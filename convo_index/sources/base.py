@@ -61,7 +61,8 @@ def all_adapters() -> list[SourceAdapter]:
     """Adapters in a fixed order; import lazily so an optional source cannot break startup."""
     from convo_index.sources.claude_code import ClaudeCodeAdapter
     from convo_index.sources.opencode import OpencodeAdapter
-    return [ClaudeCodeAdapter(), OpencodeAdapter()]
+    from convo_index.sources.codex import CodexAdapter
+    return [ClaudeCodeAdapter(), OpencodeAdapter(), CodexAdapter()]
 
 
 def enabled_adapters() -> list[SourceAdapter]:
@@ -75,6 +76,8 @@ def resume_command(conversation_id: str, cwd: str | None) -> str | None:
         from convo_index.sources.claude_code import resume_command as rc
     elif source == "opencode":
         from convo_index.sources.opencode import resume_command as rc
+    elif source == "codex":
+        from convo_index.sources.codex import resume_command as rc
     else:
         return None
     return rc(conversation_id, cwd)
