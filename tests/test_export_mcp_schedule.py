@@ -87,6 +87,28 @@ def test_cli_search_export_backup(tmp_path, monkeypatch, capsys):
     assert cli.main(["backup", str(tmp_path / "backups")]) == 0                       # existing directory -> timestamped file
 
 
+def test_cli_resummarize_makes_the_next_run_call_the_summarizer(tmp_path, monkeypatch, capsys):
+    from convo_index import jobs
+    st, db = _seed(tmp_path, monkeypatch)
+    conn = dbm.connect(db)
+    conn.execute("INSERT INTO derived_jobs(conversation_id, kind, input_fingerprint, status, attempts, last_run) VALUES('claude_code:s0','summary','f','ok',1,'t')")
+    conn.commit(); conn.close()
+    assert cli.main(["resummarize"]) == 2
+    assert cli.main(["resummarize", "s0"]) == 0 and "1 summary job(s)" in capsys.readouterr().out
+    assert cli.main(["resummarize", "claude_code:nope"]) == 1
+    # the summary was made from the current revision: without forgetting that too, the next run
+    # would adopt it back instead of calling the LLM
+    calls = []
+    monkeypatch.setattr(jobs.SM, "summarize_conversation",
+                        lambda transcript, title, settings: calls.append(title) or ({"problem": "p", "solution": "s", "learning": "l"}, None))
+    llm = make_settings(tmp_path, llm={"summary": {"backend": "claude_cli", "model": "m"}}, privacy={"hosted_processing": "allow"})
+    conn = dbm.connect(db)
+    assert dbm.get_summarized_revision(conn, "claude_code:s0") is None
+    assert jobs.run_summary(conn, "claude_code:s0", "Kube deploy", "1", "user: pods crash", llm) == "ok" and calls == ["Kube deploy"]
+    assert dbm.get_summarized_revision(conn, "claude_code:s0") == "1"
+    conn.close()
+
+
 def test_markdown_fences_outlast_backticks_in_tool_output(tmp_path, monkeypatch):
     st, db = _seed(tmp_path, monkeypatch)
     conn = dbm.connect(db)

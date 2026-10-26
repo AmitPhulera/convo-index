@@ -354,6 +354,36 @@ def cmd_backup(args):
     return 0
 
 
+def cmd_resummarize(args):
+    from convo_index import settings as S
+    from convo_index import db as dbm
+    if not args.id and not args.all:
+        print("give a conversation id or --all", file=sys.stderr)
+        return 2
+    conn = dbm.connect(S.load().db_path())
+    try:
+        if args.all:
+            n = conn.execute("DELETE FROM derived_jobs WHERE kind='summary'").rowcount
+            conn.execute("UPDATE conversation_summary SET summarized_revision=NULL")
+        else:
+            try:
+                cid = dbm.resolve_id(conn, args.id)
+            except dbm.AmbiguousId as e:
+                print(f"ambiguous id; use one of {e.args[0]}", file=sys.stderr)
+                return 1
+            if not dbm.exists(conn, cid):
+                print(f"no conversation {args.id}", file=sys.stderr)
+                return 1
+            n = conn.execute("DELETE FROM derived_jobs WHERE kind='summary' AND conversation_id=?", (cid,)).rowcount
+            conn.execute("UPDATE conversation_summary SET summarized_revision=NULL WHERE conversation_id=?", (cid,))
+        # a summary made from the current revision would otherwise be adopted back without an LLM call
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"{n} summary job(s) forgotten; the next `convo-index index` re-summarizes them")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="convo-index",
                                  description="Index and browse AI coding-assistant conversations.")
@@ -395,6 +425,11 @@ def main(argv=None):
     p_exp.add_argument("--force", action="store_true", help="overwrite an existing --out file")
     p_bak = sub.add_parser("backup", help="copy the database (SQLite backup API, WAL-safe) to a path")
     p_bak.add_argument("path")
+    p_jobs = sub.add_parser("jobs", help="derived-job maintenance")
+    p_jobs.add_argument("action", choices=["unblock"], help="unblock: re-queue jobs blocked on auth/config now")
+    p_res = sub.add_parser("resummarize", help="forget summary jobs so the next index run re-summarizes")
+    p_res.add_argument("id", nargs="?", help="one conversation; omit with --all for every conversation")
+    p_res.add_argument("--all", action="store_true")
     args = ap.parse_args(argv)
 
     if args.config:
@@ -426,6 +461,17 @@ def main(argv=None):
         return cmd_export(args)
     if args.cmd == "backup":
         return cmd_backup(args)
+    if args.cmd == "resummarize":
+        return cmd_resummarize(args)
+    if args.cmd == "jobs":
+        from convo_index import settings as S, db as dbm, jobs
+        conn = dbm.connect(S.load().db_path())
+        try:
+            out = jobs.unblock(conn, S.load(), force=True)
+        finally:
+            conn.close()
+        print(f"re-queued: {out or 'nothing was blocked'}")
+        return 0
     if args.cmd == "config":
         from convo_index import settings as S
         if args.what == "path":
