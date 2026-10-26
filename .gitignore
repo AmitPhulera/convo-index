@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+convos.db
+convos.db-*
+archive/
+refresh.log
+convos.db.bak-*
+*.egg-info/
+dist/
+models/
