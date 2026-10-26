@@ -71,6 +71,23 @@ def test_config_path_and_show(tmp_path, monkeypatch, capsys):
     assert "[privacy]" in capsys.readouterr().out
 
 
+def test_reembed_drops_vectors_and_records_fingerprint(tmp_path, monkeypatch, capsys):
+    _isolate(tmp_path, monkeypatch)
+    db = tmp_path / "convos.db"
+    conn = dbm.connect(db); dbm.init_schema(conn, db)
+    c = Conversation(source="claude_code", native_id="s", title="t", first_prompt="p", source_ref="/a",
+                     messages=[Message(seq=0, role="user", text="x")])
+    from convo_index.config import EMBED_DIM
+    dbm.upsert_conversation(conn, c, "globex", "path", [], None, "1", lambda t: [[0.0] * EMBED_DIM for _ in t])
+    assert conn.execute("SELECT COUNT(*) FROM vec_messages").fetchone()[0] == 1
+    conn.close()
+    assert cli.main(["reembed"]) == 0
+    conn = dbm.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM vec_messages").fetchone()[0] == 0
+    assert "nomic-embed-text" in dbm.get_meta(conn, "embedding_fingerprint")
+    assert "dropped 1 message vectors" in capsys.readouterr().out
+
+
 def test_doctor_json_reports_warnings(tmp_path, monkeypatch, capsys):
     _isolate(tmp_path, monkeypatch)
     from convo_index import doctor
@@ -95,6 +112,18 @@ def test_init_preserves_explicit_disabled_source(tmp_path, monkeypatch):
     assert tomllib.loads(cfg.read_text())["sources"]["opencode"]["enabled"] is False
 
 
+def test_reembed_recreates_vector_table_with_configured_dim(tmp_path, monkeypatch, capsys):
+    cfg = _isolate(tmp_path, monkeypatch)
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text('[embeddings]\ndim = 1536\nmodel = "text-embedding-3-small"\n')
+    db = tmp_path / "convos.db"
+    conn = dbm.connect(db); dbm.init_schema(conn, db); conn.close()
+    assert cli.main(["reembed"]) == 0
+    conn = dbm.connect(db)
+    assert dbm.vector_dim(conn) == 1536
+    assert "1536 dims" in capsys.readouterr().out
+
+
 def test_init_without_tty_and_without_yes_keeps_ask(tmp_path, monkeypatch, capsys):
     cfg = _isolate(tmp_path, monkeypatch)
     monkeypatch.setattr(R, "probe_cli_backends", lambda: ["gemini_cli"])
@@ -102,6 +131,69 @@ def test_init_without_tty_and_without_yes_keeps_ask(tmp_path, monkeypatch, capsy
     cli.main(["init"])
     assert tomllib.loads(cfg.read_text())["privacy"]["hosted_processing"] == "ask"
     assert "pass --yes" in capsys.readouterr().err
+
+
+def test_tag_cli_assign_list_and_retag(tmp_path, monkeypatch, capsys):
+    from tests.conftest import make_settings
+    _isolate(tmp_path, monkeypatch)
+    st = make_settings(tmp_path)
+    st["paths"]["db"] = str(tmp_path / "convos.db")
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    db = tmp_path / "convos.db"
+    conn = dbm.connect(db); dbm.init_schema(conn, db)
+    c = Conversation(source="claude_code", native_id="s", title="t", first_prompt="p", source_ref="/a", cwd="/nowhere",
+                     messages=[Message(seq=0, role="user", text="x")])
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t)); conn.close()
+    assert cli.main(["tag", "s", "workspace=personal"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"workspace": ["personal"]}
+    assert cli.main(["tag", "s", "workspace=none"]) == 0
+    assert json.loads(capsys.readouterr().out) == {}
+    assert cli.main(["tag", "s", "workspace=bogus"]) == 1
+    assert cli.main(["tag", "s", "workspace"]) == 2                 # missing '=' is an error, not "none"
+    assert cli.main(["tag", "--list"]) == 0
+    out = capsys.readouterr().out
+    assert "workspace (exclusive)" in out and "globex" in out
+    conn = dbm.connect(db)        # a finished job whose answer was empty: no evidence row, still re-tagged
+    conn.execute("INSERT INTO derived_jobs(conversation_id, kind, input_fingerprint, status, attempts, last_run) "
+                 "VALUES('claude_code:s','tags','f','ok',1,'t')")
+    conn.commit(); conn.close()
+    assert cli.main(["tag", "--retag"]) == 0
+    assert "1 conversation" in capsys.readouterr().out
+    conn = dbm.connect(db)
+    assert conn.execute("SELECT count(*) FROM derived_jobs WHERE kind='tags'").fetchone()[0] == 0
+    conn.close()
+
+
+def test_tag_suggestions_and_calibrate_cli(tmp_path, monkeypatch, capsys):
+    from tests.conftest import make_settings
+    from tests.test_vectors import fake_embed, FP
+    from convo_index import tags as T, vectors as V
+    _isolate(tmp_path, monkeypatch)
+    st = make_settings(tmp_path); st["paths"]["db"] = str(tmp_path / "convos.db")
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    db = tmp_path / "convos.db"
+    conn = dbm.connect(db); dbm.init_schema(conn, db); T.sync_definitions(conn, st)
+    for i, (title, txt) in enumerate([("Kube", "kubernetes deploy failing"), (None, "kubernetes cluster upgrade"), (None, "kubernetes ingress")]):
+        c = Conversation(source="claude_code", native_id=f"s{i}", title=title, first_prompt=txt, source_ref="/a", cwd="/x",
+                         start_ts=f"2026-06-0{i + 1}T00:00:00Z", messages=[Message(seq=0, role="user", text=txt)])
+        dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+        V.run_vector(conn, c.id, fake_embed, FP)
+    assert cli.main(["tag", "--calibrate"]) == 0
+    assert "no suggestions" in capsys.readouterr().out
+    T.set_decision(conn, "claude_code:s0", "workspace", "globex", settings=st)     # suggests to s1 and s2
+    conn.close()
+    assert cli.main(["tag", "--suggestions"]) == 0
+    out = capsys.readouterr().out
+    assert "2 open suggestion(s)" in out and "workspace=globex" in out and "«kubernetes cluster upgrade»" in out   # None title -> first prompt
+    conn = dbm.connect(db)
+    T.set_decision(conn, "claude_code:s1", "workspace", "globex", suggest=False)
+    T.set_decision(conn, "claude_code:s2", "workspace", "personal", suggest=False)  # exclusive: implicit reject
+    conn.close()
+    assert cli.main(["tag", "--calibrate"]) == 0
+    out = capsys.readouterr().out
+    assert "workspace:" in out and "1 accepted, 1 rejected (precision 0.5)" in out and "at or above" in out
+    assert cli.main(["tag", "--suggestions"]) == 0
+    assert "0 open suggestion(s)" in capsys.readouterr().out
 
 
 ADVANCED_TAGS = '''

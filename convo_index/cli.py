@@ -112,6 +112,129 @@ def cmd_doctor(args):
     return 1 if rep["warnings"] else 0
 
 
+def cmd_reembed(args):
+    """Drop every vector and record the configured embedder; the next `index` backfills."""
+    from convo_index import db as dbm
+    from convo_index import settings as S
+    from convo_index.lock import index_lock, IndexLocked
+    from convo_index.providers import registry as R
+    settings = S.load()
+    emb = R.make_embedder(settings)
+    if emb is None:
+        print("no embedding backend configured", file=sys.stderr)
+        return 1
+    try:
+        with index_lock(settings.db_path()):
+            conn = dbm.connect(settings.db_path())
+            dbm.init_schema(conn, settings.db_path(), have_lock=True)
+            n = conn.execute("SELECT COUNT(*) FROM vec_messages").fetchone()[0]
+            dim = int(settings["embeddings"].get("dim") or 0) or dbm.vector_dim(conn)
+            dbm.recreate_vectors(conn, dim, fingerprint=emb.fingerprint)   # dimension may have changed with the model
+            conn.close()
+    except IndexLocked:
+        print("another indexer is running; try again later", file=sys.stderr)
+        return 75
+    print(f"dropped {n} message vectors and all conversation vectors; tables recreated with {dim} dims; "
+          f"embedder now {emb.fingerprint}. Run `convo-index index` to backfill (bounded per run).")
+    return 0
+
+
+def cmd_tag(args):
+    """convo-index tag <id> <group>=<tag|none> [--reject]  |  convo-index tag --list  |
+    convo-index tag --retag"""
+    from convo_index import db as dbm, settings as S, tags as T, jobs
+    settings = S.load()
+    conn = dbm.connect(settings.db_path())
+    dbm.init_schema(conn, settings.db_path())
+    T.sync_definitions(conn, settings)
+    if args.calibrate:
+        from convo_index import vectors as V
+        rep = V.calibrate(conn)
+        if not rep:
+            print("no suggestions have been decided on yet; accept or reject a few suggested tags first")
+            return 0
+        for g, buckets in rep.items():
+            print(f"{g}:")
+            for b in sorted(buckets, reverse=True):
+                x = buckets[b]; cum = x["at_or_above"]
+                print(f"  similarity [{b}, {float(b) + 0.05:.2f}): {x['accepted']} accepted, {x['rejected']} rejected"
+                      + (f" (precision {x['precision']})" if x["precision"] is not None else "")
+                      + f"; at or above {b}: {cum['accepted']}/{cum['accepted'] + cum['rejected']} accepted (precision {cum['precision']})")
+        return 0
+    if args.suggestions:
+        from convo_index import vectors as V
+        rows = V.open_suggestions(conn)
+        for r in rows:
+            print(f"{(r['similarity'] or 0):.2f}  {r['id']}  {r['group']}={r['tag']}  «{(r['title'] or '')[:50]}»  "
+                  f"(like: {(r['origin_title'] or r['origin'] or '')[:40]})")
+        print(f"{len(rows)} open suggestion(s)")
+        return 0
+    if args.list:
+        groups = T.load_groups(conn)
+        counts = {(g, t): n for g, t, n in conn.execute(
+            "SELECT group_name, tag, COUNT(*) FROM tag_assignments GROUP BY 1, 2")}
+        for g, spec in groups.items():
+            print(f"{g} ({'exclusive' if spec['exclusive'] else 'multi'}): {spec['description']}")
+            for t in spec["tags"]:
+                print(f"  {t['name']:20s} {counts.get((g, t['name']), 0):5d}  {t['description']}")
+        return 0
+    if args.retag:
+        from convo_index.lock import index_lock, IndexLocked
+        try:
+            with index_lock(settings.db_path()):
+                # every conversation gets a fresh answer for every group (the LLM is asked about all open
+                # groups at once), including those whose last answer was empty and so left no evidence
+                affected = [r[0] for r in conn.execute("SELECT id FROM conversations")]
+                conn.execute("DELETE FROM tag_evidence WHERE method='llm'")
+                for i in range(0, len(affected), 500):
+                    chunk = affected[i:i + 500]
+                    conn.execute(f"DELETE FROM derived_jobs WHERE kind=? AND conversation_id IN ({','.join('?' * len(chunk))})",
+                                 (jobs.TAGS, *chunk))
+                conn.commit()
+                for cid in affected:
+                    T.resolve(conn, cid)
+        except IndexLocked:
+            print("an indexer is running; try again later", file=sys.stderr)
+            return 75
+        print(f"LLM tag evidence cleared for {len(affected)} conversation(s); the next `convo-index index` "
+              "re-tags them (bounded per run). Rules and decisions are kept.")
+        return 0
+    if not args.id or not args.assign or "=" not in args.assign:
+        print("usage: convo-index tag <id> <group>=<tag|none> [--reject] | --list | --retag", file=sys.stderr)
+        return 2
+    try:
+        cid = dbm.resolve_id(conn, args.id)
+    except dbm.AmbiguousId as e:
+        print(f"ambiguous id {args.id}: " + ", ".join(e.args[0]), file=sys.stderr)
+        return 1
+    if not dbm.exists(conn, cid):
+        print(f"no conversation {args.id}", file=sys.stderr)
+        return 1
+    group, _, tag = args.assign.partition("=")
+    tag = None if tag in ("", "none", "null") else tag
+    try:
+        T.set_decision(conn, cid, group, tag, "reject" if args.reject else "accept")
+    except LookupError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(json.dumps(T.detail_for(conn, cid)["assignments"]))
+    return 0
+
+
+def cmd_related(args):
+    from convo_index import db as dbm, settings as S, references as REF
+    settings = S.load()
+    conn = dbm.connect(settings.db_path()); dbm.init_schema(conn, settings.db_path())
+    t = REF.timeline(conn, args.key, settings)
+    if not t["conversations"]:
+        print(f"no linked conversations for {args.key}")
+        return 1
+    print(f"{t['kind']} {t['key']}" + (f"  {t['url']}" if t["url"] else ""))
+    for c in t["conversations"]:
+        print(f"  {(c['start_ts'] or '')[:10]}  {c['source']:12s} {c['is_resolved'] or '-':8s} {c['id']}  {c['title']}")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="convo-index",
                                  description="Index and browse AI coding-assistant conversations.")
@@ -123,8 +246,19 @@ def main(argv=None):
     sub.add_parser("serve", help="run the local web UI")
     p_doc = sub.add_parser("doctor", help="show sources, backends, embedder and failing jobs. Exit 1 if warnings")
     p_doc.add_argument("--json", action="store_true")
+    sub.add_parser("reembed", help="drop all vectors so the next index run re-embeds with the configured embedder")
     p_cfg = sub.add_parser("config", help="config file helpers")
     p_cfg.add_argument("what", choices=["path", "show"])
+    p_rel = sub.add_parser("related", help="timeline of every conversation linked to a ticket, PR or branch key")
+    p_rel.add_argument("key", help="e.g. SAAS-1234, github.com/o/r#38068, a branch name (resolved to its project when unambiguous)")
+    p_tag = sub.add_parser("tag", help="tag a conversation by hand, list tags, or re-run LLM tagging")
+    p_tag.add_argument("id", nargs="?", help="conversation id (namespaced or bare)")
+    p_tag.add_argument("assign", nargs="?", help="<group>=<tag> or <group>=none")
+    p_tag.add_argument("--reject", action="store_true", help="record a rejection instead of an acceptance")
+    p_tag.add_argument("--list", action="store_true", help="show groups, tags and counts")
+    p_tag.add_argument("--retag", action="store_true", help="clear LLM tag evidence so the next index re-tags")
+    p_tag.add_argument("--calibrate", action="store_true", help="how past neighbour suggestions fared against your decisions")
+    p_tag.add_argument("--suggestions", action="store_true", help="list open neighbour suggestions")
     args = ap.parse_args(argv)
 
     if args.config:
@@ -144,6 +278,12 @@ def main(argv=None):
         return 0
     if args.cmd == "doctor":
         return cmd_doctor(args)
+    if args.cmd == "reembed":
+        return cmd_reembed(args)
+    if args.cmd == "tag":
+        return cmd_tag(args)
+    if args.cmd == "related":
+        return cmd_related(args)
     if args.cmd == "config":
         from convo_index import settings as S
         if args.what == "path":
