@@ -6,7 +6,7 @@ provider call is therefore retried on later runs without the source having to ch
 and never more than `max_attempts` times for the same inputs. A fingerprint change
 (new transcript, new prompt version, new backend/model) resets the attempts.
 
-Kinds: `summary` and `tags` (LLM
+Kinds: `summary`, `vector` (one embedding per conversation, see vectors.py) and `tags` (LLM
 tagging of groups that rules/decisions left open). Per-message vectors for search are not
 jobs: `backfill_vectors` fills them against the embedder fingerprint in index_meta.
 """
@@ -190,7 +190,9 @@ def pending_summaries(conn, settings, limit):
 
 def dispatch(conn, settings=None, attempted=None, embed_fn=None, embedder_fp=None):
     """One bounded pass of derived work per index run. Each conversation/kind is attempted
-    at most once per run (`attempted` is the run's set). Returns counts."""
+    at most once per run (`attempted` is the run's set). Returns counts. Order: summaries
+    (they are part of the embedded text, so embedding after them avoids a second embed),
+    then conversation vectors (they feed the few-shot examples), then tags."""
     settings = settings or S.load()
     attempted = attempted if attempted is not None else set()
     budget = int(settings["summary"].get("per_run") or 50)
@@ -206,6 +208,15 @@ def dispatch(conn, settings=None, attempted=None, embed_fn=None, embedder_fp=Non
             out["summaries"] += 1
             if run_summary(conn, cid, title, revision, transcript_from_db(conn, cid), settings) == "ok":
                 out["summaries_ok"] += 1
+    if embed_fn is not None and embedder_fp:
+        from convo_index import vectors as V
+        vbudget = V.learning_settings(settings)["vectors_per_run"]
+        cids = [cid for cid in V.pending_vectors(conn, embedder_fp, vbudget, int(settings["summary"]["max_attempts"]), settings)
+                if (cid, V.VECTOR) not in attempted]
+        attempted.update((cid, V.VECTOR) for cid in cids)
+        res = V.run_vectors(conn, cids, embed_fn, embedder_fp, settings)   # batched provider calls
+        out["vectors"] += res["attempted"]
+        out["vectors_ok"] += res["ok"]
     out.update({"tags": 0, "tags_ok": 0})
     if settings.llm_job("classify")["backend"]:
         for cid in pending_tags(conn, settings, max(0, budget - out["summaries"])):
