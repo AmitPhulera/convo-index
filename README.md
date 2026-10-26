@@ -1,5 +1,7 @@
 # Conversation Index
 
+[![CI](https://github.com/AmitPhulera/convo-index/actions/workflows/ci.yml/badge.svg)](https://github.com/AmitPhulera/convo-index/actions/workflows/ci.yml)
+
 Local index + browser for AI coding-assistant conversations: Claude Code, Opencode, Codex
 CLI and Antigravity CLI. Full-text + semantic search, summaries and user-defined tags through
 whichever LLM CLI you already have, related work by ticket/PR/branch, token usage with

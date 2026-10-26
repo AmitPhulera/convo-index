@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint and static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: ruff
+        run: uvx ruff check .
+      - name: bandit (high severity)
+        run: uvx --from bandit bandit -q -r convo_index -lll
+      - name: shellcheck install.sh
+        run: shellcheck install.sh
+
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.12", "3.13"]
+    env:
+      HF_HUB_OFFLINE: "1"          # the suite must never download the embedding model
+      UV_PYTHON_PREFERENCE: only-managed   # runner Pythons may lack sqlite loadable-extension support
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --frozen
+      - run: uv run pytest -q
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    # Advisory until the lockfile catches up with pillow 13 (fastembed pulls in 12.3.0, which
+    # has open advisories); Dependabot's uv updates bump it. Make this job required again then.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv export --frozen --no-dev --no-emit-project -o requirements.txt
+      - run: uvx pip-audit --strict -r requirements.txt
+
+  build:
+    name: build and install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - run: uvx twine check dist/*
+      - name: the wheel installs and the command runs
+        run: |
+          uv tool install dist/*.whl
+          convo-index --help

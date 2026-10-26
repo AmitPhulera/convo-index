@@ -28,3 +28,13 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py312"
+
+[tool.ruff.lint]
+# pyflakes, the syntax/runtime-relevant pycodestyle rules and bugbear; the repo keeps
+# its compact one-line statements, so the pure layout rules stay off
+select = ["E4", "E7", "E9", "F", "B"]
+ignore = ["E701", "E702", "E731", "E741"]
