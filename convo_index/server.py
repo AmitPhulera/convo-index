@@ -374,6 +374,14 @@ class Handler(BaseHTTPRequestHandler):
     def _route_get(self):
         u = urlparse(self.path)
         path, qs = u.path, parse_qs(u.query)
+        if path == "/":
+            return self._send_file("index.html", "text/html")
+        if path.startswith("/static/"):
+            name = path[len("/static/"):]
+            ctype = ("text/css" if name.endswith(".css")
+                     else "application/javascript" if name.endswith(".js")
+                     else "text/plain")
+            return self._send_file(name, ctype)
         if path == "/api/search":
             return self._send(200, handle_search(qs))
         if path == "/api/sources":
