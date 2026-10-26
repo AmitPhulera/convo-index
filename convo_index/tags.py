@@ -255,6 +255,72 @@ def decisions_for(conn, cid):
     return out
 
 
+def set_decision(conn, cid, group, tag, decision="accept", *, suggest=True, settings=None):
+    """Record a user decision and re-resolve, atomically. `tag=None` with accept means
+    "none of these" for the group (stored as the empty-string sentinel). Accepting a tag in
+    an exclusive group replaces earlier accepts; accepting any tag removes a "none".
+    An accept then proposes the tag to similar conversations (vectors.suggest) unless
+    `suggest` is False; `settings` are loaded when not given."""
+    if decision not in DECISIONS:
+        raise LookupError(f"decision must be one of {DECISIONS}, not {decision!r}")
+    stored = NONE_TAG if tag is None else tag
+    if tag is None and decision != "accept":
+        raise LookupError('"none of these" can only be accepted; clear it to undo')
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        excl = conn.execute("SELECT exclusive FROM tag_groups WHERE name=?", (group,)).fetchone()
+        if excl is None:
+            raise LookupError(f"unknown tag group {group!r}")
+        if tag is not None and not conn.execute("SELECT 1 FROM tags WHERE group_name=? AND name=?", (group, tag)).fetchone():
+            raise LookupError(f"unknown tag {group}:{tag}")
+        if decision == "accept":
+            if tag is None or excl[0]:
+                # "none of these" or an exclusive pick supersedes earlier accepts in this group
+                conn.execute("DELETE FROM tag_decisions WHERE conversation_id=? AND group_name=? AND decision='accept'",
+                             (cid, group))
+            else:
+                conn.execute("DELETE FROM tag_decisions WHERE conversation_id=? AND group_name=? AND tag=?",
+                             (cid, group, NONE_TAG))   # a real tag cancels "none" in a multi group
+        conn.execute(
+            "INSERT INTO tag_decisions(conversation_id, group_name, tag, decision, ts) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(conversation_id, group_name, tag) DO UPDATE SET decision=excluded.decision, ts=excluded.ts",
+            (cid, group, stored, decision, _now()))
+        out = _resolve_locked(conn, cid)
+        # the decision may have reopened a group (a rejection) or closed one: let the next run
+        # look again; pending_tags marks the job done when nothing is left for the LLM
+        conn.execute("DELETE FROM derived_jobs WHERE conversation_id=? AND kind='tags'", (cid,))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    if suggest and decision == "accept" and tag is not None:
+        try:
+            from convo_index import vectors as V
+            V.suggest(conn, cid, group, tag, settings, definition_revision=dbm.get_meta(conn, META_REVISION))
+        except Exception:
+            pass   # suggestions are best-effort (no vectors yet, vec table missing): the decision stands
+    return out
+
+
+def clear_decision(conn, cid, group, tag=None):
+    """Drop the user's decision(s) for a group (all of them when `tag` is None) and
+    re-resolve, atomically, so the pipeline's own evidence shows again."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if tag is None:
+            conn.execute("DELETE FROM tag_decisions WHERE conversation_id=? AND group_name=?", (cid, group))
+        else:
+            conn.execute("DELETE FROM tag_decisions WHERE conversation_id=? AND group_name=? AND tag=?", (cid, group, tag))
+        out = _resolve_locked(conn, cid)
+        # the group may be open again: forget the tags job so the dispatcher looks at it anew
+        conn.execute("DELETE FROM derived_jobs WHERE conversation_id=? AND kind='tags'", (cid,))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return out
+
+
 # ---------------------------------------------------------------- resolution ------
 
 def resolve(conn, cid, groups=None):
@@ -328,7 +394,47 @@ def assignments_for(conn, cids):
     return out
 
 
+def detail_for(conn, cid):
+    """Assignments, evidence, decisions and open suggestions for the detail pane."""
+    groups = load_groups(conn)
+    ev = [{"group": g, "tag": t, "method": m, "confidence": c, "detail": d}
+          for g, t, m, c, d in conn.execute(
+              "SELECT group_name, tag, method, confidence, detail FROM tag_evidence WHERE conversation_id=? "
+              "AND method != 'neighbour' ORDER BY id", (cid,))]
+    dec = [{"group": g, "tag": (None if t == NONE_TAG else t), "decision": d} for g, t, d in conn.execute(
+        "SELECT group_name, tag, decision FROM tag_decisions WHERE conversation_id=?", (cid,))]
+    try:
+        from convo_index import vectors as V
+        suggestions = V.suggestions_for(conn, cid)
+    except Exception:
+        suggestions = []
+    return {"groups": groups, "assignments": assignments_for(conn, [cid]).get(cid, {}),
+            "evidence": ev, "decisions": dec, "suggestions": suggestions}
+
+
 # ---------------------------------------------------------------- LLM -------------
+
+def unresolved_groups(conn, cid, groups=None):
+    """Groups the LLM should still be asked about: no *valid* user decision (an accepted tag
+    that no longer exists does not close a group), and, for exclusive groups only, no rule hit
+    on a valid, non-rejected tag. A multi group stays open after a rule hit because the rule
+    settled one tag, not the question of which other tags also apply."""
+    groups = groups or load_groups(conn)
+    decisions = decisions_for(conn, cid)
+    rule_hits = conn.execute(
+        "SELECT group_name, tag FROM tag_evidence WHERE conversation_id=? AND method='rule'", (cid,)).fetchall()
+    out = {}
+    for g, spec in groups.items():
+        if not spec["tags"]:
+            continue
+        valid = {t["name"] for t in spec["tags"]}
+        d = decisions.get(g) or {"accept": set(), "reject": set(), "none": False}
+        if d["none"] or (d["accept"] & valid):
+            continue
+        if spec["exclusive"] and any(rg == g and tag in valid and tag not in d["reject"] for rg, tag in rule_hits):
+            continue
+        out[g] = spec
+    return out
 
 
 def conv_row(conn, cid):

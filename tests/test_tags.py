@@ -1,5 +1,6 @@
 """User-defined tag groups: definitions, rules, decisions, resolution, LLM tagging."""
 
+import pytest
 
 from convo_index import db as dbm
 from convo_index import tags as T
@@ -113,7 +114,83 @@ def test_resolve_exclusive_keeps_one_multi_keeps_all_and_mirrors_category(tmp_pa
     assert conn.execute("SELECT category, category_source FROM conversations WHERE id=?", (c.id,)).fetchone() == ("globex", "rule")
 
 
+def test_user_decision_beats_rules_and_llm(tmp_path):
+    conn = _db(tmp_path, multi_settings(tmp_path))
+    c = _conv(cwd="/globex/x")
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, _row(c))
+    assert T.resolve(conn, c.id)["workspace"] == ["globex"]
+    T.set_decision(conn, c.id, "workspace", "personal")
+    assert T.assignments_for(conn, [c.id])[c.id]["workspace"] == ["personal"]
+    assert conn.execute("SELECT category, category_source FROM conversations WHERE id=?", (c.id,)).fetchone() == ("personal", "user")
+    T.set_decision(conn, c.id, "workspace", None)            # "none of these"
+    assert T.assignments_for(conn, [c.id])[c.id] == {}
+    assert conn.execute("SELECT category FROM conversations WHERE id=?", (c.id,)).fetchone() == ("unknown",)
+    T.clear_decision(conn, c.id, "workspace", None)
+    assert T.assignments_for(conn, [c.id])[c.id]["workspace"] == ["globex"]   # rules show again
+
+
+def test_rejection_removes_candidate_but_keeps_others(tmp_path):
+    conn = _db(tmp_path, multi_settings(tmp_path))
+    c = _conv(branch="infra/y", title="review the PR")
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, _row(c))
+    T.set_decision(conn, c.id, "topic", "review", "reject")
+    assert T.assignments_for(conn, [c.id])[c.id]["topic"] == ["infra"]
+    # exclusive pick replaces an earlier pick
+    T.set_decision(conn, c.id, "workspace", "globex"); T.set_decision(conn, c.id, "workspace", "personal")
+    assert [r[0] for r in conn.execute("SELECT tag FROM tag_decisions WHERE group_name='workspace'")] == ["personal"]
+
+
+def test_set_decision_validates_group_and_tag(tmp_path):
+    conn = _db(tmp_path, multi_settings(tmp_path))
+    c = _conv(); dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    with pytest.raises(LookupError):
+        T.set_decision(conn, c.id, "nope", "x")
+    with pytest.raises(LookupError):
+        T.set_decision(conn, c.id, "topic", "nope")
+
+
+def test_decisions_survive_reingest_but_evidence_is_rebuilt(tmp_path):
+    conn = _db(tmp_path, multi_settings(tmp_path))
+    c = _conv(cwd="/globex/x")
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, _row(c)); T.set_decision(conn, c.id, "topic", "review")
+    dbm.remove_conversation(conn, c.id)                      # e.g. emptied at the source
+    assert conn.execute("SELECT COUNT(*) FROM tag_evidence").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM tag_decisions").fetchone()[0] == 1
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "2", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, _row(c))
+    assert T.resolve(conn, c.id) == {"workspace": ["globex"], "topic": ["review"]}
+
+
 # ---------------------------------------------------------------- LLM step
+
+
+def test_none_decision_is_single_row_and_cancelled_by_a_real_tag(tmp_path):
+    conn = _db(tmp_path, multi_settings(tmp_path))
+    c = _conv(); dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.set_decision(conn, c.id, "topic", None); T.set_decision(conn, c.id, "topic", None)
+    assert conn.execute("SELECT COUNT(*) FROM tag_decisions WHERE group_name='topic'").fetchone()[0] == 1
+    assert T.decisions_for(conn, c.id)["topic"]["none"] is True
+    T.set_decision(conn, c.id, "topic", "infra")                       # multi group: a real tag cancels none
+    d = T.decisions_for(conn, c.id)["topic"]
+    assert d["none"] is False and d["accept"] == {"infra"}
+    assert conn.execute("SELECT category, category_source FROM conversations WHERE id=?", (c.id,)).fetchone() == ("unknown", None)
+    T.set_decision(conn, c.id, "workspace", None)
+    assert conn.execute("SELECT category, category_source FROM conversations WHERE id=?", (c.id,)).fetchone() == ("unknown", "user")
+
+
+def test_invalid_decision_rejected_and_clear_whole_group(tmp_path):
+    conn = _db(tmp_path, multi_settings(tmp_path))
+    c = _conv(cwd="/globex/x"); dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, _row(c))
+    with pytest.raises(LookupError):
+        T.set_decision(conn, c.id, "topic", "infra", "approve")
+    T.set_decision(conn, c.id, "topic", "infra"); T.set_decision(conn, c.id, "topic", "review", "reject")
+    assert conn.execute("SELECT COUNT(*) FROM tag_decisions WHERE group_name='topic'").fetchone()[0] == 2
+    assert T.clear_decision(conn, c.id, "topic")["topic"] == []          # whole group, one call
+    assert conn.execute("SELECT COUNT(*) FROM tag_decisions").fetchone()[0] == 0
 
 
 def test_scalar_rule_values_are_one_value_not_characters(tmp_path):
@@ -121,6 +198,45 @@ def test_scalar_rule_values_are_one_value_not_characters(tmp_path):
                       tags=[{"name": "acme", "group": "workspace", "rules": {"path_contains": "acme"}}])
     assert T.definitions(s)["tags"][0]["rules"] == {"path_contains": ["acme"]}
     assert T.rule_matches({"path_contains": ["acme"]}, {"cwd": "/x/a"}) is None
+
+
+def test_definition_change_rebuilds_rules_on_unchanged_conversations(tmp_path):
+    s = multi_settings(tmp_path)
+    conn = _db(tmp_path, s)
+    c = _conv(cwd="/Users/me/globex/x", branch="infra/k8s")
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, _row(c)); T.resolve(conn, c.id)
+    assert T.assignments_for(conn, [c.id])[c.id] == {"workspace": ["globex"], "topic": ["infra"]}
+    # the path rule moves to another tag and `infra` is removed: nothing re-ingests, yet the
+    # next sync must reflect it
+    s["tags"][0]["rules"]["path_contains"] = ["elsewhere"]
+    s["tags"][1]["rules"]["path_contains"] = ["globex"]           # personal now matches
+    s["tags"] = [t for t in s["tags"] if t["name"] != "infra"]
+    T.sync_definitions(conn, s)
+    assert T.assignments_for(conn, [c.id])[c.id] == {"workspace": ["personal"]}
+    assert conn.execute("SELECT COUNT(*) FROM tag_assignments WHERE tag='infra'").fetchone()[0] == 0
+    # an accepted tag that no longer exists does not keep its group closed
+    s2 = multi_settings(tmp_path)
+    conn2 = _db(tmp_path / "b", s2)
+    d = _conv("s2", cwd="/nowhere")
+    dbm.upsert_conversation(conn2, d, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.set_decision(conn2, d.id, "topic", "review", suggest=False)
+    assert "topic" not in T.unresolved_groups(conn2, d.id)
+    s2["tags"] = [t for t in s2["tags"] if t["name"] != "review"]
+    T.sync_definitions(conn2, s2)
+    assert "topic" in T.unresolved_groups(conn2, d.id) and T.assignments_for(conn2, [d.id])[d.id] == {}
+
+
+def test_rejecting_the_only_rule_candidate_reopens_an_exclusive_group(tmp_path):
+    s = multi_settings(tmp_path)
+    conn = _db(tmp_path, s)
+    c = _conv(cwd="/Users/me/globex/x")
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, _row(c)); T.resolve(conn, c.id)
+    assert "workspace" not in T.unresolved_groups(conn, c.id)          # rule settled it
+    T.set_decision(conn, c.id, "workspace", "globex", "reject", suggest=False)
+    assert T.assignments_for(conn, [c.id])[c.id] == {}
+    assert "workspace" in T.unresolved_groups(conn, c.id)               # empty group: ask the LLM
 
 
 def test_invalid_rules_are_reported_and_dropped(tmp_path, capsys):
