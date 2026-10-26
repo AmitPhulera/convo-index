@@ -517,6 +517,25 @@ def list_sources(conn):
         "SELECT source FROM conversations GROUP BY source ORDER BY COUNT(*) DESC").fetchall()]
 
 
+def set_hidden(conn, conversation_id, hidden):
+    conn.execute(
+        """INSERT INTO conversation_state(conversation_id, hidden) VALUES(?, ?)
+           ON CONFLICT(conversation_id) DO UPDATE SET hidden=excluded.hidden""",
+        (conversation_id, 1 if hidden else 0),
+    )
+    conn.commit()
+
+
+def get_hidden_ids(conn):
+    return {r[0] for r in conn.execute(
+        "SELECT conversation_id FROM conversation_state WHERE hidden=1").fetchall()}
+
+
+def get_deleted_ids(conn):
+    return {r[0] for r in conn.execute(
+        "SELECT conversation_id FROM conversation_state WHERE deleted=1").fetchall()}
+
+
 _SUMMARY_FIELDS = ("problem", "solution", "is_resolved", "learning", "claude_failed")
 
 
@@ -603,6 +622,61 @@ def _delete_message_row(conn, mid, old_text):
     _fts_delete(conn, mid, old_text)
     conn.execute("DELETE FROM vec_messages WHERE rowid=?", (mid,))
     conn.execute("DELETE FROM messages WHERE id=?", (mid,))
+
+
+def _delete_conversation_rows(conn, conversation_id):
+    for mid, text in conn.execute("SELECT id, text FROM messages WHERE conversation_id=?",
+                                  (conversation_id,)).fetchall():
+        _delete_message_row(conn, mid, text)
+    conn.execute("DELETE FROM usage_records WHERE conversation_id=?", (conversation_id,))
+    for table in ("derived_jobs", "tag_assignments", "tag_evidence", "references_"):
+        if _table_exists(conn, table):
+            conn.execute(f"DELETE FROM {table} WHERE conversation_id=?", (conversation_id,))
+    if _table_exists(conn, "conv_vec_ids"):
+        vid = conn.execute("SELECT vid FROM conv_vec_ids WHERE conversation_id=?", (conversation_id,)).fetchone()
+        if vid:
+            conn.execute("DELETE FROM vec_conversations WHERE rowid=?", (vid[0],))
+            conn.execute("DELETE FROM conv_vec_ids WHERE vid=?", (vid[0],))
+    # tag_decisions / reference_decisions are the user's word: kept across re-ingestion.
+    conn.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+
+
+def remove_conversation(conn, conversation_id):
+    """Drop a conversation's indexed content because the source no longer has it (emptied,
+    reverted, or newly recognised as the indexer's own call). No blocklist entry: if the
+    source grows real content again it will be indexed again. Returns True if rows existed."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existed = exists(conn, conversation_id)
+        _delete_conversation_rows(conn, conversation_id)
+        conn.execute("DELETE FROM conversation_summary WHERE conversation_id=?", (conversation_id,))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return existed
+
+
+def delete_conversation(conn, conversation_id):
+    """Permanently drop a conversation and blocklist it so reindex won't re-add it.
+    Returns its archive_path (if any) so the caller can remove the file."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT archive_path FROM conversations WHERE id=?",
+                           (conversation_id,)).fetchone()
+        archive_path = row[0] if row else None
+        _delete_conversation_rows(conn, conversation_id)
+        conn.execute("DELETE FROM conversation_summary WHERE conversation_id=?", (conversation_id,))
+        conn.execute(
+            """INSERT INTO conversation_state(conversation_id, deleted) VALUES(?, 1)
+               ON CONFLICT(conversation_id) DO UPDATE SET deleted=1""",
+            (conversation_id,),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return archive_path
 
 
 def plan_messages(conn, conv: Conversation):

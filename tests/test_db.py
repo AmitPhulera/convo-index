@@ -148,6 +148,35 @@ def test_fts_search_finds_message(tmp_path):
     assert hits == [("claude_code:s1",)]
 
 
+def test_hidden_flag_roundtrip(tmp_path):
+    conn = _open(tmp_path)
+    assert dbm.get_hidden_ids(conn) == set()
+    dbm.set_hidden(conn, "claude_code:s1", True)
+    assert dbm.get_hidden_ids(conn) == {"claude_code:s1"}
+    dbm.set_hidden(conn, "claude_code:s1", False)
+    assert dbm.get_hidden_ids(conn) == set()
+
+
+def test_hidden_survives_reindex(tmp_path):
+    conn = _open(tmp_path)
+    dbm.upsert_conversation(conn, _conv(), "globex", "path", [], "/a", "1", _embed_none)
+    dbm.set_hidden(conn, "claude_code:s1", True)
+    dbm.upsert_conversation(conn, _conv(), "globex", "path", [], "/a", "2", _embed_none)
+    assert dbm.get_hidden_ids(conn) == {"claude_code:s1"}
+
+
+def test_delete_conversation_blocklists_and_removes(tmp_path):
+    conn = _open(tmp_path)
+    conv = _conv()
+    conv.usage = [UsageRecord(native_request_id="r", message_seq=1, output=1)]
+    dbm.upsert_conversation(conn, conv, "globex", "path", [], "/arch/s1.jsonl", "1", _embed_zero)
+    archive = dbm.delete_conversation(conn, "claude_code:s1")
+    assert archive == "/arch/s1.jsonl"
+    for table in ("conversations", "messages", "vec_messages", "usage_records"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, table
+    assert dbm.get_deleted_ids(conn) == {"claude_code:s1"}
+
+
 def test_summary_roundtrip_and_survives_reindex(tmp_path):
     conn = _open(tmp_path)
     dbm.upsert_conversation(conn, _conv(), "globex", "path", [], "/a", "1", _embed_none)
@@ -157,6 +186,14 @@ def test_summary_roundtrip_and_survives_reindex(tmp_path):
     assert dbm.get_summarized_revision(conn, "claude_code:s1") == "1"
     dbm.upsert_conversation(conn, _conv(), "globex", "path", [], "/a", "2", _embed_none)
     assert dbm.get_summary(conn, "claude_code:s1") == s
+
+
+def test_delete_clears_summary(tmp_path):
+    conn = _open(tmp_path)
+    dbm.upsert_conversation(conn, _conv(), "globex", "path", [], "/a", "1", _embed_none)
+    dbm.set_summary(conn, "claude_code:s1", {"problem": "P"}, "1")
+    dbm.delete_conversation(conn, "claude_code:s1")
+    assert dbm.get_summary(conn, "claude_code:s1") is None
 
 
 def test_sources_and_namespacing(tmp_path):
@@ -207,6 +244,17 @@ def test_init_on_current_db_does_not_wait_for_index_lock_or_writers(tmp_path):
     conn.execute("ROLLBACK")
 
 
+def test_upsert_refuses_conversation_deleted_meanwhile(tmp_path):
+    conn = _open(tmp_path)
+    conv = _conv()
+    def embed_then_delete(texts):
+        dbm.delete_conversation(conn, conv.id)  # user hits Delete while we embed
+        return _embed_zero(texts)
+    assert dbm.upsert_conversation(conn, conv, "globex", "path", [], "/a", "1", embed_then_delete) is None
+    assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 0
+    assert dbm.get_deleted_ids(conn) == {conv.id}
+
+
 def test_positional_fallback_cannot_steal_a_native_identity(tmp_path):
     conn = _open(tmp_path)
     # A: "continue" (seq 0) with native id a
@@ -238,6 +286,25 @@ def test_set_summary_if_current(tmp_path):
     assert dbm.set_summary_if_current(conn, "claude_code:s1", {"problem": "old"}, "r0") is False  # stale
     assert dbm.set_summary_if_current(conn, "claude_code:s1", {"problem": "new"}, "r1") is True
     assert dbm.get_summary(conn, "claude_code:s1")["problem"] == "new"
+
+
+def test_set_summary_if_current_refuses_a_deleted_conversation(tmp_path):
+    conn = _open(tmp_path)
+    dbm.upsert_conversation(conn, _conv(), "globex", "path", [], None, "r1", _embed_none)
+    dbm.delete_conversation(conn, "claude_code:s1")
+    assert dbm.set_summary_if_current(conn, "claude_code:s1", {"problem": "zombie"}, "r1") is False
+    assert dbm.get_summary(conn, "claude_code:s1") is None
+
+
+def test_remove_conversation_drops_content_without_blocklisting(tmp_path):
+    conn = _open(tmp_path)
+    dbm.upsert_conversation(conn, _conv(), "globex", "path", [], None, "1", _embed_zero)
+    dbm.set_summary(conn, "claude_code:s1", {"problem": "p"}, "1")
+    assert dbm.remove_conversation(conn, "claude_code:s1") is True
+    for table in ("conversations", "messages", "vec_messages", "conversation_summary"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, table
+    assert dbm.get_deleted_ids(conn) == set()
+    assert dbm.remove_conversation(conn, "claude_code:s1") is False
 
 
 def test_v6_conversation_vectors_take_the_existing_message_vector_dim(tmp_path):
