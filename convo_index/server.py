@@ -248,6 +248,7 @@ def handle_analytics():
     return json.dumps(A.analytics(_db(), CFG.load()))
 
 
+
 _refresh_lock = threading.Lock()
 
 
@@ -376,6 +377,8 @@ class Handler(BaseHTTPRequestHandler):
         path, qs = u.path, parse_qs(u.query)
         if path == "/":
             return self._send_file("index.html", "text/html")
+        if path == "/analytics":
+            return self._send_file("analytics.html", "text/html")
         if path.startswith("/static/"):
             name = path[len("/static/"):]
             ctype = ("text/css" if name.endswith(".css")
