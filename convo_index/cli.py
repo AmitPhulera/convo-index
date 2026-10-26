@@ -568,6 +568,7 @@ def main(argv=None):
     p_up.add_argument("--no-schedule", action="store_true", help="do not install the daily refresh")
     p_up.add_argument("--no-open", action="store_true", help="do not open the UI in a browser")
     p_up.add_argument("--wait", action="store_true", help="build the index in the foreground instead of the background")
+    sub.add_parser("mcp", help="MCP server over stdio (search_conversations, get_conversation, get_related)")
     p_jobs = sub.add_parser("jobs", help="derived-job maintenance")
     p_jobs.add_argument("action", choices=["unblock"], help="unblock: re-queue jobs blocked on auth/config now")
     p_res = sub.add_parser("resummarize", help="forget summary jobs so the next index run re-summarizes")
@@ -610,6 +611,9 @@ def main(argv=None):
         return cmd_service(args)
     if args.cmd == "up":
         return cmd_up(args)
+    if args.cmd == "mcp":
+        from convo_index import mcp
+        return mcp.serve()
     if args.cmd == "resummarize":
         return cmd_resummarize(args)
     if args.cmd == "jobs":

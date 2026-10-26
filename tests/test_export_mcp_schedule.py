@@ -1,4 +1,5 @@
 """Export, MCP server, scheduler plan and the CLI round trips."""
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 from convo_index import cli
 from convo_index import db as dbm
 from convo_index import export as X
+from convo_index import mcp
 from convo_index import schedule as SCH
 from convo_index import settings as S
 from convo_index.model import Conversation, Message, UsageRecord, KIND_TOOL_CALL, KIND_TOOL_RESULT
@@ -56,6 +58,58 @@ def test_export_dict_and_markdown(tmp_path, monkeypatch):
     assert "### Assistant → tool" not in md and "Restart the deployment." in md          # tools excluded by default
     assert "```" in X.as_markdown(conn, "claude_code:s0", st, include_tools=True)
     assert X.as_dict(conn, "claude_code:nope", st) is None and X.as_markdown(conn, "claude_code:nope", st) is None
+
+
+def test_mcp_handshake_tools_and_calls(tmp_path, monkeypatch):
+    st, db = _seed(tmp_path, monkeypatch)
+    monkeypatch.setattr("convo_index.server.embed", lambda texts: [None] * len(texts))
+    init = mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}, st)
+    assert init["result"]["protocolVersion"] == "2025-03-26" and init["result"]["serverInfo"]["name"] == "convo-index"
+    assert mcp.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}, st) is None
+    tools = mcp.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, st)["result"]["tools"]
+    assert [t["name"] for t in tools] == ["search_conversations", "get_conversation", "get_related"]
+    assert all("inputSchema" in t and t["inputSchema"]["type"] == "object" for t in tools)
+    r = mcp.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "search_conversations", "arguments": {"query": "kubernetes", "limit": 5}}}, st)["result"]
+    assert not r.get("isError") and r["structuredContent"]["count"] == 1
+    hit = r["structuredContent"]["results"][0]
+    assert hit["id"] == "claude_code:s0" and hit["source"] == "claude_code" and hit["fidelity"] == "full" and "snippet" in hit
+    assert json.loads(r["content"][0]["text"])["count"] == 1
+    r = mcp.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": {"name": "search_conversations", "arguments": {"query": "", "tags": ["workspace:globex"]}}}, st)["result"]
+    assert [h["id"] for h in r["structuredContent"]["results"]] == ["claude_code:s0"]
+    g = mcp.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                    "params": {"name": "get_conversation", "arguments": {"id": "s0"}}}, st)["result"]   # legacy bare id resolves
+    assert g["structuredContent"]["title"] == "Kube deploy" and len(g["structuredContent"]["messages"]) == 2   # no tools by default
+    assert g["structuredContent"]["usage"]["requests"] == 1
+    rel = mcp.handle({"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                      "params": {"name": "get_related", "arguments": {"key": "SAAS-42"}}}, st)["result"]["structuredContent"]
+    assert rel["kind"] == "ticket" and [c["id"] for c in rel["conversations"]] == ["claude_code:s0"]
+    # errors never kill the loop
+    e = mcp.handle({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "get_conversation", "arguments": {"id": "claude_code:nope"}}}, st)
+    assert e["result"]["isError"] and e["result"]["content"][0]["text"] == "not found"
+    e = mcp.handle({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "search_conversations", "arguments": {"query": "x", "mode": "psychic"}}}, st)
+    assert e["result"]["isError"] and "mode" in e["result"]["content"][0]["text"]
+    assert mcp.handle({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "nope"}}, st)["error"]["code"] == -32602
+    assert mcp.handle({"jsonrpc": "2.0", "id": 10, "method": "resources/list"}, st)["error"]["code"] == -32601
+    # hidden conversations stay out of results
+    conn = dbm.connect(db); dbm.set_hidden(conn, "claude_code:s0", True); conn.close()
+    r = mcp.handle({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                    "params": {"name": "search_conversations", "arguments": {"query": "kubernetes"}}}, st)["result"]
+    assert r["structuredContent"]["count"] == 0
+
+
+def test_mcp_serve_over_streams(tmp_path, monkeypatch):
+    st, db = _seed(tmp_path, monkeypatch)
+    monkeypatch.setattr("convo_index.server.embed", lambda texts: [None] * len(texts))
+    stdin = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+                        'not json\n'
+                        '{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
+                        '{"jsonrpc":"2.0","id":2,"method":"ping"}\n')
+    out = io.StringIO()
+    assert mcp.serve(stdin, out, st) == 0
+    lines = [json.loads(l) for l in out.getvalue().splitlines()]
+    assert [l.get("id") for l in lines] == [1, None, 2] and lines[1]["error"]["code"] == -32700 and lines[2]["result"] == {}
 
 
 def test_schedule_plans_per_platform_without_touching_the_system(tmp_path, monkeypatch):
@@ -151,6 +205,26 @@ def test_schedule_install_print_shows_the_plan(tmp_path, monkeypatch, capsys):
     assert cli.main(["schedule", "install", "--hour", "25", "--print"]) == 2
 
 
+def test_mcp_never_returns_hidden_conversations_and_ignores_idless_requests(tmp_path, monkeypatch):
+    st, db = _seed(tmp_path, monkeypatch)
+    conn = dbm.connect(db); dbm.set_hidden(conn, "claude_code:s0", True); conn.close()
+    r = mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_conversation", "arguments": {"id": "claude_code:s0"}}}, st)
+    assert r["result"]["isError"] and r["result"]["content"][0]["text"] == "not found"
+    assert mcp.handle({"jsonrpc": "2.0", "method": "initialized"}, st) is None            # id-less = notification
+    assert mcp.handle({"jsonrpc": "2.0", "method": "cancelled", "params": {}}, st) is None
+    out = io.StringIO()
+    mcp.serve(io.StringIO('{"jsonrpc":"2.0","method":"whatever"}\n'), out, st)
+    assert out.getvalue() == ""
+    monkeypatch.setattr("convo_index.server.embed", lambda texts: [None] * len(texts))
+    r = mcp.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "search_conversations", "arguments": {"query": "", "tags": "workspace:globex"}}}, st)
+    assert r["result"]["structuredContent"]["count"] == 0                                   # string tag accepted, s0 hidden
+    conn = dbm.connect(db); dbm.set_hidden(conn, "claude_code:s0", False); conn.close()
+    r = mcp.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "search_conversations", "arguments": {"query": "", "tags": "workspace:globex"}}}, st)
+    assert [h["id"] for h in r["result"]["structuredContent"]["results"]] == ["claude_code:s0"]
+
+
 def test_markdown_fences_outlast_backticks_in_tool_output(tmp_path, monkeypatch):
     st, db = _seed(tmp_path, monkeypatch)
     conn = dbm.connect(db)
@@ -194,6 +268,47 @@ def test_coverage_counts_only_token_bearing_requests(tmp_path):
     assert a["requests"] == 10 and a["token_requests"] == 1 and a["priced_requests"] == 0 and a["coverage"] == 0.0
     assert K.aggregate([("anthropic", "<synthetic>", 3, 0, 0, 0, 0, 0, None, 0)], p)["coverage"] is None
     assert p.rates("gpt-4o-2024-08-06")["input"] == 2.5 and p.rates("claude-3-5-sonnet-20241022")["input"] == 3.0
+
+
+def test_mcp_survives_malformed_requests_and_reports_missing_index(tmp_path, monkeypatch):
+    st, db = _seed(tmp_path, monkeypatch)
+    out = io.StringIO()
+    mcp.serve(io.StringIO('{"jsonrpc":"2.0","id":1,"method":5}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":[1]}\n'
+                          '{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}\n'
+                          '{"jsonrpc":"2.0","id":4,"method":"ping"}\n'), out, st)
+    lines = [json.loads(l) for l in out.getvalue().splitlines()]
+    assert [l["id"] for l in lines] == [1, 2, 3, 4]
+    assert lines[0]["error"]["code"] == -32600 and lines[1]["error"]["code"] == -32600
+    assert lines[2]["result"]["protocolVersion"] == mcp.PROTOCOL and lines[2]["result"]["serverInfo"]["version"] not in ("", None)
+    assert lines[3]["result"] == {}
+    monkeypatch.setattr(mcp, "handle", lambda msg, settings=None: 1 / 0)
+    out = io.StringIO(); mcp.serve(io.StringIO('{"jsonrpc":"2.0","id":9,"method":"ping"}\n'), out, st)
+    assert json.loads(out.getvalue())["error"]["code"] == -32603                       # internal error, loop alive
+    monkeypatch.undo()
+    st, db = _seed(tmp_path / "b", monkeypatch)
+    monkeypatch.setenv("CONVO_INDEX_DB", str(tmp_path / "nowhere" / "convos.db"))
+    r = mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_related", "arguments": {"key": "X-1"}}}, st)
+    assert r["result"]["isError"] and "no index" in r["result"]["content"][0]["text"] and not (tmp_path / "nowhere").exists()
+    # a hybrid query embeds first; that must not open (and so create) the missing database either
+    monkeypatch.setattr("convo_index.server.embed", lambda texts: 1 / 0)
+    r = mcp.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "search_conversations", "arguments": {"query": "pods"}}}, st)
+    assert r["result"]["isError"] and "no index" in r["result"]["content"][0]["text"] and not (tmp_path / "nowhere").exists()
+
+
+def test_mcp_semantic_without_embedder_is_an_error_and_limits_are_clamped(tmp_path, monkeypatch):
+    st, db = _seed(tmp_path, monkeypatch)
+    monkeypatch.setattr("convo_index.server.embed", lambda texts: [None] * len(texts))
+    monkeypatch.setattr("convo_index.server.semantic_status", lambda: (False, "no embedder configured"))
+    r = mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "search_conversations", "arguments": {"query": "kubernetes", "mode": "semantic"}}}, st)["result"]
+    assert r["isError"] and "no embedder" in r["content"][0]["text"]
+    r = mcp.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "search_conversations", "arguments": {"query": "kubernetes"}}}, st)["result"]
+    assert r["structuredContent"]["count"] == 1 and "keyword results only" in r["structuredContent"]["note"]
+    g = mcp.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "get_conversation", "arguments": {"id": "claude_code:s0", "max_messages": -1, "max_chars": 1, "include_tools": True}}}, st)["result"]
+    assert len(g["structuredContent"]["messages"]) == 1 and "more chars" not in g["structuredContent"]["messages"][0]["text"]   # clamped to 1 / 200
 
 
 def test_schedule_passes_env_through_and_refuses_a_missing_config(tmp_path, monkeypatch):
@@ -325,3 +440,16 @@ def test_windows_tasks_register_run_and_unregister(tmp_path, monkeypatch):
     un = SCH.uninstall(st, system="Windows")
     assert all(r["ok"] for r in un["results"]), un["results"]
     assert SCH.status(st, system="Windows")["installed"] is False and not (tmp_path / "Jos\u00e9 data" / "convo-index-test.xml").exists()
+
+
+def test_mcp_streams_are_utf8_whatever_the_console_code_page(tmp_path, monkeypatch):
+    st, db = _seed(tmp_path, monkeypatch)
+    conn = dbm.connect(db)
+    conn.execute("UPDATE conversations SET title='\u65e5\u672c\u8a9e' WHERE id='claude_code:s0'"); conn.commit(); conn.close()
+    req = ('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_conversation","arguments":{"id":"claude_code:s0"}}}\n'
+           '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_conversations","arguments":{"query":"\u00e9","mode":"keyword"}}}\n')
+    stdin = io.TextIOWrapper(io.BytesIO(req.encode("utf-8")), encoding="cp1252")        # what Windows hands a console app
+    raw = io.BytesIO(); stdout = io.TextIOWrapper(raw, encoding="cp1252")
+    assert mcp.serve(stdin, stdout, st) == 0
+    lines = [json.loads(l) for l in raw.getvalue().decode("utf-8").splitlines()]
+    assert "\u65e5\u672c\u8a9e" in lines[0]["result"]["content"][0]["text"] and "error" not in lines[1]
