@@ -235,6 +235,125 @@ def cmd_related(args):
     return 0
 
 
+def _since_ts(spec):
+    """'30d' | '12h' | '2026-06-01' -> ISO timestamp lower bound."""
+    import re as _re
+    from datetime import datetime, timedelta, timezone
+    m = _re.fullmatch(r"(\d+)([dhw])", spec or "")
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        delta = timedelta(days=n) if unit == "d" else timedelta(hours=n) if unit == "h" else timedelta(weeks=n)
+        return (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if _re.fullmatch(r"\d{4}-\d{2}-\d{2}", spec or ""):
+        return spec + "T00:00:00Z"
+    print(f"--since: expected 30d, 12h, 2w or YYYY-MM-DD, got {spec!r}", file=sys.stderr)
+    raise SystemExit(2)   # usage error, like argparse
+
+
+def cmd_search(args):
+    from convo_index import settings as S
+    from convo_index import db as dbm
+    from convo_index import search as SE
+    settings = S.load()
+    q = (args.query or "").strip()
+    since = _since_ts(args.since) if args.since else None   # usage errors before the embedder loads
+    qvec = None
+    if q and args.mode in ("hybrid", "semantic"):
+        from convo_index import server
+        qvec = server.embed([q])[0]
+        if qvec is None and args.mode == "semantic":
+            print(server.semantic_status()[1] or "semantic search unavailable", file=sys.stderr)
+            return 1
+    conn = dbm.connect(settings.db_path())
+    try:
+        hits = SE.search(conn, q, qvec, mode=args.mode, limit=max(1, args.limit),
+                         source=args.source, project=args.project, tags=args.tag, since=since)
+    finally:
+        conn.close()
+    if args.json:
+        print(json.dumps(hits, ensure_ascii=False, indent=1))
+        return 0
+    for h in hits:
+        tags = " ".join(f"#{t}" for ts in (h.get("tags") or {}).values() for t in ts)
+        print(f"{(h.get('start_ts') or '')[:10]}  {h['id']:40s} {h.get('title') or ''}"[:140])
+        extra = "  ".join(x for x in (h.get("cwd") or "", tags, (h.get("snippet") or "").replace("\n", " ")[:120]) if x)
+        if extra:
+            print(f"            {extra}")
+    print(f"{len(hits)} result(s)", file=sys.stderr)
+    return 0
+
+
+def cmd_export(args):
+    from convo_index import settings as S
+    from convo_index import db as dbm
+    from convo_index import export as X
+    settings = S.load()
+    conn = dbm.connect(settings.db_path())
+    try:
+        try:
+            cid = dbm.resolve_id(conn, args.id)
+        except dbm.AmbiguousId as e:
+            print(f"ambiguous id; use one of {e.args[0]}", file=sys.stderr)
+            return 1
+        body = X.as_markdown(conn, cid, settings, include_tools=args.tools) if args.md else \
+            X.as_dict(conn, cid, settings, include_tools=args.tools)
+    finally:
+        conn.close()
+    if body is None:
+        print(f"no conversation {args.id}", file=sys.stderr)
+        return 1
+    text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False, indent=1)
+    if args.out:
+        out_path = Path(args.out).expanduser()
+        if out_path.exists() and not args.force:
+            print(f"{out_path} exists; use --force to overwrite", file=sys.stderr)
+            return 1
+        out_path.write_text(text, encoding="utf-8")
+        print(f"wrote {args.out}", file=sys.stderr)
+    else:
+        print(text)
+    return 0
+
+
+def cmd_backup(args):
+    import sqlite3
+    from convo_index import settings as S
+    src_path = S.load().db_path()
+    if not src_path.exists():
+        print(f"no database at {src_path}", file=sys.stderr)
+        return 1
+    raw = str(args.path)
+    dest = Path(raw).expanduser()
+    if dest.is_dir() or raw.endswith(("/", os.sep)):
+        import time
+        dest.mkdir(parents=True, exist_ok=True)               # a trailing slash means "a directory, create it"
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        dest, n = dest / f"{src_path.name}.{stamp}", 1
+        while dest.exists():                                  # two backups within a second
+            dest, n = dest.with_name(f"{src_path.name}.{stamp}-{n}"), n + 1
+    if dest.exists():
+        print(f"{dest} exists; refusing to overwrite", file=sys.stderr)
+        return 1
+    if not dest.parent.is_dir():
+        print(f"{dest.parent} is not a directory; add a trailing slash to create a backup directory", file=sys.stderr)
+        return 1
+    src = sqlite3.connect(str(src_path))
+    try:
+        dst = sqlite3.connect(str(dest))
+        try:
+            src.backup(dst)
+        except BaseException:
+            dst.close()
+            dest.unlink(missing_ok=True)          # never leave a half-written copy behind
+            raise
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    print(f"backed up {src_path} -> {dest} ({dest.stat().st_size} bytes)")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="convo-index",
                                  description="Index and browse AI coding-assistant conversations.")
@@ -259,6 +378,23 @@ def main(argv=None):
     p_tag.add_argument("--retag", action="store_true", help="clear LLM tag evidence so the next index re-tags")
     p_tag.add_argument("--calibrate", action="store_true", help="how past neighbour suggestions fared against your decisions")
     p_tag.add_argument("--suggestions", action="store_true", help="list open neighbour suggestions")
+    p_search = sub.add_parser("search", help="search the index from the terminal")
+    p_search.add_argument("query", nargs="?", default="", help="search text; empty lists recent conversations")
+    p_search.add_argument("--source", choices=["claude_code", "opencode", "codex", "antigravity"])
+    p_search.add_argument("--tag", action="append", default=[], help="group:tag filter (repeatable)")
+    p_search.add_argument("--project", help="repo root / cwd")
+    p_search.add_argument("--since", help="e.g. 30d, 12h, 2026-06-01")
+    p_search.add_argument("--mode", choices=["hybrid", "keyword", "semantic"], default="hybrid")
+    p_search.add_argument("--limit", type=int, default=20)
+    p_search.add_argument("--json", action="store_true")
+    p_exp = sub.add_parser("export", help="export one conversation as JSON (default) or Markdown")
+    p_exp.add_argument("id")
+    p_exp.add_argument("--md", action="store_true", help="Markdown transcript")
+    p_exp.add_argument("--tools", action="store_true", help="include tool calls and results")
+    p_exp.add_argument("-o", "--out", help="write to this file instead of stdout")
+    p_exp.add_argument("--force", action="store_true", help="overwrite an existing --out file")
+    p_bak = sub.add_parser("backup", help="copy the database (SQLite backup API, WAL-safe) to a path")
+    p_bak.add_argument("path")
     args = ap.parse_args(argv)
 
     if args.config:
@@ -284,6 +420,12 @@ def main(argv=None):
         return cmd_tag(args)
     if args.cmd == "related":
         return cmd_related(args)
+    if args.cmd == "search":
+        return cmd_search(args)
+    if args.cmd == "export":
+        return cmd_export(args)
+    if args.cmd == "backup":
+        return cmd_backup(args)
     if args.cmd == "config":
         from convo_index import settings as S
         if args.what == "path":

@@ -1,6 +1,9 @@
 """Export, MCP server, scheduler plan and the CLI round trips."""
+import json
 
+import pytest
 
+from convo_index import cli
 from convo_index import db as dbm
 from convo_index import export as X
 from convo_index import settings as S
@@ -52,6 +55,38 @@ def test_export_dict_and_markdown(tmp_path, monkeypatch):
     assert X.as_dict(conn, "claude_code:nope", st) is None and X.as_markdown(conn, "claude_code:nope", st) is None
 
 
+def test_cli_search_export_backup(tmp_path, monkeypatch, capsys):
+    st, db = _seed(tmp_path, monkeypatch)
+    monkeypatch.setattr("convo_index.server.embed", lambda texts: [None] * len(texts))
+    assert cli.main(["search", "kubernetes", "--json"]) == 0
+    hits = json.loads(capsys.readouterr().out)
+    assert [h["id"] for h in hits] == ["claude_code:s0"]
+    assert cli.main(["search", "", "--tag", "workspace:globex"]) == 0
+    out = capsys.readouterr()
+    assert "claude_code:s0" in out.out and "1 result(s)" in out.err
+    assert cli.main(["search", "kubernetes", "--since", "1d", "--json"]) == 0 and json.loads(capsys.readouterr().out) == []
+    assert cli.main(["search", "kubernetes", "--since", "2026-06-01", "--json"]) == 0 and len(json.loads(capsys.readouterr().out)) == 1
+    with pytest.raises(SystemExit):
+        cli.main(["search", "x", "--since", "yesterday"])
+    assert cli.main(["search", "kubernetes", "--mode", "semantic"]) == 1            # no embedder: says why
+    capsys.readouterr()
+    assert cli.main(["export", "s0"]) == 0
+    d = json.loads(capsys.readouterr().out)
+    assert d["id"] == "claude_code:s0" and d["messages_total"] == 4
+    out_md = tmp_path / "x.md"
+    assert cli.main(["export", "claude_code:s0", "--md", "-o", str(out_md)]) == 0 and out_md.read_text().startswith("# Kube deploy")
+    assert cli.main(["export", "claude_code:nope"]) == 1
+    capsys.readouterr()
+    dest = tmp_path / "backups" / "copy.db"
+    assert cli.main(["backup", str(dest)]) == 1                                       # parent dir missing: refused, no stray file
+    assert not (tmp_path / "backups").exists()
+    assert cli.main(["backup", str(tmp_path / "backups") + "/"]) == 0                 # trailing slash: create the dir, timestamped file
+    assert (tmp_path / "backups").is_dir() and len(list((tmp_path / "backups").iterdir())) == 1
+    assert cli.main(["backup", str(dest)]) == 0 and dest.exists()
+    assert cli.main(["backup", str(dest)]) == 1                                       # never overwrites
+    assert cli.main(["backup", str(tmp_path / "backups")]) == 0                       # existing directory -> timestamped file
+
+
 def test_markdown_fences_outlast_backticks_in_tool_output(tmp_path, monkeypatch):
     st, db = _seed(tmp_path, monkeypatch)
     conn = dbm.connect(db)
@@ -82,6 +117,16 @@ def test_markdown_export_escapes_heading_lines_and_single_lines_the_title(tmp_pa
     conn.commit()
     md = X.as_markdown(conn, "claude_code:s0", st)
     assert md.startswith("# multi line title\n") and "\\### Assistant · spoofed" in md and md.count("\n### Assistant") == 1
+
+
+def test_export_refuses_to_overwrite_without_force_and_since_is_a_usage_error(tmp_path, monkeypatch, capsys):
+    st, db = _seed(tmp_path, monkeypatch)
+    out = tmp_path / "x.json"; out.write_text("keep")
+    assert cli.main(["export", "s0", "-o", str(out)]) == 1 and out.read_text() == "keep"
+    assert cli.main(["export", "s0", "-o", str(out), "--force"]) == 0 and out.read_text() != "keep"
+    with pytest.raises(SystemExit) as e:
+        cli.main(["search", "x", "--since", "yesterday"])
+    assert e.value.code == 2
 
 
 def test_markdown_export_keeps_code_blocks_as_they_are(tmp_path, monkeypatch):
