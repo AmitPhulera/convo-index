@@ -6,7 +6,8 @@ provider call is therefore retried on later runs without the source having to ch
 and never more than `max_attempts` times for the same inputs. A fingerprint change
 (new transcript, new prompt version, new backend/model) resets the attempts.
 
-Kinds: `summary`. Per-message vectors for search are not
+Kinds: `summary` and `tags` (LLM
+tagging of groups that rules/decisions left open). Per-message vectors for search are not
 jobs: `backfill_vectors` fills them against the embedder fingerprint in index_meta.
 """
 from __future__ import annotations
@@ -17,6 +18,7 @@ from convo_index import db as dbm
 from convo_index import settings as S
 from convo_index.providers import registry as R
 from convo_index import summarize as SM
+from convo_index import tags as T
 from convo_index.model import KIND_TEXT
 
 SUMMARY = "summary"
@@ -205,6 +207,14 @@ def dispatch(conn, settings=None, attempted=None, embed_fn=None, embedder_fp=Non
             if run_summary(conn, cid, title, revision, transcript_from_db(conn, cid), settings) == "ok":
                 out["summaries_ok"] += 1
     out.update({"tags": 0, "tags_ok": 0})
+    if settings.llm_job("classify")["backend"]:
+        for cid in pending_tags(conn, settings, max(0, budget - out["summaries"])):
+            if (cid, TAGS) in attempted:
+                continue
+            attempted.add((cid, TAGS))
+            out["tags"] += 1
+            if run_tags(conn, cid, settings) in ("ok", "nothing"):
+                out["tags_ok"] += 1
     return out
 
 
@@ -248,6 +258,129 @@ def missing_summaries(conn, settings=None, limit=25):
         out["retried"] += 1
         if run_summary(conn, cid, title, revision, transcript_from_db(conn, cid), settings) == "ok":
             out["ok"] += 1
+    return out
+
+
+def _tags_fp(defs_rev, source_rev, summary_fp, spec, has_vector=False):
+    """summary_fp: the summary *job's* fingerprint when there is one (it changes when the
+    summary model/prompt changes and the text is regenerated), else the summarized revision.
+    has_vector: few-shot examples exist only once the conversation has a vector, so a tagging
+    done without one is re-done (once) when the vector arrives."""
+    base = (f"{defs_rev or ''}|{source_rev or ''}|{summary_fp or ''}|v{1 if has_vector else 0}"
+            f"|{spec['backend']}|{spec['model']}|t{T.PROMPT_VERSION}")
+    return base + (f"|{spec['base_url']}" if spec.get("base_url") else "")   # endpoint changes re-tag too
+
+
+def tags_fingerprint(conn, cid, settings):
+    """Inputs of the LLM tagging step: definitions revision, the conversation's source
+    revision (title/first prompt live there), the summary revision it may use, and the
+    classify backend/model. Rules are re-applied on every ingest and are not part of it."""
+    spec = settings.llm_job("classify")
+    row = conn.execute(
+        """SELECT c.source_revision, COALESCE(js.input_fingerprint, s.summarized_revision), cv.vid IS NOT NULL
+           FROM conversations c
+           LEFT JOIN conversation_summary s ON s.conversation_id = c.id
+           LEFT JOIN derived_jobs js ON js.conversation_id = c.id AND js.kind = 'summary' AND js.status = 'ok'
+           LEFT JOIN conv_vec_ids cv ON cv.conversation_id = c.id
+           WHERE c.id=?""", (cid,)).fetchone()
+    return _tags_fp(dbm.get_meta(conn, T.META_REVISION), row[0] if row else None, row[1] if row else None, spec,
+                    bool(row[2]) if row else False)
+
+
+def record_tags_covered(conn, cid, settings):
+    """Called at ingest after rules/decisions were applied: when nothing is left for the LLM,
+    mark the tags job done so the dispatcher never has to discover that by scanning."""
+    if not T.unresolved_groups(conn, cid):
+        _record(conn, cid, TAGS, tags_fingerprint(conn, cid, settings), "ok", None, reset=True)
+        return True
+    return False
+
+
+def run_tags(conn, cid, settings=None):
+    """LLM tagging for the groups that rules and decisions left open. Returns
+    'ok' | 'skipped' | 'nothing' | 'failed' | 'exhausted' | 'unconfigured'."""
+    settings = settings or S.load()
+    max_attempts = int(settings["summary"]["max_attempts"])
+    fp = tags_fingerprint(conn, cid, settings)
+    job = get_job(conn, cid, TAGS)
+    same = job is not None and job["fingerprint"] == fp
+    if same and job["status"] == "ok":
+        return "skipped"
+    if job is not None and job["status"] == "ok" and job["fingerprint"] is None:
+        _record(conn, cid, TAGS, fp, "ok", None, reset=True)    # migrated seed: adopt, do not re-tag
+        return "skipped"
+    if same and (job["attempts"] >= max_attempts or job["status"] == BLOCKED):
+        return "exhausted"
+    if not settings.llm_job("classify")["backend"]:
+        return "unconfigured"
+    row = T.conv_row(conn, cid)
+    if row is None:
+        return "failed"
+    status, res = T.llm_tag(conn, cid, row, settings)
+    if status == "stale":
+        return "skipped"      # the conversation changed or vanished during the call: nothing recorded
+    if status == "nothing":
+        _record(conn, cid, TAGS, fp, "ok", None, reset=True)
+        T.resolve(conn, cid)
+        return "nothing"
+    if status == "failed":
+        _record_failure(conn, cid, TAGS, fp, res, not same, max_attempts, settings)
+        return "failed"
+    T.resolve(conn, cid)
+    _record(conn, cid, TAGS, fp, "ok", None, reset=True)
+    return "ok"
+
+
+def pending_tags(conn, settings, limit):
+    """Conversations whose tags job is missing, failed-but-retryable, or stale, selected in
+    SQL (fingerprint compared in the query) over a bounded candidate window; then the ones
+    with nothing left for the LLM are marked done. Never scans the whole table in Python.
+    Seeded rows (status ok, fingerprint NULL) take the current inputs as their baseline."""
+    if limit <= 0:
+        return []   # the run's budget is spent: no candidate, no bookkeeping
+    groups = T.load_groups(conn)
+    if not groups:
+        return []
+    spec = settings.llm_job("classify")
+    max_attempts = int(settings["summary"]["max_attempts"])
+    defs_rev = dbm.get_meta(conn, T.META_REVISION) or ""
+    sf, sp = source_filter(settings)
+    tail = f"|{spec['backend']}|{spec['model']}|t{T.PROMPT_VERSION}" + (f"|{spec['base_url']}" if spec.get("base_url") else "")
+    fp_expr = ("? || '|' || COALESCE(c.source_revision, '') || '|' || COALESCE(js.input_fingerprint, s.summarized_revision, '')"
+               " || (CASE WHEN cv.vid IS NULL THEN '|v0' ELSE '|v1' END) || ?")
+    # Seeded rows (status ok, no fingerprint) adopt the current inputs as their baseline once,
+    # so a later change of definitions, revision or summary is noticed like any other.
+    conn.execute(
+        f"""UPDATE derived_jobs SET input_fingerprint = (
+                SELECT {fp_expr} FROM conversations c
+                LEFT JOIN conversation_summary s ON s.conversation_id = c.id
+                LEFT JOIN derived_jobs js ON js.conversation_id = c.id AND js.kind = 'summary' AND js.status = 'ok'
+                LEFT JOIN conv_vec_ids cv ON cv.conversation_id = c.id
+                WHERE c.id = derived_jobs.conversation_id)
+            WHERE kind = ? AND status = 'ok' AND input_fingerprint IS NULL""", (defs_rev, tail, TAGS))
+    conn.commit()
+    rows = conn.execute(
+        f"""SELECT c.id FROM conversations c
+            LEFT JOIN derived_jobs j ON j.conversation_id = c.id AND j.kind = ?
+            LEFT JOIN conversation_summary s ON s.conversation_id = c.id
+            LEFT JOIN derived_jobs js ON js.conversation_id = c.id AND js.kind = 'summary' AND js.status = 'ok'
+            LEFT JOIN conv_vec_ids cv ON cv.conversation_id = c.id
+            LEFT JOIN conversation_state st ON st.conversation_id = c.id
+            WHERE COALESCE(st.deleted, 0) = 0{sf} AND (
+                  j.conversation_id IS NULL
+               OR (j.input_fingerprint IS NOT NULL AND j.input_fingerprint != {fp_expr})
+               OR (j.status = 'failed' AND j.input_fingerprint = {fp_expr} AND j.attempts < ?))
+            ORDER BY (j.conversation_id IS NULL) DESC, (j.status = 'failed') DESC, c.start_ts DESC
+            LIMIT ?""",
+        (TAGS, *sp, defs_rev, tail, defs_rev, tail, max_attempts, limit * 4)).fetchall()
+    out = []
+    for (cid,) in rows:
+        if not T.unresolved_groups(conn, cid, groups):
+            _record(conn, cid, TAGS, tags_fingerprint(conn, cid, settings), "ok", None, reset=True)
+            continue
+        out.append(cid)
+        if len(out) >= limit:
+            break
     return out
 
 

@@ -332,6 +332,28 @@ def test_recreate_vectors_validates_first_and_keeps_tables_on_bad_dim(tmp_path):
     assert dbm.vector_dim(conn) == 768 and dbm.get_meta(conn, "embedding_fingerprint") == "new"
 
 
+def test_parser_version_bump_carries_summary_and_tag_jobs_forward(tmp_path):
+    """A new adapter parser version changes every change key; an unchanged file must keep its
+    summary and its tags job instead of re-running the LLM over the archive."""
+    from convo_index import db as dbm, jobs
+    from convo_index.model import Conversation, Message
+    db = tmp_path / "t.db"
+    conn = dbm.connect(db); dbm.init_schema(conn, db)
+    conv = Conversation(source="claude_code", native_id="s", title="T", first_prompt="p", source_ref="/a", cwd="/x",
+                        messages=[Message(seq=0, role="user", text="hi")])
+    dbm.upsert_conversation(conn, conv, "unknown", None, [], None, "p2:100.5:42", lambda t: [None] * len(t))
+    dbm.set_summary(conn, conv.id, {"problem": "P", "solution": "S"}, "p2:100.5:42")
+    jobs._record(conn, conv.id, jobs.SUMMARY, "p2:100.5:42|p2|claude_cli|m||h9000t5000", "ok", None)
+    jobs._record(conn, conv.id, jobs.TAGS, "rev|p2:100.5:42||v0|claude_cli|m|t2", "ok", None)
+    dbm.upsert_conversation(conn, conv, "unknown", None, [], None, "p3:100.5:42", lambda t: [None] * len(t))   # same file, new parser
+    assert dbm.get_summarized_revision(conn, conv.id) == "p3:100.5:42"
+    assert jobs.get_job(conn, conv.id, jobs.SUMMARY)["fingerprint"].startswith("p3:100.5:42|")
+    assert jobs.get_job(conn, conv.id, jobs.TAGS)["fingerprint"] == "rev|p3:100.5:42||v0|claude_cli|m|t2"
+    dbm.upsert_conversation(conn, conv, "unknown", None, [], None, "p3:200.0:50", lambda t: [None] * len(t))   # the file really changed
+    assert dbm.get_summarized_revision(conn, conv.id) == "p3:100.5:42"                                  # summary is now stale, as it should be
+    assert dbm.same_content_revision("p2:a", "p3:a") and not dbm.same_content_revision("p2:a", "p2:b") and not dbm.same_content_revision(None, "x")
+
+
 def test_titles_are_capped_to_one_display_line(tmp_path):
     from convo_index import db as dbm
     from convo_index.model import Conversation, Message, display_title, TITLE_LIMIT

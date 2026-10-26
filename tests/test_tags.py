@@ -5,6 +5,7 @@ import pytest
 from convo_index import db as dbm
 from convo_index import tags as T
 from convo_index.model import Conversation, Message
+from convo_index.providers.base import LLMResult
 from tests.conftest import make_settings
 
 
@@ -166,6 +167,51 @@ def test_decisions_survive_reingest_but_evidence_is_rebuilt(tmp_path):
 
 # ---------------------------------------------------------------- LLM step
 
+def test_llm_schema_and_prompt(tmp_path):
+    conn = _db(tmp_path, multi_settings(tmp_path))
+    groups = T.load_groups(conn)
+    schema = T.llm_schema(groups)
+    assert schema["properties"]["workspace"] == {"anyOf": [{"type": "string", "enum": ["globex", "personal"]}, {"type": "null"}]}
+    assert schema["properties"]["topic"]["items"]["enum"] == ["infra", "review", "opencode-only"]
+    p = T.build_prompt(groups, {"title": "Ti", "first_prompt": "Pr", "source": "opencode", "cwd": "/c", "git_branch": "b"},
+                       {"problem": "P!", "solution": "S!"})
+    assert 'Group "workspace" (exclusive)' in p and 'Group "topic" (multi)' in p and "Summary: P! S!" in p
+    assert p.startswith("Classify this developer conversation")
+
+
+def test_llm_tag_only_asks_about_unresolved_groups_and_records_evidence(tmp_path, fake_llm):
+    s = multi_settings(tmp_path); s["llm"]["classify"] = {"backend": "claude_cli", "model": "m"}; s["privacy"]["hosted_processing"] = "allow"
+    conn = _db(tmp_path, s)
+    c = _conv(cwd="/globex/x")                                # workspace resolved by rule; topic open
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, _row(c))
+    f = fake_llm({"topic": ["infra", "bogus"]})
+    status, res = T.llm_tag(conn, c.id, _row(c), s)
+    assert status == "ok"
+    assert list(f.calls[0]["schema"]["properties"]) == ["topic"]
+    assert T.resolve(conn, c.id) == {"workspace": ["globex"], "topic": ["infra"]}   # bogus dropped
+    srcs = {r[0]: r[1] for r in conn.execute("SELECT tag, source FROM tag_assignments WHERE conversation_id=?", (c.id,))}
+    assert srcs == {"globex": "rule", "infra": "llm"}
+
+
+def test_llm_tag_nothing_when_everything_resolved(tmp_path, fake_llm):
+    conn = _db(tmp_path, make_settings(tmp_path))
+    c = _conv(cwd="/globex/x")
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, _row(c))
+    f = fake_llm({"workspace": "personal"})
+    assert T.llm_tag(conn, c.id, _row(c), make_settings(tmp_path))[0] == "nothing" and f.calls == []
+
+
+def test_llm_tag_failure_is_reported(tmp_path, fake_llm):
+    s = make_settings(tmp_path); s["llm"]["classify"] = {"backend": "claude_cli", "model": "m"}; s["privacy"]["hosted_processing"] = "allow"
+    conn = _db(tmp_path, s)
+    c = _conv(cwd="/nowhere")
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    fake_llm(LLMResult(ok=False, error="timeout"))
+    status, res = T.llm_tag(conn, c.id, _row(c), s)
+    assert status == "failed" and res.error == "timeout"
+
 
 def test_none_decision_is_single_row_and_cancelled_by_a_real_tag(tmp_path):
     conn = _db(tmp_path, multi_settings(tmp_path))
@@ -193,11 +239,43 @@ def test_invalid_decision_rejected_and_clear_whole_group(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM tag_decisions").fetchone()[0] == 0
 
 
+def test_multi_group_stays_open_for_llm_after_a_rule_hit(tmp_path, fake_llm):
+    s = multi_settings(tmp_path); s["llm"]["classify"] = {"backend": "claude_cli", "model": "m"}; s["privacy"]["hosted_processing"] = "allow"
+    conn = _db(tmp_path, s)
+    c = _conv(cwd="/globex/x", branch="infra/y")                      # workspace + topic:infra by rule
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, _row(c))
+    assert list(T.unresolved_groups(conn, c.id)) == ["topic"]         # exclusive closed, multi still open
+    fake_llm({"topic": ["review"]})
+    assert T.llm_tag(conn, c.id, _row(c), s)[0] == "ok"
+    assert T.resolve(conn, c.id) == {"workspace": ["globex"], "topic": ["infra", "review"]}
+
+
+def test_llm_tag_only_replaces_evidence_for_asked_groups(tmp_path, fake_llm):
+    s = multi_settings(tmp_path); s["llm"]["classify"] = {"backend": "claude_cli", "model": "m"}; s["privacy"]["hosted_processing"] = "allow"
+    conn = _db(tmp_path, s)
+    c = _conv(cwd="/nowhere"); dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    fake_llm({"workspace": "personal", "topic": ["infra"]})
+    T.llm_tag(conn, c.id, _row(c), s)
+    T.set_decision(conn, c.id, "workspace", "globex")                 # workspace now decided
+    fake_llm({"topic": ["review"]})
+    T.llm_tag(conn, c.id, _row(c), s)                                 # asks about topic only
+    kept = {(g, t) for g, t in conn.execute("SELECT group_name, tag FROM tag_evidence WHERE method='llm'")}
+    assert kept == {("workspace", "personal"), ("topic", "review")}
+
+
 def test_scalar_rule_values_are_one_value_not_characters(tmp_path):
     s = make_settings(tmp_path, tag_groups=[{"name": "workspace", "exclusive": True}],
                       tags=[{"name": "acme", "group": "workspace", "rules": {"path_contains": "acme"}}])
     assert T.definitions(s)["tags"][0]["rules"] == {"path_contains": ["acme"]}
     assert T.rule_matches({"path_contains": ["acme"]}, {"cwd": "/x/a"}) is None
+
+
+def test_legacy_migration_seeds_tags_jobs_as_done(tmp_path, settings):
+    conn = dbm.connect(tmp_path / "t.db"); dbm.init_schema(conn, tmp_path / "t.db")
+    dbm.upsert_conversation(conn, _conv("a"), "personal", "haiku", [], None, "1", lambda t: [None] * len(t))
+    T.sync_definitions(conn, settings)
+    assert conn.execute("SELECT status, input_fingerprint FROM derived_jobs WHERE kind='tags'").fetchone() == ("ok", None)
 
 
 def test_definition_change_rebuilds_rules_on_unchanged_conversations(tmp_path):
@@ -239,6 +317,52 @@ def test_rejecting_the_only_rule_candidate_reopens_an_exclusive_group(tmp_path):
     assert "workspace" in T.unresolved_groups(conn, c.id)               # empty group: ask the LLM
 
 
+def test_clearing_a_decision_reopens_the_tags_job(tmp_path, fake_llm):
+    from convo_index import jobs
+    s = multi_settings(tmp_path)
+    s["llm"]["classify"] = {"backend": "claude_cli", "model": "m"}; s["privacy"]["hosted_processing"] = "allow"
+    conn = _db(tmp_path, s)
+    c = _conv(cwd="/nowhere")
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.set_decision(conn, c.id, "workspace", "globex", suggest=False)
+    T.set_decision(conn, c.id, "topic", None, suggest=False)             # none: everything decided
+    assert jobs.pending_tags(conn, s, 10) == [] and jobs.get_job(conn, c.id, jobs.TAGS)["status"] == "ok"
+    T.clear_decision(conn, c.id, "workspace")
+    assert jobs.get_job(conn, c.id, jobs.TAGS) is None and jobs.pending_tags(conn, s, 10) == [c.id]
+    assert jobs.pending_tags(conn, s, 0) == []                            # spent budget: no candidate at all
+
+
+def test_slow_llm_result_is_discarded_when_the_conversation_moved(tmp_path, fake_llm):
+    from convo_index import jobs
+    s = multi_settings(tmp_path)
+    s["llm"]["classify"] = {"backend": "claude_cli", "model": "m"}; s["privacy"]["hosted_processing"] = "allow"
+    conn = _db(tmp_path, s)
+    c = _conv(cwd="/nowhere")
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    from convo_index.providers import registry as R
+    def slow(job, prompt, schema=None, settings=None, **kw):
+        dbm.delete_conversation(conn, c.id)                              # the user deletes it mid-call
+        return LLMResult(ok=True, data={"workspace": "globex", "topic": ["infra"]})
+    orig = R.complete; R.complete = slow
+    try:
+        assert T.llm_tag(conn, c.id, T.conv_row(conn, c.id), s)[0] == "stale"
+    finally:
+        R.complete = orig
+    assert conn.execute("SELECT COUNT(*) FROM tag_evidence WHERE conversation_id=?", (c.id,)).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM tag_assignments WHERE conversation_id=?", (c.id,)).fetchone()[0] == 0
+    # same for a re-ingest that bumps the source revision during the call
+    d = _conv("s2", cwd="/nowhere")
+    dbm.upsert_conversation(conn, d, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    def reingest(job, prompt, schema=None, settings=None, **kw):
+        dbm.upsert_conversation(conn, d, "unknown", None, [], None, "2", lambda t: [None] * len(t))
+        return LLMResult(ok=True, data={"workspace": "globex", "topic": []})
+    R.complete = reingest
+    try:
+        assert jobs.run_tags(conn, d.id, s) == "skipped" and jobs.get_job(conn, d.id, jobs.TAGS) is None
+    finally:
+        R.complete = orig
+
+
 def test_invalid_rules_are_reported_and_dropped(tmp_path, capsys):
     s = multi_settings(tmp_path)
     s["tags"][2]["rules"]["regex"] = ["(unclosed", "ansible"]
@@ -264,3 +388,16 @@ def test_category_conversion_goes_through_resolution_and_mirrors_source(tmp_path
     assert conn.execute("SELECT COUNT(*) FROM tag_assignments WHERE group_name='workspace'").fetchone()[0] == 2
     T.sync_definitions(conn, settings)                                  # idempotent
     assert conn.execute("SELECT COUNT(*) FROM tag_evidence WHERE definition_revision='legacy'").fetchone()[0] == 2
+
+
+def test_removed_accepted_tag_lets_rule_evidence_through(tmp_path):
+    s = multi_settings(tmp_path)
+    conn = _db(tmp_path, s)
+    c = _conv(cwd="/x", branch="infra/k8s")                           # the branch rule matches `infra`
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    T.set_decision(conn, c.id, "topic", "review", suggest=False)       # the user's pick wins over the rule
+    T.apply_rules(conn, c.id, _row(c)); T.resolve(conn, c.id)
+    assert T.assignments_for(conn, [c.id])[c.id]["topic"] == ["review"]
+    s["tags"] = [t for t in s["tags"] if t["name"] != "review"]      # `review` is removed from the config
+    T.sync_definitions(conn, s)
+    assert T.assignments_for(conn, [c.id])[c.id]["topic"] == ["infra"]  # the rule's candidate is no longer suppressed

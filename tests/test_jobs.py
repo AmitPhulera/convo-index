@@ -196,6 +196,91 @@ def test_backfill_skips_messages_deleted_during_embedding(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM vec_messages").fetchone()[0] == 0
 
 
+def _tag_db(tmp_path, settings):
+    from convo_index import tags as T
+    conn = dbm.connect(tmp_path / "t.db"); dbm.init_schema(conn, tmp_path / "t.db")
+    T.sync_definitions(conn, settings)
+    return conn
+
+
+def test_tags_job_runs_llm_for_open_groups_and_is_stable(tmp_path, llm_settings, fake_llm):
+    from convo_index import tags as T
+    conn = _tag_db(tmp_path, llm_settings)
+    c = _conv("s1"); c.cwd = "/nowhere"
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "r1", lambda t: [None] * len(t))
+    f = fake_llm({"workspace": "personal"})
+    assert jobs.run_tags(conn, "claude_code:s1", llm_settings) == "ok"
+    assert T.assignments_for(conn, ["claude_code:s1"])["claude_code:s1"] == {"workspace": ["personal"]}
+    assert conn.execute("SELECT category FROM conversations").fetchone() == ("personal",)
+    assert jobs.run_tags(conn, "claude_code:s1", llm_settings) == "skipped" and len(f.calls) == 1
+    # a summary arriving changes the inputs -> re-tagged once
+    dbm.set_summary(conn, "claude_code:s1", GOOD, "r1")
+    fake_llm({"workspace": "globex"})
+    assert jobs.run_tags(conn, "claude_code:s1", llm_settings) == "ok"
+    assert conn.execute("SELECT category FROM conversations").fetchone() == ("globex",)
+
+
+def test_tags_job_nothing_when_rules_cover_everything(tmp_path, llm_settings, fake_llm):
+    from convo_index import tags as T
+    conn = _tag_db(tmp_path, llm_settings)
+    c = _conv("s1"); c.cwd = "/Users/me/globex/hq"
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "r1", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, {"cwd": c.cwd, "git_branch": None, "title": "T", "first_prompt": "hi", "source": "claude_code"})
+    f = fake_llm({"workspace": "personal"})
+    assert jobs.run_tags(conn, c.id, llm_settings) == "nothing" and f.calls == []
+    assert jobs.pending_tags(conn, llm_settings, 10) == []
+
+
+def test_dispatch_tags_after_summaries_within_budget(tmp_path, llm_settings, fake_llm):
+    conn = _tag_db(tmp_path, llm_settings)
+    for i in range(3):
+        c = _conv(f"s{i}"); c.cwd = "/nowhere"
+        dbm.upsert_conversation(conn, c, "unknown", None, [], None, "r1", lambda t: [None] * len(t))
+    llm_settings["summary"]["per_run"] = 4
+    f = fake_llm(GOOD, GOOD, GOOD, {"workspace": "personal"}, {"workspace": "globex"})
+    out = jobs.dispatch(conn, llm_settings)
+    assert out["summaries"] == 3 and out["tags"] == 1          # budget 4: 3 summaries + 1 tag call
+    out = jobs.dispatch(conn, llm_settings)
+    assert out["summaries"] == 0 and out["tags"] == 2          # next run tags the remaining two
+    assert len(f.calls) == 6                                    # (the fake answers the 6th with a failure)
+
+
+def test_tags_job_unconfigured_and_failure(tmp_path, settings, llm_settings, fake_llm):
+    conn = _tag_db(tmp_path, llm_settings)
+    c = _conv("s1"); c.cwd = "/nowhere"
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "r1", lambda t: [None] * len(t))
+    assert jobs.run_tags(conn, c.id, settings) == "unconfigured"
+    fake_llm(LLMResult(ok=False, error="auth", detail="login"))
+    assert jobs.run_tags(conn, c.id, llm_settings) == "failed"
+    assert jobs.get_job(conn, c.id, "tags")["attempts"] == 3           # auth: exhausted immediately
+    assert jobs.run_tags(conn, c.id, llm_settings) == "exhausted"
+
+
+def test_pending_tags_adopts_migrated_seed_and_reacts_to_source_revision(tmp_path, llm_settings, fake_llm):
+    conn = _tag_db(tmp_path, llm_settings)
+    c = _conv("s1"); c.cwd = "/nowhere"
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "r1", lambda t: [None] * len(t))
+    conn.execute("INSERT INTO derived_jobs(conversation_id, kind, input_fingerprint, status, attempts) "
+                 "VALUES('claude_code:s1','tags',NULL,'ok',1)"); conn.commit()     # as the category migration seeds
+    assert jobs.pending_tags(conn, llm_settings, 10) == []                          # adopted, not re-tagged
+    f = fake_llm({"workspace": "personal"})
+    assert jobs.run_tags(conn, c.id, llm_settings) == "skipped" and f.calls == []
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "r2", lambda t: [None] * len(t))   # new revision
+    assert jobs.pending_tags(conn, llm_settings, 10) == ["claude_code:s1"]
+    assert jobs.run_tags(conn, c.id, llm_settings) == "ok" and len(f.calls) == 1
+
+
+def test_record_tags_covered_at_ingest(tmp_path, llm_settings):
+    from convo_index import tags as T
+    conn = _tag_db(tmp_path, llm_settings)
+    c = _conv("s1"); c.cwd = "/Users/me/globex/hq"
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "r1", lambda t: [None] * len(t))
+    T.apply_rules(conn, c.id, {"cwd": c.cwd, "git_branch": None, "title": "T", "first_prompt": "hi", "source": "claude_code"})
+    assert jobs.record_tags_covered(conn, c.id, llm_settings) is True
+    assert jobs.get_job(conn, c.id, "tags")["status"] == "ok"
+    assert jobs.pending_tags(conn, llm_settings, 10) == []
+
+
 def test_auth_failures_block_until_the_backend_becomes_usable(tmp_path, llm_settings, fake_llm, monkeypatch):
     from convo_index.providers import registry as R
     conn = _db(tmp_path)
@@ -237,6 +322,13 @@ def test_records_are_not_written_for_deleted_conversations(tmp_path, llm_setting
     assert conn.execute("SELECT COUNT(*) FROM derived_jobs").fetchone()[0] == 0
 
 
+def test_tags_fingerprint_includes_the_endpoint_when_set(tmp_path, llm_settings):
+    spec = {"backend": "openai_compat", "model": "m"}
+    a = jobs._tags_fp("d", "s", None, spec)
+    assert jobs._tags_fp("d", "s", None, {**spec, "base_url": "http://a"}) != jobs._tags_fp("d", "s", None, {**spec, "base_url": "http://b"})
+    assert a == jobs._tags_fp("d", "s", None, {**spec, "base_url": ""})               # unset endpoint: unchanged format
+
+
 def test_relogin_changes_the_signature_and_jobs_unblock_forces(tmp_path, llm_settings, fake_llm, monkeypatch):
     from convo_index.providers import registry as R
     conn = _db(tmp_path)
@@ -254,3 +346,46 @@ def test_relogin_changes_the_signature_and_jobs_unblock_forces(tmp_path, llm_set
     fake_llm(LLMResult(ok=False, error="auth", detail="expired again"))
     assert jobs.run_summary(conn, "claude_code:s1", "T", "r2", tr, llm_settings) == "failed"
     assert jobs.unblock(conn, llm_settings, force=True) == {"summary": 1}                     # convo-index jobs unblock
+
+
+def test_rejecting_an_llm_tag_reopens_the_tags_job(tmp_path, llm_settings, fake_llm):
+    from convo_index import tags as T
+    conn = _tag_db(tmp_path, llm_settings)
+    c = _conv("s1"); c.cwd = "/nowhere"
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "r1", lambda t: [None] * len(t))
+    f = fake_llm({"workspace": "personal"}, {"workspace": "globex"})
+    assert jobs.run_tags(conn, c.id, llm_settings) == "ok" and jobs.pending_tags(conn, llm_settings, 10) == []
+    T.set_decision(conn, c.id, "workspace", "personal", "reject", suggest=False)
+    assert jobs.pending_tags(conn, llm_settings, 10) == [c.id]            # the group is open again
+    assert jobs.run_tags(conn, c.id, llm_settings) == "ok" and len(f.calls) == 2
+    assert T.assignments_for(conn, [c.id])[c.id] == {"workspace": ["globex"]}
+
+
+def test_seeded_tags_job_notices_later_input_changes_through_dispatch(tmp_path, llm_settings, fake_llm):
+    llm_settings["llm"]["summary"] = {"backend": "", "model": ""}          # only tagging is configured
+    conn = _tag_db(tmp_path, llm_settings)
+    c = _conv("s1"); c.cwd = "/nowhere"
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "r1", lambda t: [None] * len(t))
+    conn.execute("INSERT INTO derived_jobs(conversation_id, kind, input_fingerprint, status, attempts) "
+                 "VALUES('claude_code:s1','tags',NULL,'ok',1)"); conn.commit()
+    assert jobs.pending_tags(conn, llm_settings, 10) == []                 # adopted with a real baseline
+    assert conn.execute("SELECT input_fingerprint FROM derived_jobs WHERE kind='tags'").fetchone()[0]
+    dbm.upsert_conversation(conn, c, "unknown", None, [], None, "r2", lambda t: [None] * len(t))
+    f = fake_llm({"workspace": "personal"})
+    assert jobs.dispatch(conn, llm_settings)["tags"] == 1 and len(f.calls) == 1   # no run_tags() in between
+
+
+def test_disabled_source_content_never_reaches_a_provider(tmp_path, llm_settings, fake_llm):
+    """`enabled = false` on a source keeps what it indexed earlier out of every provider call."""
+    llm_settings["sources"] = {"claude_code": {"enabled": False}}
+    conn = _tag_db(tmp_path, llm_settings)
+    dbm.upsert_conversation(conn, _conv("s1"), "unknown", None, [], None, "r1", lambda t: [None] * len(t))
+    f = fake_llm(GOOD, {"workspace": "personal"})
+    calls = []
+    def embed(texts):
+        calls.append(texts); return [[0.0] * 768 for _ in texts]
+    out = jobs.dispatch(conn, llm_settings, embed_fn=embed, embedder_fp="e|dim=768")
+    assert out["summaries"] == 0 and out["tags"] == 0 and out["vectors"] == 0 and f.calls == []
+    assert jobs.backfill_vectors(conn, embed, settings=llm_settings) == 0 and calls == []
+    assert jobs.retry_failed(conn, llm_settings) == {"retried": 0, "ok": 0}
+    assert jobs.missing_summaries(conn, llm_settings) == {"retried": 0, "ok": 0}

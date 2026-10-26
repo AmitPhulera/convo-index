@@ -21,6 +21,8 @@ import time
 
 from convo_index import db as dbm
 from convo_index import settings as S
+from convo_index.config import CLASSIFY_PROMPT_PREFIX, HAIKU_CONTEXT_CHARS
+from convo_index.providers import registry as R
 
 META_REVISION = "tag_definitions_revision"
 META_CATEGORY_MIGRATED = "tags_migrated_from_category"
@@ -29,6 +31,7 @@ NONE_TAG = ""            # stored value for the "none of these" decision (NULL w
 RULE_TEXT_LIMIT = 10_000 # chars of title+first prompt a rule regex may scan
 RULE_KINDS = ("path_contains", "branch_prefix", "regex", "source")
 DECISIONS = ("accept", "reject")
+PROMPT_VERSION = 2       # bump when build_prompt changes what the model sees (2: few-shot examples)
 
 
 def _now():
@@ -435,6 +438,104 @@ def unresolved_groups(conn, cid, groups=None):
             continue
         out[g] = spec
     return out
+
+
+def llm_schema(groups):
+    props = {}
+    for g, spec in groups.items():
+        names = [t["name"] for t in spec["tags"]]
+        if spec["exclusive"]:
+            # anyOf keeps strict validators (OpenAI structured outputs) happy: no null in enum
+            props[g] = {"anyOf": [{"type": "string", "enum": names}, {"type": "null"}]}
+        else:
+            props[g] = {"type": "array", "items": {"type": "string", "enum": names}}
+    return {"type": "object", "properties": props, "required": list(props)}
+
+
+def _one_line(text):
+    return " ".join(str(text or "").split())
+
+
+def build_prompt(groups, conv_row, summary=None, examples=None):
+    """`examples`: {group: [{title, first_prompt, tag, decision}]} — the user's nearest past
+    decisions, shown so the model follows their judgement (rejections as negatives)."""
+    lines = [f"{CLASSIFY_PROMPT_PREFIX} into the tag groups below. For each group answer with the "
+             "best-fitting tag name; for exclusive groups answer exactly one tag or null when none fits; "
+             "for multi groups answer a JSON array (possibly empty). Reply with JSON only.", ""]
+    for g, spec in groups.items():
+        kind = "exclusive" if spec["exclusive"] else "multi"
+        lines.append(f"Group \"{g}\" ({kind}){': ' + spec['description'] if spec['description'] else ''}")
+        for t in spec["tags"]:
+            lines.append(f"  - {t['name']}: {t['description']}" if t["description"] else f"  - {t['name']}")
+        for ex in (examples or {}).get(g) or []:
+            verdict = (f"NOT {ex['tag']}" if ex["decision"] == "reject" else
+                       ("none of these" if ex["tag"] is None else ex["tag"]))
+            lines.append(f"  example (user said {verdict}): \"{_one_line(ex['title'])[:80]}\" — {_one_line(ex['first_prompt'])[:160]}")
+    lines += ["", f"Title: {conv_row.get('title') or ''}",
+              f"Source tool: {conv_row.get('source') or ''}; cwd: {conv_row.get('cwd') or ''}; branch: {conv_row.get('git_branch') or ''}",
+              f"First message: {(conv_row.get('first_prompt') or '')[:HAIKU_CONTEXT_CHARS]}"]
+    if summary and (summary.get("problem") or summary.get("solution")):
+        lines += [f"Summary: {summary.get('problem') or ''} {summary.get('solution') or ''}".strip()]
+    return "\n".join(lines)
+
+
+def llm_tag(conn, cid, conv_row, settings=None, groups=None):
+    """One LLM call for every unresolved group. Returns (status, LLMResult|None) where status is
+    'ok' | 'nothing' (no unresolved groups) | 'failed'."""
+    settings = settings or S.load()
+    groups = groups or load_groups(conn)
+    todo = unresolved_groups(conn, cid, groups)
+    if not todo:
+        return "nothing", None
+    examples = {}
+    try:
+        from convo_index import vectors as V
+        k = int((settings.get("tags_learning") or {}).get("few_shot_k", 6))
+        for g in todo:
+            ex = V.few_shot_examples(conn, cid, g, k=k, settings=settings)
+            if ex:
+                examples[g] = ex
+    except Exception:   # no vectors yet, or vec table missing: the prompt simply has no examples
+        examples = {}
+    before = _state_stamp(conn, cid)
+    res = R.complete("classify", build_prompt(todo, conv_row, dbm.get_summary(conn, cid), examples),
+                     schema=llm_schema(todo), settings=settings, max_output_tokens=200, timeout=120)
+    if not res.ok or not isinstance(res.data, dict):
+        return "failed", res
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # The call was slow: the conversation may be gone, re-ingested or re-defined meanwhile.
+        # A result for an old state is discarded rather than written over the new one.
+        if before is None or _state_stamp(conn, cid) != before:
+            conn.execute("ROLLBACK")
+            return "stale", res
+        rev = dbm.get_meta(conn, META_REVISION)
+        q = ",".join("?" * len(todo))
+        conn.execute(f"DELETE FROM tag_evidence WHERE conversation_id=? AND method='llm' AND group_name IN ({q})",
+                     (cid, *todo.keys()))   # only the groups asked about; other groups' evidence stays
+        for g, spec in todo.items():
+            picked = res.data.get(g)
+            picked = [picked] if isinstance(picked, str) else (picked or [])
+            valid = {t["name"] for t in spec["tags"]}
+            for tag in picked:
+                if tag in valid:
+                    conn.execute(
+                        "INSERT INTO tag_evidence(conversation_id, group_name, tag, method, confidence, detail, definition_revision, ts) "
+                        "VALUES(?,?,?,?,?,?,?,?)", (cid, g, tag, "llm", 0.7, res.model_used or "", rev, _now()))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return "ok", res
+
+
+def _state_stamp(conn, cid):
+    """(source revision, definitions revision) of a live conversation, or None when it is
+    missing or deleted."""
+    row = conn.execute("SELECT source_revision FROM conversations WHERE id=?", (cid,)).fetchone()
+    if not row or dbm.is_deleted(conn, cid):
+        return None
+    return (row[0], dbm.get_meta(conn, META_REVISION))
 
 
 def conv_row(conn, cid):
