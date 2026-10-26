@@ -14,8 +14,10 @@ import os
 import re
 from pathlib import Path
 
+from convo_index.config import PROJECTS_DIR, CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX
 from convo_index.model import (Conversation, Message, ToolCall, UsageRecord, KIND_TEXT, KIND_THINKING,
-                               KIND_TOOL_CALL, KIND_TOOL_RESULT, FIDELITY_FULL, FIDELITY_PARTIAL)
+                               KIND_TOOL_CALL, KIND_TOOL_RESULT, FIDELITY_FULL, FIDELITY_PARTIAL, split_id)
+from convo_index.sources.base import SourceRef, UnreadableSource, shell_quote
 
 TOOL_TEXT_LIMIT = 4000
 # tool names -> file action for the files-touched facet
@@ -24,6 +26,9 @@ _FILE_TOOLS = {"Read": "read", "View": "read", "Edit": "edit", "Write": "create"
 SOURCE = "claude_code"
 PARSER_VERSION = 3       # part of the change key: bump when parsing changes so indexed sessions re-ingest once
 
+# Entrypoints that indicate a non-interactive, programmatic session rather than a
+# real conversation worth indexing (e.g. `claude -p` headless SDK invocations).
+SKIP_ENTRYPOINTS = {"sdk-cli", "sdk-py", "sdk-ts"}
 # Record types Claude Code writes; a file with none of these (and no uuid/sessionId on any
 # record) is an unknown layout, not an empty session.
 KNOWN_TYPES = {"user", "assistant", "system", "summary", "ai-title", "file-history-snapshot",
@@ -285,6 +290,30 @@ def parse_conversation(path, text=None):
     }
 
 
+def exclude_reason(parsed):
+    """Why a parsed session must not be indexed, or None. Raises UnreadableSource when the
+    file has records but every one of them was unparseable."""
+    if not parsed["messages"]:
+        # No messages recovered. If any record was unparseable it could be the reason, so
+        # this is not a confirmed-empty session even when metadata lines (ai-title, mode...)
+        # parsed fine: keep whatever was indexed before and report it.
+        if parsed.get("malformed_lines"):
+            raise UnreadableSource(
+                f"{parsed['malformed_lines']} of {parsed['lines']} lines unparseable, no messages recovered")
+        if parsed.get("lines") and not parsed.get("recognized"):
+            raise UnreadableSource(f"{parsed['lines']} records in an unknown layout (no typed records)")
+        return "empty"
+    # Skip non-interactive headless sessions (e.g. our own `claude -p` Haiku
+    # classification calls), which would otherwise pollute the index every run.
+    # The first_prompt check is a flush-race-proof backstop: a concurrently-written
+    # classification session may be indexed before its `entrypoint` line lands.
+    if parsed.get("entrypoint") in SKIP_ENTRYPOINTS:
+        return "headless-sdk"
+    if parsed["first_prompt"].startswith((CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX)):
+        return "self-llm-call"
+    return None
+
+
 def to_conversation(parsed, path):
     msgs = [Message(seq=m["seq"], role=m["role"], text=m["text"], kind=m.get("kind", KIND_TEXT),
                     ts=m["ts"], native_id=m.get("uuid"), model=m.get("model"), tool_call=m.get("tool_call"))
@@ -315,3 +344,45 @@ def revision_of(path):
     when parsing changes."""
     st = Path(path).stat()
     return f"p{PARSER_VERSION}:{st.st_mtime}:{st.st_size}"
+
+
+class ClaudeCodeAdapter:
+    name = SOURCE
+    supported_versions = "Claude Code 2.x JSONL sessions"
+
+    def __init__(self, projects_dir=None):
+        self.projects_dir = Path(projects_dir) if projects_dir else PROJECTS_DIR
+
+    def available(self):
+        return self.projects_dir.exists()
+
+    def iter_files(self):
+        if not self.projects_dir.exists():
+            return
+        yield from sorted(self.projects_dir.glob("*/*.jsonl"))
+
+    def discover(self):
+        for path in self.iter_files():
+            try:
+                key = revision_of(path)
+            except OSError:
+                continue
+            yield SourceRef(SOURCE, path.stem, key, str(path))
+
+    def load(self, ref):
+        text, revision = read_snapshot(ref.locator)
+        revision = f"p{PARSER_VERSION}:{revision}"
+        parsed = parse_conversation(ref.locator, text)
+        if exclude_reason(parsed):
+            return None
+        conv = to_conversation(parsed, ref.locator)
+        # The file name is the session id; `sessionId` inside should agree, but the
+        # namespaced id must follow the ref so discovery and storage stay aligned.
+        conv.native_id = ref.native_id
+        return conv, revision
+
+
+def resume_command(conversation_id, cwd):
+    """Shell command to continue this conversation in Claude Code."""
+    _, native = split_id(conversation_id)
+    return f"claude --resume {shell_quote(native)}"

@@ -2,7 +2,7 @@
 import json
 
 from convo_index.sources.claude_code import (parse_conversation, flatten_content, clean_prompt,
-                                             to_conversation)
+                                             to_conversation, ClaudeCodeAdapter, resume_command)
 
 
 def _write(tmp_path, lines, name="sess"):
@@ -86,6 +86,15 @@ def test_usage_without_request_id_falls_back_to_uuid(tmp_path):
     assert [(u.native_request_id, u.message_seq) for u in conv["usage"]] == [("u1", 1)]
 
 
+def test_summarizer_sessions_are_excluded(tmp_path):
+    from convo_index.config import SUMMARY_PROMPT_PREFIX
+    from convo_index.sources.claude_code import exclude_reason
+    f = _write(tmp_path, [
+        {"type": "user", "sessionId": "q", "message": {"role": "user", "content": SUMMARY_PROMPT_PREFIX + ". Respond"}},
+    ])
+    assert exclude_reason(parse_conversation(f)) == "self-llm-call"
+
+
 def test_revision_includes_size(tmp_path):
     from convo_index.sources.claude_code import revision_of
     f = _write(tmp_path, _lines())
@@ -127,6 +136,20 @@ def test_parse_captures_entrypoint(tmp_path):
     assert parse_conversation(f)["entrypoint"] == "sdk-cli"
 
 
+def test_adapter_id_follows_file_name(tmp_path):
+    projects = tmp_path / "projects"; (projects / "p").mkdir(parents=True)
+    _write(projects / "p", _lines(), name="file-id")
+    ad = ClaudeCodeAdapter(projects)
+    ref = next(iter(ad.discover()))
+    conv, revision = ad.load(ref)
+    assert ref.native_id == "file-id" and conv.id == "claude_code:file-id"
+    assert revision == ref.change_key
+
+
+def test_resume_command():
+    assert resume_command("claude_code:abc", "/x") == "claude --resume abc"
+
+
 def _write_lf(path, text):
     path.write_text(text, newline="\n")   # Claude Code writes LF; Windows must not translate
 
@@ -145,11 +168,55 @@ def test_read_snapshot_drops_partial_trailing_line_and_pins_revision(tmp_path):
     assert len(conv["messages"]) == 1
 
 
+def test_load_revision_describes_exactly_the_bytes_parsed(tmp_path, monkeypatch):
+    """An append that lands after the read must not be acknowledged by the returned revision."""
+    import convo_index.sources.claude_code as cc
+    projects = tmp_path / "projects"; (projects / "p").mkdir(parents=True)
+    f = _write(projects / "p", _lines(), name="live")
+    ad = ClaudeCodeAdapter(projects)
+    ref = next(iter(ad.discover()))
+    real = cc.read_snapshot
+    def read_then_append(path):
+        out = real(path)
+        with open(path, "a") as fh:
+            fh.write("\n" + json.dumps({"type": "user", "message": {"role": "user", "content": "late"}}))
+        return out
+    monkeypatch.setattr(cc, "read_snapshot", read_then_append)
+    conv, revision = ad.load(ref)
+    assert not any(m.text == "late" for m in conv.messages)
+    assert revision != cc.revision_of(f)     # next discovery sees a different key -> re-read
+
+
+def test_all_malformed_file_is_unreadable_not_empty(tmp_path):
+    import pytest
+    from convo_index.sources.base import UnreadableSource
+    from convo_index.sources.claude_code import exclude_reason
+    f = tmp_path / "s.jsonl"; f.write_text("NOT JSON\n[1,2]\n")
+    with pytest.raises(UnreadableSource):
+        exclude_reason(parse_conversation(f))
+
+
 def test_partially_malformed_file_is_partial_fidelity(tmp_path):
     f = tmp_path / "s.jsonl"
     f.write_text('{"type":"user","sessionId":"z","message":{"role":"user","content":"hi"}}\nNOT JSON\n')
     conv = to_conversation(parse_conversation(f), f)
     assert conv.fidelity == "partial" and conv.warnings == ["1 unparseable lines skipped"]
+
+
+def test_empty_file_is_confirmed_empty(tmp_path):
+    from convo_index.sources.claude_code import exclude_reason
+    f = tmp_path / "s.jsonl"; f.write_text("")
+    assert exclude_reason(parse_conversation(f)) == "empty"
+
+
+def test_metadata_plus_malformed_messages_is_unreadable(tmp_path):
+    import pytest
+    from convo_index.sources.base import UnreadableSource
+    from convo_index.sources.claude_code import exclude_reason
+    f = tmp_path / "s.jsonl"
+    f.write_text('{"type":"ai-title","aiTitle":"Looks fine"}\n{"type":"user","message":{"role":"user","content":"hi"\n')
+    with pytest.raises(UnreadableSource):
+        exclude_reason(parse_conversation(f))
 
 
 def test_tool_and_thinking_blocks_become_messages(tmp_path):
@@ -192,6 +259,17 @@ def test_usage_on_tool_only_turn_links_to_its_first_block(tmp_path):
     assert [u.message_seq for u in conv["usage"]] == [1]
 
 
+def test_unknown_layout_is_unreadable_not_empty(tmp_path):
+    import pytest
+    from convo_index.sources import claude_code as cc
+    from convo_index.sources.base import UnreadableSource
+    f = tmp_path / "x.jsonl"; f.write_text('{"foo": 1}\n{}\n')
+    with pytest.raises(UnreadableSource):
+        cc.exclude_reason(cc.parse_conversation(f))
+    f.write_text('{"type": "summary", "summary": "s"}\n')
+    assert cc.exclude_reason(cc.parse_conversation(f)) == "empty"        # known record types, no messages
+
+
 def test_event_with_non_object_message_is_a_malformed_line(tmp_path):
     f = tmp_path / "s.jsonl"
     f.write_text('{"type":"user","sessionId":"z","message":"bad"}\n'
@@ -202,3 +280,18 @@ def test_event_with_non_object_message_is_a_malformed_line(tmp_path):
     conv = to_conversation(parse_conversation(f), f)
     assert [m.text for m in conv.messages] == ["hi"] and conv.fidelity == "partial"
     assert conv.warnings == ["4 unparseable lines skipped"]
+
+
+def test_typed_records_of_an_unknown_layout_are_unreadable(tmp_path):
+    import pytest
+    from convo_index.sources import claude_code as cc
+    from convo_index.sources.base import UnreadableSource
+    f = tmp_path / "x.jsonl"; f.write_text('{"type":"new_message","content":"keep me"}\n')
+    with pytest.raises(UnreadableSource):
+        cc.exclude_reason(cc.parse_conversation(f))
+
+
+def test_resume_command_quotes_the_id():
+    from convo_index.sources.claude_code import resume_command
+    from convo_index.sources.base import shell_quote
+    assert resume_command("claude_code:id; echo injected", None) == "claude --resume " + shell_quote("id; echo injected")
