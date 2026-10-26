@@ -1,8 +1,10 @@
 """Provider backends against recorded CLI/HTTP envelopes (no processes, no network)."""
+import io
 import json
+import urllib.error
 
 
-from convo_index.providers import base, cli_backends as cli
+from convo_index.providers import base, cli_backends as cli, http_backends as http
 from convo_index.providers.base import LLMRequest
 
 SCHEMA = {"type": "object", "properties": {"category": {"type": "string", "enum": ["a", "b"]}},
@@ -154,6 +156,75 @@ def test_codex_turn_failed_is_classified(monkeypatch):
 
 
 # ---------------------------------------------------------------- http backends
+
+class _HTTPResp:
+    def __init__(self, body): self.body = json.dumps(body).encode()
+    def read(self): return self.body
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def test_anthropic_api_uses_forced_tool_for_schema(monkeypatch):
+    sent = {}
+    def urlopen(req, timeout):
+        sent["body"] = json.loads(req.data); sent["headers"] = dict(req.headers)
+        return _HTTPResp({"id": "msg_1", "model": "claude-haiku-4-5", "usage": {"input_tokens": 5, "output_tokens": 7},
+                          "content": [{"type": "tool_use", "name": "answer", "input": {"category": "a"}}]})
+    monkeypatch.setattr(http.urllib.request, "urlopen", urlopen)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    r = http.AnthropicAPI({"backend": "anthropic_api"}).complete(LLMRequest(prompt="P", model="claude-haiku-4-5", schema=SCHEMA))
+    assert r.ok and r.data == {"category": "a"} and r.usage.output == 7
+    assert sent["body"]["tool_choice"] == {"type": "tool", "name": "answer"}
+    assert sent["headers"]["X-api-key"] == "k"
+
+
+def test_anthropic_api_without_key_is_auth_error(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert http.AnthropicAPI({}).complete(LLMRequest(prompt="P", model="m")).error == "auth"
+
+
+def test_openai_compat_chat_and_usage_split(monkeypatch):
+    def urlopen(req, timeout):
+        return _HTTPResp({"id": "c", "model": "qwen", "choices": [{"message": {"content": '{"category":"b"}'}}],
+                          "usage": {"prompt_tokens": 20, "prompt_tokens_details": {"cached_tokens": 5},
+                                    "completion_tokens": 36}})
+    monkeypatch.setattr(http.urllib.request, "urlopen", urlopen)
+    r = http.OpenAICompat({"base_url": "http://localhost:11434/v1"}).complete(
+        LLMRequest(prompt="P", model="qwen", schema=SCHEMA))
+    assert r.ok and r.data == {"category": "b"}
+    assert (r.usage.input_uncached, r.usage.cache_read, r.usage.output) == (15, 5, 36)
+
+
+def test_openai_compat_http_errors(monkeypatch):
+    def urlopen(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 401, "nope", {}, io.BytesIO(b"bad key"))
+    monkeypatch.setattr(http.urllib.request, "urlopen", urlopen)
+    r = http.OpenAICompat({"base_url": "https://api.example/v1"}).complete(LLMRequest(prompt="P", model="m"))
+    assert r.error == "auth" and "bad key" in r.detail
+
+
+def test_openai_compat_embeddings_batches_truncates_and_checks_dim(monkeypatch):
+    calls = []
+    def urlopen(req, timeout):
+        body = json.loads(req.data); calls.append(body)
+        return _HTTPResp({"data": [{"index": i, "embedding": [0.1, 0.2]} for i in range(len(body["input"]))]})
+    monkeypatch.setattr(http.urllib.request, "urlopen", urlopen)
+    emb = http.OpenAICompat({"base_url": "http://localhost:11434/v1", "model": "nomic", "dim": 2, "max_chars": 5})
+    res = emb.embed(["a" * 100, "b", "c"], batch_size=2)
+    assert res.error is None and len(res.vectors) == 3 and res.vectors[0] == [0.1, 0.2]
+    assert len(calls) == 2 and calls[0]["input"][0] == "aaaaa"    # truncated to max_chars
+    assert "nomic" in emb.fingerprint and "dim=2" in emb.fingerprint
+    bad = http.OpenAICompat({"base_url": "http://localhost:11434/v1", "model": "nomic", "dim": 768})
+    res = bad.embed(["x"])
+    assert res.error == "config" and res.vectors == [None]
+
+
+def test_openai_compat_embeddings_error_returns_none_vectors(monkeypatch):
+    def urlopen(req, timeout):
+        raise urllib.error.HTTPError("u", 404, "model not found", {}, io.BytesIO(b'{"error":"not found"}'))
+    monkeypatch.setattr(http.urllib.request, "urlopen", urlopen)
+    res = http.OpenAICompat({"base_url": "http://localhost:11434/v1", "model": "nomic"}).embed(["x", "y"])
+    assert res.vectors == [None, None] and res.error == "provider" and "404" in res.detail
 
 
 # ---------------------------------------------------------------- registry
