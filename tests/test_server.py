@@ -1,0 +1,216 @@
+import json
+from urllib.parse import quote
+
+from convo_index import db as dbm
+from convo_index import server
+from convo_index.config import EMBED_DIM
+from convo_index.model import Conversation, Message, KIND_TOOL_CALL
+
+
+def _seed(path, monkeypatch):
+    conn = dbm.connect(path); dbm.init_schema(conn)
+    conv = Conversation(source="claude_code", native_id="s1", title="Kube fix",
+                        first_prompt="kubernetes deployment", source_ref="/a", cwd="/x", git_branch="m",
+                        start_ts="2026-06-16T00:00:00Z", end_ts="2026-06-16T01:00:00Z",
+                        messages=[Message(seq=0, role="user", text="kubernetes deployment failing",
+                                          ts="2026-06-16T00:00:00Z"),
+                                  Message(seq=1, role="assistant", text="[bash] kubectl get pods",
+                                          kind=KIND_TOOL_CALL)])
+    dbm.upsert_conversation(conn, conv, "globex", "path", ["SAAS-1"], None, "1", lambda t: [[0.0] * EMBED_DIM for _ in t])
+    conn.execute("INSERT INTO legacy_ids(legacy, id) VALUES('s1', 'claude_code:s1')"); conn.commit()
+    conn.close()
+    monkeypatch.setattr(server, "DB_PATH", path)
+    monkeypatch.setattr(server, "embed", lambda texts: [None])
+
+
+def test_handle_search(tmp_path, monkeypatch):
+    _seed(tmp_path / "t.db", monkeypatch)
+    data = json.loads(server.handle_search({"q": ["kubernetes"], "mode": ["keyword"]}))
+    assert data[0]["id"] == "claude_code:s1" and data[0]["source"] == "claude_code"
+
+
+def test_handle_search_source_filter(tmp_path, monkeypatch):
+    _seed(tmp_path / "t.db", monkeypatch)
+    assert json.loads(server.handle_search({"q": [""], "mode": ["hybrid"], "source": ["opencode"]})) == []
+    assert len(json.loads(server.handle_search({"q": [""], "mode": ["hybrid"], "source": ["claude_code"]}))) == 1
+    assert len(json.loads(server.handle_search({"q": [""], "mode": ["hybrid"], "source": ["opencode,claude_code"]}))) == 1
+    assert json.loads(server.handle_search({"q": [""], "mode": ["hybrid"], "source": ["opencode,codex"]})) == []
+
+
+def test_handle_sources(tmp_path, monkeypatch):
+    _seed(tmp_path / "t.db", monkeypatch)
+    assert json.loads(server.handle_sources()) == ["claude_code"]
+
+
+def test_handle_conversation(tmp_path, monkeypatch):
+    _seed(tmp_path / "t.db", monkeypatch)
+    data = json.loads(server.handle_conversation("claude_code:s1"))
+    assert data["title"] == "Kube fix" and data["id"] == "claude_code:s1"
+    assert data["resume_cmd"] == "claude --resume s1"
+    assert [(m["kind"], m["text"]) for m in data["messages"]] == [
+        ("text", "kubernetes deployment failing"), ("tool_call", "[bash] kubectl get pods")]
+
+
+def test_handle_conversation_resolves_legacy_id(tmp_path, monkeypatch):
+    _seed(tmp_path / "t.db", monkeypatch)
+    data = json.loads(server.handle_conversation("s1"))
+    assert data["id"] == "claude_code:s1"
+
+
+def test_handle_conversation_missing(tmp_path, monkeypatch):
+    _seed(tmp_path / "t.db", monkeypatch)
+    assert server.handle_conversation("claude_code:nope") is None
+
+
+def test_segment_decodes_encoded_ids():
+    assert server._segment("/api/conversation/" + quote("claude_code:s1", safe=""), "/api/conversation/") == "claude_code:s1"
+
+
+def test_first_run_serve_init_with_missing_data_dir(tmp_path, monkeypatch):
+    p = tmp_path / "no" / "such" / "dir" / "convos.db"
+    conn = dbm.connect(p); dbm.init_schema(conn, p); conn.close()
+    assert p.exists()
+
+
+def test_handle_config_exposes_labels_and_ticket_url(monkeypatch, tmp_path):
+    from tests.conftest import make_settings
+    st = make_settings(tmp_path)
+    monkeypatch.setattr(server.CFG, "load", lambda *a, **k: st)
+    data = json.loads(server.handle_config())
+    assert data["category_labels"] == ["globex", "personal"]
+    assert data["ticket_url"].endswith("{key}")
+
+
+def test_semantic_search_disabled_on_fingerprint_mismatch(tmp_path, monkeypatch):
+    real_embed = server.embed
+    _seed(tmp_path / "t.db", monkeypatch)
+    from tests.conftest import make_settings
+    st = make_settings(tmp_path)
+    monkeypatch.setattr(server.CFG, "load", lambda *a, **k: st)
+    monkeypatch.setattr(server, "embed", real_embed)   # the real embed() with a fake embedder
+    class Emb:
+        fingerprint = "fp-new"
+        def embed(self, texts, purpose="document"):
+            from convo_index.providers.base import EmbedResult
+            return EmbedResult(vectors=[[0.0] * 768 for _ in texts], fingerprint="fp-new")
+    monkeypatch.setattr(server.R, "make_embedder", lambda *a, **k: Emb())
+    conn = dbm.connect(tmp_path / "t.db"); dbm.set_meta(conn, "embedding_fingerprint", "fp-old"); conn.close()
+    from convo_index import server as srv
+    ok, reason = srv.semantic_status()
+    assert ok is False and "reembed" in reason
+    assert srv.embed(["q"]) == [None]
+    assert json.loads(srv.handle_config())["semantic_search"] is False
+    conn = dbm.connect(tmp_path / "t.db"); dbm.set_meta(conn, "embedding_fingerprint", "fp-new"); conn.close()
+    assert srv.semantic_status() == (True, None) and srv.embed(["q"]) == [[0.0] * 768]
+
+
+def test_prepare_passes_the_resolved_path_and_dim_to_init_schema(tmp_path, monkeypatch):
+    from tests.conftest import make_settings
+    st = make_settings(tmp_path, embeddings={"dim": 384})
+    monkeypatch.setattr(server.CFG, "load", lambda *a, **k: st)
+    monkeypatch.setattr(server, "DB_PATH", None)
+    seen = {}
+    monkeypatch.setattr(dbm, "init_schema", lambda conn, db_path=None, **kw: seen.update({"path": db_path, **kw}))
+    path = server.prepare()
+    assert path == st.db_path() and seen["path"] == st.db_path() and seen["dim"] == 384
+
+
+def _serve(tmp_path, monkeypatch):
+    import threading
+    _seed(tmp_path / "t.db", monkeypatch)
+    srv = server.make_server("127.0.0.1", 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _request(srv, method, path, headers=None):
+    import http.client
+    port = srv.server_address[1]
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request(method, path, headers={"Host": f"127.0.0.1:{port}", **(headers or {})})   # Host sent verbatim
+    res = conn.getresponse()
+    body = res.read()
+    conn.close()
+    return res.status, body
+
+
+def test_rebinding_host_is_refused(tmp_path, monkeypatch):
+    srv = _serve(tmp_path, monkeypatch)
+    try:
+        port = srv.server_address[1]
+        status, _ = _request(srv, "GET", "/api/search?q=kubernetes&mode=keyword", {"Host": f"attacker.example:{port}"})
+        assert status == 403
+        status, body = _request(srv, "GET", "/api/search?q=kubernetes&mode=keyword", {"Host": f"localhost:{port}"})
+        assert status == 200 and json.loads(body)[0]["id"] == "claude_code:s1"
+    finally:
+        srv.shutdown()
+
+
+def test_allowed_hosts():
+    assert server.allowed_hosts("127.0.0.1", 9753) == {("127.0.0.1", None), ("localhost", None), ("::1", None)}
+    assert ("box.lan", None) in server.allowed_hosts("0.0.0.0", 9753, ["box.lan"])
+    assert not any(h == "0.0.0.0" for h, _ in server.allowed_hosts("0.0.0.0", 9753))
+    extra = server.allowed_hosts("0.0.0.0", 9753, ["Box.lan:9753", "fe80::1", "[fe80::2]:9753", "", "x:y:z:bad"])
+    assert extra == server.allowed_hosts("0.0.0.0", 9753) | {("box.lan", 9753), ("fe80::1", None), ("fe80::2", 9753)}
+    assert ("box.lan", None) in server.allowed_hosts("0.0.0.0", 9753, "box.lan")   # a string, not a list
+    assert ("fe80::3", None) in server.allowed_hosts("fe80::3", 9753)
+
+
+def test_host_header_forms():
+    allowed = server.allowed_hosts("0.0.0.0", 9753, ["box.lan", "pinned.lan:9753"])
+    for host in ("Box.lan:9753", "box.lan.:9753", "box.lan", "box.lan:80", "localhost:8080", "[::1]:8080",
+                 "127.0.0.1:9753", "pinned.lan:9753"):
+        assert server.request_error("GET", {"Host": host}, allowed) is None, host
+    for host in ("pinned.lan", "pinned.lan:8080", "attacker.example:9753", "0.0.0.0:9753", "", "localhost:abc",
+                 "localhost@attacker.example:9753", "attacker.example@localhost:9753",
+                 "attacker.example:9753/localhost"):
+        assert server.request_error("GET", {"Host": host}, allowed), host
+    # behind a TLS-terminating proxy: Host carries port 80, Origin port 443; one bare entry covers both
+    assert server.request_error("POST", {"Host": "box.lan", "Origin": "https://box.lan", "X-Convo-Index": "1"},
+                                allowed) is None
+    assert server.request_error("POST", {"Host": "box.lan:9753", "Origin": "null", "X-Convo-Index": "1"}, allowed)
+    assert server.request_error("POST", {"Host": "box.lan:9753", "Origin": "http://localhost:8080",
+                                         "X-Convo-Index": "1"}, allowed) is None   # a port forward's own origin
+
+
+def test_default_http_port_host_has_no_port():
+    allowed = server.allowed_hosts("0.0.0.0", 80, ["box.lan:80"])
+    assert server.request_error("GET", {"Host": "box.lan"}, allowed) is None
+    assert server.request_error("POST", {"Host": "box.lan", "Origin": "http://box.lan",
+                                         "X-Convo-Index": "1"}, allowed) is None
+    assert server.request_error("GET", {"Host": "box.lan"}, server.allowed_hosts("0.0.0.0", 9753, ["box.lan:9753"]))
+
+
+def test_advertised_url_is_one_the_server_accepts():
+    for bind in ("0.0.0.0", "::", "127.0.0.1", "box.lan", "fe80::1"):
+        url = server.advertised_url(bind, 9753)
+        allowed = server.allowed_hosts(bind, 9753)
+        assert server.request_error("GET", {"Host": url.removeprefix("http://")}, allowed) is None, bind
+
+
+def test_make_server_binds_an_ipv6_address():
+    import pytest
+    try:
+        srv = server.make_server("::1", 0)
+    except OSError as e:
+        pytest.skip(f"no IPv6 loopback here: {e}")
+    try:
+        assert server.advertised_url("::1", srv.server_address[1]).startswith("http://[::1]:")
+    finally:
+        srv.server_close()
+
+
+def test_serve_steps_aside_when_the_port_is_taken(tmp_path, monkeypatch, capsys):
+    """A second `serve` (the login service next to a terminal one, or vice versa) exits 0, so a
+    service manager that restarts on failure leaves it alone."""
+    _seed(tmp_path / "t.db", monkeypatch)
+    holder = server.make_server("127.0.0.1", 0)
+    port = holder.server_address[1]
+    cfg = {"server": {"host": "127.0.0.1", "port": port, "allowed_hosts": []}, "embeddings": {"dim": EMBED_DIM}}
+    monkeypatch.setattr(server.CFG, "load", lambda *a, **k: cfg)
+    monkeypatch.setattr(server, "prepare", lambda c: None)
+    try:
+        assert server.main() == 0
+    finally:
+        holder.server_close()
+    assert "already served" in capsys.readouterr().out
