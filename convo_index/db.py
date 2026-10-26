@@ -8,6 +8,7 @@ after a file backup; `SCHEMA_VERSION` is the current layout.
 from __future__ import annotations
 
 import json
+import re
 import os
 import sqlite3
 import time
@@ -16,7 +17,7 @@ from pathlib import Path
 import sqlite_vec
 
 from convo_index.config import EMBED_DIM
-from convo_index.model import TITLE_LIMIT, display_title, KIND_TEXT
+from convo_index.model import TITLE_LIMIT, display_title, Conversation, KIND_TEXT
 
 SCHEMA_VERSION = 7
 
@@ -419,6 +420,9 @@ def _migrate_v1_to_v2(conn):
 
 # ---------------------------------------------------------------- lookups ---------
 
+class AmbiguousId(LookupError):
+    """A bare native id matches conversations from more than one source."""
+
 
 def vector_dim(conn):
     """Dimension the existing vec_messages table was created with (parsed from its DDL)."""
@@ -475,4 +479,248 @@ def set_meta(conn, key, value):
     conn.commit()
 
 
+def resolve_id(conn, id_or_legacy):
+    """Canonical conversation id for a namespaced id, a pre-v2 bare session uuid, or a bare
+    native id (e.g. pasted from a tool's own --resume command). A bare native id is only
+    accepted when it is unambiguous; otherwise AmbiguousId lists the candidates so Hide /
+    Delete can never act on the wrong conversation."""
+    if conn.execute("SELECT 1 FROM conversations WHERE id=?", (id_or_legacy,)).fetchone():
+        return id_or_legacy
+    row = conn.execute("SELECT id FROM legacy_ids WHERE legacy=?", (id_or_legacy,)).fetchone()
+    if row:
+        return row[0]
+    rows = conn.execute("SELECT id FROM conversations WHERE native_id=? ORDER BY id LIMIT 3",
+                        (id_or_legacy,)).fetchall()
+    if len(rows) > 1:
+        raise AmbiguousId([r[0] for r in rows])
+    return rows[0][0] if rows else id_or_legacy
+
+
+def is_deleted(conn, conversation_id):
+    row = conn.execute("SELECT deleted FROM conversation_state WHERE conversation_id=?",
+                       (conversation_id,)).fetchone()
+    return bool(row and row[0])
+
+
+def exists(conn, conversation_id):
+    return conn.execute("SELECT 1 FROM conversations WHERE id=?", (conversation_id,)).fetchone() is not None
+
+
+def get_revision(conn, conversation_id):
+    row = conn.execute("SELECT source_revision FROM conversations WHERE id=?",
+                       (conversation_id,)).fetchone()
+    return row[0] if row else None
+
+
+def list_sources(conn):
+    return [r[0] for r in conn.execute(
+        "SELECT source FROM conversations GROUP BY source ORDER BY COUNT(*) DESC").fetchall()]
+
+
+def mark_vector_stale(conn, conversation_id):
+    """The summary or the conversation row changed: the conversation vector may be out of
+    date. Found in SQL by vectors.pending_vectors; run_vector re-checks the text fingerprint."""
+    if _table_exists(conn, "derived_jobs"):
+        conn.execute("UPDATE derived_jobs SET status='stale' WHERE conversation_id=? AND kind='vector' AND status='ok'",
+                     (conversation_id,))
+        # a failed (even exhausted) job gets a fresh attempt for the changed inputs; it stays
+        # failed because the stored vector, if any, is for an older text
+        conn.execute("UPDATE derived_jobs SET attempts=0 WHERE conversation_id=? AND kind='vector' AND status='failed'",
+                     (conversation_id,))
+
+
 # ---------------------------------------------------------------- writes ----------
+
+def _fts_delete(conn, mid, old_text):
+    # External-content FTS5 tables are updated with the special 'delete' command.
+    conn.execute("INSERT INTO messages_fts(messages_fts, rowid, text) VALUES('delete', ?, ?)",
+                 (mid, old_text or ""))
+
+
+def _delete_message_row(conn, mid, old_text):
+    _fts_delete(conn, mid, old_text)
+    conn.execute("DELETE FROM vec_messages WHERE rowid=?", (mid,))
+    conn.execute("DELETE FROM messages WHERE id=?", (mid,))
+
+
+def plan_messages(conn, conv: Conversation):
+    """Match incoming messages to stored rows.
+
+    Pass 1 claims rows by native id. Pass 2 falls back to (seq, content hash) but only
+    against rows that carry no native id (legacy/migrated rows), so a repeated prompt such
+    as "continue" can never steal another message's identity.
+    Returns (pairs, to_delete): pairs is [(message, existing_row_or_None)], rows are
+    (id, native_id, seq, content_hash, text)."""
+    existing = conn.execute(
+        "SELECT id, native_id, seq, content_hash, text, kind FROM messages WHERE conversation_id=?",
+        (conv.id,)).fetchall()
+    by_native = {r[1]: r for r in existing if r[1]}
+    anonymous_by_pos = {(r[2], r[3]): r for r in existing if not r[1]}
+    claimed = set()
+    matched = {}
+    for m in conv.messages:
+        row = by_native.get(m.native_id) if m.native_id else None
+        if row is not None and row[0] not in claimed:
+            claimed.add(row[0])
+            matched[m.seq] = row
+    for m in conv.messages:
+        if m.seq in matched:
+            continue
+        row = anonymous_by_pos.get((m.seq, m.content_hash))
+        if row is not None and row[0] not in claimed:
+            claimed.add(row[0])
+            matched[m.seq] = row
+    pairs = [(m, matched.get(m.seq)) for m in conv.messages]
+    to_delete = [r for r in existing if r[0] not in claimed]
+    return pairs, to_delete
+
+
+def _needs_embedding(pairs, have_vec):
+    for m, row in pairs:
+        if m.kind != KIND_TEXT:
+            continue
+        if row is None or row[3] != m.content_hash or row[0] not in have_vec:
+            yield m
+
+
+def _vector_rowids(conn, conversation_id):
+    return {r[0] for r in conn.execute(
+        "SELECT m.id FROM messages m JOIN vec_messages v ON v.rowid = m.id WHERE m.conversation_id=?",
+        (conversation_id,)).fetchall()}
+
+
+_PARSER_PREFIX = re.compile(r"^p\d+:")
+
+
+def same_content_revision(a, b):
+    """True when two change keys differ only in the adapter's parser-version prefix (`p<n>:`),
+    i.e. the source file/row is unchanged and only our parsing of it moved on."""
+    if not a or not b:
+        return False
+    return _PARSER_PREFIX.sub("", a) == _PARSER_PREFIX.sub("", b)
+
+
+def upsert_conversation(conn, conv: Conversation, category, category_source, tickets,
+                        archive_path, revision, embed_fn, extra=None):
+    """Write a conversation, reconciling messages against what is stored so row ids stay
+    stable. `extra(conn)`, if given, runs inside the same transaction just before COMMIT.
+    Only text messages without a vector are embedded; `embed_fn(texts)` returns a
+    vector or None per text.
+
+    Embedding runs *before* the write transaction so a slow embedder never holds the
+    database lock; the plan is then recomputed inside the transaction, because the web
+    server may have deleted or changed rows in between. Returns per-message stats, or None
+    when the conversation is on the user's delete blocklist and nothing was written."""
+    cid = conv.id
+    pairs, _ = plan_messages(conn, conv)
+    vectors = {}
+    need = list(_needs_embedding(pairs, _vector_rowids(conn, cid)))
+    if need:
+        for m, v in zip(need, embed_fn([m.text for m in need]), strict=False):
+            vectors[m.seq] = v
+
+    stats = {"inserted": 0, "updated": 0, "deleted": 0, "embedded": 0}
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # The user may have deleted this conversation (UI) while we were embedding; the
+        # blocklist wins, otherwise the indexer would resurrect it.
+        if is_deleted(conn, cid):
+            conn.execute("ROLLBACK")
+            return None
+        prev_rev = conn.execute("SELECT source_revision FROM conversations WHERE id=?", (cid,)).fetchone()
+        prev_rev = prev_rev[0] if prev_rev else None
+        pairs, to_delete = plan_messages(conn, conv)   # authoritative plan, under the lock
+        have_vec = _vector_rowids(conn, cid)
+        for r in to_delete:
+            _delete_message_row(conn, r[0], r[4])
+            stats["deleted"] += 1
+        # The ordered text messages are what summaries and tags read: if they are the same
+        # before and after, derived work made from them is still valid.
+        before = [r[3] for r in sorted([r for _, r in pairs if r is not None] + list(to_delete), key=lambda r: r[2])
+                  if r[5] == KIND_TEXT]
+        after = [m.content_hash for m in conv.messages if m.kind == KIND_TEXT]
+        text_changed = before != after
+        seq_to_id = {}
+        for m, row in pairs:
+            if row is None:
+                cur = conn.execute(
+                    """INSERT INTO messages(conversation_id, native_id, seq, role, kind, ts, text,
+                                            content_hash, model) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (cid, m.native_id, m.seq, m.role, m.kind, m.ts, m.text, m.content_hash, m.model))
+                mid = cur.lastrowid
+                conn.execute("INSERT INTO messages_fts(rowid, text) VALUES(?,?)", (mid, m.text))
+                stats["inserted"] += 1
+                needs_vec = m.kind == KIND_TEXT
+            else:
+                mid = row[0]
+                changed = row[3] != m.content_hash
+                if changed:
+                    _fts_delete(conn, mid, row[4])
+                    conn.execute("INSERT INTO messages_fts(rowid, text) VALUES(?,?)", (mid, m.text))
+                    conn.execute("DELETE FROM vec_messages WHERE rowid=?", (mid,))
+                    stats["updated"] += 1
+                conn.execute(
+                    """UPDATE messages SET native_id=?, seq=?, role=?, kind=?, ts=?, text=?,
+                                           content_hash=?, model=? WHERE id=?""",
+                    (m.native_id, m.seq, m.role, m.kind, m.ts, m.text, m.content_hash, m.model, mid))
+                needs_vec = m.kind == KIND_TEXT and (changed or mid not in have_vec)
+            seq_to_id[m.seq] = mid
+            v = vectors.get(m.seq)
+            if needs_vec and v is not None:
+                conn.execute("DELETE FROM vec_messages WHERE rowid=?", (mid,))
+                conn.execute("INSERT INTO vec_messages(rowid, embedding) VALUES(?,?)",
+                             (mid, sqlite_vec.serialize_float32(v)))
+                stats["embedded"] += 1
+
+        conn.execute(
+            """INSERT INTO conversations(id, source, native_id, source_ref, source_revision,
+                    archive_path, title, first_prompt, category, category_source, tickets,
+                    cwd, project_root, git_branch, git_origin_url, parent_id, relation,
+                    provider, models, fidelity, warnings, metadata, start_ts, end_ts, message_count)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                    source_ref=excluded.source_ref, source_revision=excluded.source_revision,
+                    archive_path=excluded.archive_path, title=excluded.title,
+                    first_prompt=excluded.first_prompt, category=excluded.category,
+                    category_source=excluded.category_source, tickets=excluded.tickets,
+                    cwd=excluded.cwd, project_root=excluded.project_root,
+                    git_branch=excluded.git_branch, git_origin_url=excluded.git_origin_url,
+                    parent_id=excluded.parent_id, relation=excluded.relation,
+                    provider=excluded.provider, models=excluded.models, fidelity=excluded.fidelity,
+                    warnings=excluded.warnings, metadata=excluded.metadata,
+                    start_ts=excluded.start_ts, end_ts=excluded.end_ts,
+                    message_count=excluded.message_count""",
+            (cid, conv.source, conv.native_id, conv.source_ref, revision, archive_path,
+             display_title(conv.title, conv.first_prompt or cid), conv.first_prompt, category, category_source, json.dumps(tickets),
+             conv.cwd, conv.project_root or conv.cwd, conv.git_branch, conv.git_origin_url,
+             conv.parent_id, conv.relation[0] if conv.relation else None,
+             conv.provider, json.dumps(conv.models), conv.fidelity, json.dumps(conv.warnings),
+             json.dumps(conv.metadata), conv.start_ts, conv.end_ts, len(conv.messages)))
+        mark_vector_stale(conn, cid)
+        if prev_rev and prev_rev != revision and same_content_revision(prev_rev, revision) and not text_changed:
+            # Only the adapter's parser version changed, and it left every text message as it
+            # was: derived work made from this content is still valid. Carry the summary and the
+            # tags job to the new revision so a parser bump never re-runs the LLM over the archive.
+            conn.execute("UPDATE conversation_summary SET summarized_revision=? WHERE conversation_id=? AND summarized_revision=?",
+                         (revision, cid, prev_rev))
+            conn.execute("UPDATE derived_jobs SET input_fingerprint = replace(input_fingerprint, ?, ?) "
+                         "WHERE conversation_id=? AND kind IN ('summary', 'tags') AND input_fingerprint LIKE '%' || ? || '%'",
+                         (prev_rev, revision, cid, prev_rev))
+
+        # Usage is derived data: replace wholesale, linking to stable message ids.
+        conn.execute("DELETE FROM usage_records WHERE conversation_id=?", (cid,))
+        for u in conv.usage:
+            conn.execute(
+                """INSERT OR REPLACE INTO usage_records(conversation_id, native_request_id, message_id,
+                        provider, model, input_uncached, cache_read, cache_write, output, reasoning,
+                        reported_cost_usd, ts, cache_write_1h) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (cid, u.native_request_id, seq_to_id.get(u.message_seq), u.provider, u.model,
+                 u.input_uncached, u.cache_read, u.cache_write, u.output, u.reasoning,
+                 u.reported_cost_usd, u.ts, u.cache_write_1h))
+        if extra is not None:
+            extra(conn)   # e.g. references + ticket mirror: land with the revision or not at all
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return stats
