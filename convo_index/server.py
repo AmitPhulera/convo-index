@@ -21,6 +21,7 @@ from convo_index import settings as CFG
 from convo_index import tags as T
 from convo_index import references as REF
 from convo_index import cost as K
+from convo_index import vectors as V
 
 DB_PATH = None   # tests override; otherwise resolved from settings at request time
 
@@ -104,6 +105,72 @@ def handle_config():
                        "config_path": str(cfg.path) if cfg.path else None,
                        "windows": os.name == "nt",
                        "semantic_search": ok, "semantic_reason": reason})
+
+
+def handle_suggestions():
+    conn = dbm.connect(_db())
+    try:
+        return json.dumps(V.open_suggestions(conn) if dbm._table_exists(conn, "tag_evidence") else [])
+    finally:
+        conn.close()
+
+
+def handle_related(key):
+    conn = dbm.connect(_db())
+    try:
+        return json.dumps(REF.timeline(conn, key))
+    finally:
+        conn.close()
+
+
+def handle_reference(conversation_id, body):
+    """POST /api/reference/<id> {kind, key, linkable}: mark a false (or real) match."""
+    if not isinstance(body, dict):
+        raise LookupError("body must be a JSON object")
+    kind, key = body.get("kind"), body.get("key")
+    if not isinstance(kind, str) or kind not in ("ticket", "pr", "issue", "branch", "commit", "url"):
+        raise LookupError("kind must be one of ticket, pr, issue, branch, commit, url")
+    if not isinstance(key, str) or not key:
+        raise LookupError("key is required")
+    linkable = body.get("linkable", False)
+    if not isinstance(linkable, bool):
+        raise LookupError("linkable must be a JSON boolean")
+    conn = dbm.connect(_db())
+    try:
+        conversation_id = dbm.resolve_id(conn, conversation_id)
+        if not dbm.exists(conn, conversation_id):
+            return None
+        if not REF.set_linkable(conn, conversation_id, kind, key, linkable):
+            return None   # no such reference on this conversation
+        return json.dumps({"ok": True, "id": conversation_id, "references": REF.references_for(conn, conversation_id),
+                           "related": REF.related_for(conn, conversation_id)})
+    finally:
+        conn.close()
+
+
+def handle_tag(conversation_id, body):
+    """POST /api/tag/<id> {group, tag|null, decision: accept|reject|clear}."""
+    if not isinstance(body, dict):
+        raise LookupError("body must be a JSON object")
+    group, tag, decision = body.get("group"), body.get("tag"), body.get("decision", "accept")
+    if not isinstance(group, str) or not group:
+        raise LookupError("group is required")
+    if tag is not None and not isinstance(tag, str):
+        raise LookupError("tag must be a string or null")
+    if decision not in ("accept", "reject", "clear"):
+        raise LookupError("decision must be accept, reject or clear")
+    conn = dbm.connect(_db())
+    try:
+        conversation_id = dbm.resolve_id(conn, conversation_id)
+        if not dbm.exists(conn, conversation_id):
+            return None
+        if decision == "clear":
+            T.clear_decision(conn, conversation_id, group, tag)   # tag None = whole group
+        else:
+            T.set_decision(conn, conversation_id, group, tag, decision)
+        return json.dumps({"ok": True, "id": conversation_id, **T.detail_for(conn, conversation_id)})
+    finally:
+        conn.close()
 
 
 def handle_hide(conversation_id, hidden):
@@ -315,6 +382,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, handle_config())
         if path == "/api/analytics":
             return self._send(200, handle_analytics())
+        if path == "/api/suggestions":
+            return self._send(200, handle_suggestions())
+        if path.startswith("/api/related/"):
+            return self._send(200, handle_related(_segment(path, "/api/related/")))
         if path.startswith("/api/conversation/"):
             body = handle_conversation(_segment(path, "/api/conversation/"))
             return self._send(404, "not found", "text/plain") if body is None else self._send(200, body)
@@ -333,6 +404,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, handle_hide(_segment(path, "/api/hide/"), hidden))
             if path.startswith("/api/delete/"):
                 return self._send(200, handle_delete(_segment(path, "/api/delete/")))
+            if path.startswith("/api/reference/"):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    body = json.loads(raw or b"{}")
+                except json.JSONDecodeError:
+                    return self._send(400, json.dumps({"error": "invalid json"}))
+                try:
+                    out = handle_reference(_segment(path, "/api/reference/"), body)
+                except LookupError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                return self._send(404, "not found", "text/plain") if out is None else self._send(200, out)
+            if path.startswith("/api/tag/"):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    body = json.loads(raw or b"{}")
+                except json.JSONDecodeError:
+                    return self._send(400, json.dumps({"error": "invalid json"}))
+                try:
+                    out = handle_tag(_segment(path, "/api/tag/"), body)
+                except LookupError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                return self._send(404, "not found", "text/plain") if out is None else self._send(200, out)
             return self._send(404, "not found", "text/plain")
         except dbm.AmbiguousId as e:
             self._send(409, json.dumps({"error": "ambiguous id; use a namespaced id", "candidates": e.args[0]}))

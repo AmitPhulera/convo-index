@@ -134,6 +134,83 @@ def test_semantic_search_disabled_on_fingerprint_mismatch(tmp_path, monkeypatch)
     assert srv.semantic_status() == (True, None) and srv.embed(["q"]) == [[0.0] * 768]
 
 
+def test_tag_endpoint_and_config_groups(tmp_path, monkeypatch):
+    from tests.conftest import make_settings
+    from convo_index import tags as T
+    st = make_settings(tmp_path)
+    _seed(tmp_path / "t.db", monkeypatch)
+    monkeypatch.setattr(server.CFG, "load", lambda *a, **k: st)
+    conn = dbm.connect(tmp_path / "t.db"); T.sync_definitions(conn, st); conn.close()
+    cfg = json.loads(server.handle_config())
+    assert list(cfg["tag_groups"]) == ["workspace"] and [t["name"] for t in cfg["tag_groups"]["workspace"]["tags"]] == ["globex", "personal"]
+    out = json.loads(server.handle_tag("claude_code:s1", {"group": "workspace", "tag": "personal"}))
+    assert out["assignments"] == {"workspace": ["personal"]}
+    assert out["decisions"] == [{"group": "workspace", "tag": "personal", "decision": "accept"}]
+    conv = json.loads(server.handle_conversation("claude_code:s1"))
+    assert conv["tags"]["assignments"] == {"workspace": ["personal"]} and conv["category"] == "personal"
+    out = json.loads(server.handle_tag("claude_code:s1", {"group": "workspace", "tag": "personal", "decision": "clear"}))
+    assert out["decisions"] == []
+    assert server.handle_tag("claude_code:nope", {"group": "workspace", "tag": "personal"}) is None
+    import pytest
+    with pytest.raises(LookupError):
+        server.handle_tag("claude_code:s1", {"group": "workspace", "tag": "bogus"})
+    with pytest.raises(LookupError):
+        server.handle_tag("claude_code:s1", {"group": "workspace", "tag": "personal", "decision": "approve"})
+    with pytest.raises(LookupError):
+        server.handle_tag("claude_code:s1", ["not", "an", "object"])
+    res = json.loads(server.handle_search({"q": [""], "mode": ["hybrid"], "tag": ["workspace:personal"]}))
+    assert res == [] or all("personal" in r["tags"].get("workspace", []) for r in res)
+
+
+def test_reference_endpoint_validates(tmp_path, monkeypatch):
+    _seed(tmp_path / "t.db", monkeypatch)
+    import pytest
+    with pytest.raises(LookupError):
+        server.handle_reference("claude_code:s1", ["nope"])
+    with pytest.raises(LookupError):
+        server.handle_reference("claude_code:s1", {"kind": "bogus", "key": "x"})
+    with pytest.raises(LookupError):
+        server.handle_reference("claude_code:s1", {"kind": "ticket"})
+    with pytest.raises(LookupError):
+        server.handle_reference("claude_code:s1", {"kind": "ticket", "key": "SAAS-1", "linkable": "false"})   # not a boolean
+    assert server.handle_reference("claude_code:s1", {"kind": "ticket", "key": "SAAS-1", "linkable": False}) is None  # no such reference
+    from convo_index import references as REF
+    conn = dbm.connect(tmp_path / "t.db")
+    conv = Conversation(source="claude_code", native_id="s1", title="Kube fix", first_prompt="SAAS-1", source_ref="/a",
+                        messages=[Message(seq=0, role="user", text="SAAS-1 and commit abc1234def")])
+    REF.store(conn, conv, REF.extract(conv)); conn.close()
+    out = json.loads(server.handle_reference("claude_code:s1", {"kind": "ticket", "key": "SAAS-1", "linkable": False}))
+    assert out["ok"] is True and not [r for r in out["references"] if r["kind"] == "ticket"][0]["linkable"]
+    with pytest.raises(LookupError):                                                     # commits never link
+        server.handle_reference("claude_code:s1", {"kind": "commit", "key": "abc1234def", "linkable": True})
+
+
+def test_handle_suggestions_lists_open_ones_and_hides_hidden_targets(tmp_path, monkeypatch):
+    from tests.conftest import make_settings
+    from tests.test_vectors import fake_embed, FP
+    from convo_index import tags as T, vectors as V
+    st = make_settings(tmp_path)
+    _seed(tmp_path / "t.db", monkeypatch)
+    monkeypatch.setattr(server.CFG, "load", lambda *a, **k: st)
+    conn = dbm.connect(tmp_path / "t.db"); T.sync_definitions(conn, st)
+    other = Conversation(source="claude_code", native_id="s2", title="Kube two", first_prompt="kubernetes deploy again",
+                         source_ref="/b", cwd="/x", messages=[Message(seq=0, role="user", text="kubernetes deploy again")])
+    dbm.upsert_conversation(conn, other, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    for cid in ("claude_code:s1", "claude_code:s2"):
+        assert V.run_vector(conn, cid, fake_embed, FP) == "ok"
+    conn.close()
+    assert json.loads(server.handle_suggestions()) == []
+    server.handle_tag("claude_code:s1", {"group": "workspace", "tag": "personal"})
+    rows = json.loads(server.handle_suggestions())
+    assert [(r["id"], r["group"], r["tag"], r["origin"], r["origin_title"]) for r in rows] == \
+        [("claude_code:s2", "workspace", "personal", "claude_code:s1", "Kube fix")]
+    assert rows[0]["similarity"] > 0.9
+    conv = json.loads(server.handle_conversation("claude_code:s2"))
+    assert conv["tags"]["suggestions"][0]["tag"] == "personal"
+    server.handle_hide("claude_code:s2", True)
+    assert json.loads(server.handle_suggestions()) == []
+
+
 def test_prepare_passes_the_resolved_path_and_dim_to_init_schema(tmp_path, monkeypatch):
     from tests.conftest import make_settings
     st = make_settings(tmp_path, embeddings={"dim": 384})
