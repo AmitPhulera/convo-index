@@ -5,6 +5,7 @@ import sqlite_vec
 
 from convo_index import db as dbm
 from convo_index.config import EMBED_DIM
+from convo_index.model import content_hash, KIND_TEXT
 
 _V1_SCHEMA = """
 CREATE TABLE conversations(
@@ -41,6 +42,59 @@ def _make_v1(path):
     conn.execute("INSERT INTO conversation_state VALUES('gone', 0, 1)")
     conn.execute("INSERT INTO conversation_summary VALUES('abc','P','S','Yes','L','No',1756300000.1234567)")
     conn.commit(); conn.close()
+
+
+def test_migrates_v1_in_place_with_backup(tmp_path):
+    p = tmp_path / "convos.db"
+    _make_v1(p)
+    conn = dbm.connect(p)
+    dbm.init_schema(conn, p)
+    backups = list(tmp_path.glob("convos.db.bak-*"))
+    assert len(backups) == 1
+    assert [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")] == list(range(1, dbm.SCHEMA_VERSION + 1))
+
+    row = conn.execute("SELECT id, source, native_id, source_ref, source_revision, fidelity, project_root "
+                       "FROM conversations").fetchone()
+    assert row == ("claude_code:abc", "claude_code", "abc", "/p/abc.jsonl", str(1756300000.1234567), "full", "/x")
+    assert "file_mtime" not in {r[1] for r in conn.execute("PRAGMA table_info(conversations)")}
+
+    msgs = conn.execute("SELECT id, conversation_id, kind, content_hash, native_id FROM messages ORDER BY seq").fetchall()
+    assert [m[1] for m in msgs] == ["claude_code:abc"] * 2
+    assert msgs[0][2] == KIND_TEXT and msgs[0][3] == content_hash("user", KIND_TEXT, "hello kube")
+    assert msgs[0][4] is None
+    # vectors and FTS stayed attached to the same row ids
+    assert conn.execute("SELECT COUNT(*) FROM messages m JOIN vec_messages v ON v.rowid=m.id").fetchone()[0] == 2
+    assert conn.execute("SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'kube'").fetchall() == [(msgs[0][0],)]
+
+    assert dbm.get_hidden_ids(conn) == {"claude_code:abc"}
+    assert dbm.get_deleted_ids(conn) == {"claude_code:gone"}
+    assert dbm.get_summary(conn, "claude_code:abc")["problem"] == "P"
+    assert dbm.get_summarized_revision(conn, "claude_code:abc") == str(1756300000.1234567)
+    assert dbm.resolve_id(conn, "abc") == "claude_code:abc"
+
+    # idempotent: a second init is a no-op
+    dbm.init_schema(conn, p)
+    assert len(list(tmp_path.glob("convos.db.bak-*"))) == 1
+    assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 1
+
+
+def test_migration_reingests_once_but_keeps_summary_for_unchanged_files(tmp_path):
+    """Legacy rows keep an mtime-only revision (never equal to the adapter's mtime:size key)
+    so they are re-ingested once to backfill native ids/usage; the summary revision is
+    upgraded for unchanged files so no LLM call is repeated."""
+    import os
+    src = tmp_path / "abc.jsonl"; src.write_text("{}")
+    mtime = 1756300000.1234567
+    os.utime(src, (mtime, mtime))
+    p = tmp_path / "convos.db"
+    _make_v1(p)
+    conn = sqlite3.connect(str(p))
+    conn.execute("UPDATE conversations SET source_path=?", (str(src),)); conn.commit(); conn.close()
+    conn = dbm.connect(p)
+    dbm.init_schema(conn, p)
+    from convo_index.sources.claude_code import revision_of
+    assert dbm.get_revision(conn, "claude_code:abc") == str(mtime)          # != revision_of(src)
+    assert dbm.get_summarized_revision(conn, "claude_code:abc") == revision_of(src)
 
 
 def test_backup_is_a_complete_copy_including_uncheckpointed_wal(tmp_path):
@@ -106,9 +160,58 @@ def test_concurrent_init_migrates_exactly_once(tmp_path):
     assert len(list(tmp_path.glob("convos.db.bak-*"))) == 1
 
 
+def test_migrated_messages_reconcile_without_reembedding(tmp_path):
+    from convo_index.model import Conversation, Message
+    p = tmp_path / "convos.db"
+    _make_v1(p)
+    conn = dbm.connect(p)
+    dbm.init_schema(conn, p)
+    conv = Conversation(source="claude_code", native_id="abc", title="T", first_prompt="hello kube",
+                        source_ref="/p/abc.jsonl",
+                        messages=[Message(seq=0, role="user", text="hello kube", native_id="u0"),
+                                  Message(seq=1, role="assistant", text="sure", native_id="u1")])
+    calls = []
+    stats = dbm.upsert_conversation(conn, conv, "globex", "path", [], None, "r2",
+                                    lambda texts: calls.append(texts) or [None] * len(texts))
+    assert stats == {"inserted": 0, "updated": 0, "deleted": 0, "embedded": 0}
+    assert calls == []
+    assert conn.execute("SELECT native_id FROM messages ORDER BY seq").fetchall() == [("u0",), ("u1",)]
+
+
 def test_fresh_db_is_current_without_backup(tmp_path):
     p = tmp_path / "new.db"
     conn = dbm.connect(p)
     dbm.init_schema(conn, p)
     assert list(tmp_path.glob("*.bak-*")) == []
     assert [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")] == list(range(2, dbm.SCHEMA_VERSION + 1))
+
+
+def test_v2_to_v3_backs_up_and_marks_legacy_vectors(tmp_path):
+    from convo_index.model import Conversation, Message
+    p = tmp_path / "v2.db"
+    conn = dbm.connect(p); dbm.init_schema(conn, p)
+    c = Conversation(source="claude_code", native_id="a", title="t", first_prompt="p", source_ref="/a",
+                     messages=[Message(seq=0, role="user", text="x")])
+    dbm.upsert_conversation(conn, c, "globex", "path", [], None, "r1", lambda t: [[0.1] * EMBED_DIM for _ in t])
+    conn.execute("DELETE FROM schema_migrations WHERE version=3")
+    conn.execute("DROP TABLE derived_jobs"); conn.execute("DROP TABLE index_meta"); conn.commit(); conn.close()
+    assert list(tmp_path.glob("v2.db.bak-*")) == []
+    conn = dbm.connect(p); dbm.init_schema(conn, p)
+    assert len(list(tmp_path.glob("v2.db.bak-*"))) == 1                       # v2 -> v3 is backed up too
+    assert dbm.get_meta(conn, "embedding_fingerprint").startswith("legacy|")    # old vectors are not relabelled
+
+
+def test_v2_to_v3_seeds_jobs_only_for_current_summaries(tmp_path):
+    from convo_index.model import Conversation, Message
+    p = tmp_path / "v2.db"
+    conn = dbm.connect(p); dbm.init_schema(conn, p)
+    for native, rev, srev in (("a", "r1", "r1"), ("b", "r2", "r1")):     # b's summary is stale
+        c = Conversation(source="claude_code", native_id=native, title="t", first_prompt="p", source_ref="/a",
+                         messages=[Message(seq=0, role="user", text="x")])
+        dbm.upsert_conversation(conn, c, "globex", "path", [], None, rev, lambda t: [None] * len(t))
+        dbm.set_summary(conn, c.id, {"problem": "P"}, srev)
+    # pretend this is a v2 database: drop the v3 marker and table, then re-init
+    conn.execute("DELETE FROM schema_migrations WHERE version=3"); conn.execute("DROP TABLE derived_jobs"); conn.commit()
+    dbm.init_schema(conn, p)
+    rows = conn.execute("SELECT conversation_id, status FROM derived_jobs ORDER BY 1").fetchall()
+    assert rows == [("claude_code:a", "ok")]
