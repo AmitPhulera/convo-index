@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+from convo_index import db as dbm
 from convo_index import settings as S
 from convo_index.model import Conversation, KIND_TEXT
 
@@ -209,3 +211,238 @@ def extraction_fingerprint(settings=None):
     settings = settings or S.load()
     cfg = settings["references"]
     return f"v{EXTRACTOR_VERSION}|" + json.dumps(cfg, sort_keys=True, default=str)
+
+
+def _conversation_from_db(conn, cid):
+    """A Conversation shaped enough for extract(): head fields and the stored messages."""
+    from convo_index.model import Message
+    r = conn.execute(
+        """SELECT source, native_id, title, first_prompt, source_ref, cwd, project_root, git_branch, git_origin_url
+           FROM conversations WHERE id=?""", (cid,)).fetchone()
+    if not r:
+        return None
+    msgs = [Message(seq=seq, role=role, kind=kind, text=text) for seq, role, kind, text in conn.execute(
+        "SELECT seq, role, kind, text FROM messages WHERE conversation_id=? ORDER BY seq", (cid,))]
+    return Conversation(source=r[0], native_id=r[1], title=r[2], first_prompt=r[3], source_ref=r[4], cwd=r[5],
+                        project_root=r[6], git_branch=r[7], git_origin_url=r[8], messages=msgs)
+
+
+def backfill(conn, settings=None, batch=200):
+    """Re-extract references for every live conversation from the stored transcript, in
+    batches of one transaction each. Returns the number of conversations re-scanned."""
+    settings = settings or S.load()
+    ids = [r[0] for r in conn.execute(
+        """SELECT c.id FROM conversations c LEFT JOIN conversation_state st ON st.conversation_id = c.id
+           WHERE COALESCE(st.deleted, 0) = 0 ORDER BY c.start_ts""")]
+    done = 0
+    for i in range(0, len(ids), batch):
+        chunk = ids[i:i + batch]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for cid in chunk:
+                if dbm.is_deleted(conn, cid):
+                    continue
+                conv = _conversation_from_db(conn, cid)   # read under the lock: what we store is what is there
+                if conv is None:
+                    continue
+                _store_locked(conn, conv, extract(conv, settings))
+                done += 1
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return done
+
+
+def ensure_current(conn, settings=None):
+    """Backfill once per extractor version / [references] configuration. Returns the number
+    of conversations re-scanned (0 when already current)."""
+    settings = settings or S.load()
+    fp = extraction_fingerprint(settings)
+    if dbm.get_meta(conn, META_EXTRACTOR) == fp:
+        return 0
+    n = backfill(conn, settings)
+    dbm.set_meta(conn, META_EXTRACTOR, fp)
+    return n
+
+
+def store(conn, conv: Conversation, refs: list[Ref]):
+    """Replace the conversation's references, honouring the user's linkable overrides.
+    Returns the sorted list of linkable ticket keys (kept in conversations.tickets)."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        tickets = _store_locked(conn, conv, refs)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return tickets
+
+
+def _store_locked(conn, conv: Conversation, refs: list[Ref]):
+    """store() without the transaction: for callers that already hold one (the conversation
+    upsert writes the row, its references and the ticket mirror atomically). Overrides are
+    read under the same lock so a rejection committed a moment earlier is never overwritten."""
+    overrides = {(k, key): bool(v) for k, key, v in conn.execute(
+        "SELECT kind, key, linkable FROM reference_decisions WHERE conversation_id=?", (conv.id,))}
+    conn.execute("DELETE FROM references_ WHERE conversation_id=?", (conv.id,))
+    for r in refs:
+        linkable = overrides.get((r.kind, r.key), r.linkable) and r.kind not in NEVER_LINK and not _ambiguous(r.kind, r.key)
+        conn.execute(
+            """INSERT INTO references_(conversation_id, kind, key, namespace, message_seq, span, method,
+                                       confidence, linkable) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (conv.id, r.kind, r.key, r.namespace, r.message_seq, r.span, r.method, r.confidence, 1 if linkable else 0))
+    tickets = sorted({r.key for r in refs if r.kind == "ticket" and overrides.get(("ticket", r.key), r.linkable)})
+    conn.execute("UPDATE conversations SET tickets=? WHERE id=?", (json.dumps(tickets), conv.id))
+    return tickets
+
+
+def _ambiguous(kind, key):
+    """A bare `PR 123` without a known repository has no identity to link on."""
+    return kind in ("pr", "issue") and "/" not in key
+
+
+def set_linkable(conn, cid, kind, key, linkable):
+    """User override: mark a reference as (not) a real link; survives re-ingestion. For
+    GitHub keys the override applies to the pr and issue kinds alike (same number space)."""
+    if linkable and (kind in NEVER_LINK or _ambiguous(kind, key)):
+        raise LookupError(f"{kind} references never link" if kind in NEVER_LINK
+                          else "a bare PR number has no repository to link on")
+    kinds = ("pr", "issue") if kind in ("pr", "issue") else (kind,)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not conn.execute(f"SELECT 1 FROM references_ WHERE conversation_id=? AND key=? AND kind IN ({','.join('?' * len(kinds))})",
+                            (cid, key, *kinds)).fetchone():
+            conn.execute("ROLLBACK")
+            return False
+        for k in kinds:
+            conn.execute(
+                "INSERT INTO reference_decisions(conversation_id, kind, key, linkable, ts) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(conversation_id, kind, key) DO UPDATE SET linkable=excluded.linkable, ts=excluded.ts",
+                (cid, k, key, 1 if linkable else 0, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+        q = ",".join("?" * len(kinds))
+        conn.execute(f"UPDATE references_ SET linkable=? WHERE conversation_id=? AND key=? AND kind IN ({q})",
+                     (1 if linkable else 0, cid, key, *kinds))
+        if kind == "ticket":
+            keys = [r[0] for r in conn.execute(
+                "SELECT key FROM references_ WHERE conversation_id=? AND kind='ticket' AND linkable=1 ORDER BY key", (cid,))]
+            conn.execute("UPDATE conversations SET tickets=? WHERE id=?", (json.dumps(keys), cid))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return True
+
+
+def link_url(kind, key, settings=None):
+    settings = settings or S.load()
+    if kind == "branch":
+        return None
+    if kind == "ticket":
+        return (settings["references"].get("ticket_url") or "").replace("{key}", key) or None
+    if kind in ("pr", "issue") and "#" in key and "/" in key:
+        repo, n = key.rsplit("#", 1)
+        return f"https://{repo}/{'pull' if kind == 'pr' else 'issues'}/{n}"
+    if kind == "url":
+        return key
+    return None
+
+
+def references_for(conn, cid, settings=None):
+    """All references of a conversation, linkable first, with display URLs."""
+    rows = conn.execute(
+        """SELECT kind, key, namespace, message_seq, span, method, confidence, linkable FROM references_
+           WHERE conversation_id=? ORDER BY linkable DESC, kind, key""", (cid,)).fetchall()
+    return [{"kind": k, "key": key, "namespace": ns, "message_seq": seq, "span": span, "method": meth,
+             "confidence": conf, "linkable": bool(link), "url": link_url(k, key, settings)}
+            for k, key, ns, seq, span, meth, conf, link in rows]
+
+
+_LINKED = "('ticket','pr','issue','branch')"
+
+_RELATED_SQL = f"""
+    SELECT DISTINCT c.id, c.title, c.source, c.start_ts, c.cwd, s.is_resolved
+    FROM references_ r
+    JOIN conversations c ON c.id = r.conversation_id
+    LEFT JOIN conversation_summary s ON s.conversation_id = c.id
+    LEFT JOIN conversation_state st ON st.conversation_id = c.id
+    WHERE r.key = ? AND r.linkable = 1 AND r.kind IN {_LINKED}
+      AND COALESCE(st.hidden, 0) = 0 AND COALESCE(st.deleted, 0) = 0
+"""
+
+
+def _rows(cur):
+    return [{"id": r[0], "title": r[1], "source": r[2], "start_ts": r[3], "cwd": r[4], "is_resolved": r[5]} for r in cur]
+
+
+def related_for(conn, cid, settings=None, per_key=20):
+    """Other conversations sharing a linkable key with this one (or with its parent, for
+    sub-agent sessions), grouped by key, newest first. One SQL query per key, bounded; no
+    transitive merging."""
+    settings = settings or S.load()
+    subject = cid
+    seen = {cid}
+    for _ in range(10):   # nested sub-agents: the subject is the top of the chain
+        parent = conn.execute("SELECT parent_id FROM conversations WHERE id=?", (subject,)).fetchone()
+        if not parent or not parent[0] or parent[0] in seen:
+            break
+        subject = parent[0]; seen.add(subject)
+    keys = conn.execute(
+        f"""SELECT key, MIN(CASE kind WHEN 'pr' THEN 0 WHEN 'issue' THEN 1 WHEN 'ticket' THEN 2 ELSE 3 END) AS ord,
+                   MAX(CASE WHEN kind = 'pr' THEN 'pr' ELSE kind END) AS kind
+            FROM references_ WHERE conversation_id IN (?, ?) AND linkable = 1 AND kind IN {_LINKED}
+            GROUP BY key ORDER BY ord, key""", (cid, subject)).fetchall()
+    groups = []
+    for key, _, kind in keys:
+        kind = "pr" if any(k == "pr" for (k,) in conn.execute(
+            "SELECT DISTINCT kind FROM references_ WHERE key=? AND kind IN ('pr','issue')", (key,))) else kind
+        count = conn.execute(
+            f"""SELECT COUNT(DISTINCT r.conversation_id) FROM references_ r
+                LEFT JOIN conversation_state st ON st.conversation_id = r.conversation_id
+                WHERE r.key = ? AND r.linkable = 1 AND r.kind IN {_LINKED} AND r.conversation_id NOT IN (?, ?)
+                  AND COALESCE(st.hidden, 0) = 0 AND COALESCE(st.deleted, 0) = 0""", (key, cid, subject)).fetchone()[0]
+        if not count:
+            continue
+        items = _rows(conn.execute(_RELATED_SQL + " AND c.id NOT IN (?, ?) ORDER BY c.start_ts DESC LIMIT ?",
+                                   (key, cid, subject, per_key)))
+        groups.append({"kind": kind, "key": key, "label": branch_label(key) if kind == "branch" else key,
+                       "url": link_url(kind, key, settings), "count": count, "conversations": items})
+    groups.sort(key=lambda g: -g["count"])
+    return groups
+
+
+def resolve_key(conn, key):
+    """A key as the UI/CLI show it: exact keys pass through; a bare branch name resolves to
+    the one `<project>@<branch>` key that carries it. Returns (key, candidates): several
+    candidates mean the name is ambiguous across projects and nothing was picked."""
+    if conn.execute(f"SELECT 1 FROM references_ WHERE key=? AND linkable=1 AND kind IN {_LINKED} LIMIT 1", (key,)).fetchone():
+        return key, [key]
+    cands = [r[0] for r in conn.execute(
+        "SELECT DISTINCT key FROM references_ WHERE kind='branch' AND linkable=1 AND key LIKE '%@' || ? ESCAPE '\\'",
+        (key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"),))]
+    return (cands[0] if len(cands) == 1 else key), cands
+
+
+def timeline(conn, key, settings=None, limit=500):
+    """Every conversation linked to a key, oldest first, with resolution status. A bare branch
+    name is resolved to its project-scoped key when unambiguous; `candidates` lists the
+    matching keys otherwise."""
+    settings = settings or S.load()
+    key, cands = resolve_key(conn, key)
+    kinds = {k for (k,) in conn.execute(
+        f"SELECT DISTINCT kind FROM references_ WHERE key=? AND linkable=1 AND kind IN {_LINKED}", (key,))}
+    kind = "pr" if "pr" in kinds else (sorted(kinds)[0] if kinds else None)
+    items = _rows(conn.execute(_RELATED_SQL + " ORDER BY c.start_ts LIMIT ?", (key, limit)))
+    out = {"key": key, "kind": kind, "label": branch_label(key) if kind == "branch" else key,
+           "url": link_url(kind, key, settings) if kind else None, "conversations": items}
+    if len(cands) > 1:
+        out["candidates"] = cands
+    return out
+
+
+def top_keys(conn, kinds=("ticket", "pr", "issue", "branch"), limit=15):
+    q = ",".join("?" * len(kinds))
+    return [[k, key, n] for k, key, n in conn.execute(
+        f"""SELECT kind, key, COUNT(DISTINCT conversation_id) AS n FROM references_
+            WHERE linkable=1 AND kind IN ({q}) GROUP BY kind, key ORDER BY n DESC, key LIMIT ?""",
+        (*kinds, limit)).fetchall()]
