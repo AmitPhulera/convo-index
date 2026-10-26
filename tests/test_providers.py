@@ -8,7 +8,7 @@ import urllib.error
 
 import pytest
 
-from convo_index.providers import base, cli_backends as cli, http_backends as http, local_backends as local
+from convo_index.providers import base, cli_backends as cli, http_backends as http, local_backends as local, registry as R
 from convo_index.providers.base import LLMRequest
 
 SCHEMA = {"type": "object", "properties": {"category": {"type": "string", "enum": ["a", "b"]}},
@@ -233,11 +233,86 @@ def test_openai_compat_embeddings_error_returns_none_vectors(monkeypatch):
 
 # ---------------------------------------------------------------- registry
 
+def test_probe_order_is_gemini_codex_claude(monkeypatch):
+    monkeypatch.setattr(cli.GeminiCLI, "available", classmethod(lambda c: False))
+    monkeypatch.setattr(cli.CodexCLI, "available", classmethod(lambda c: True))
+    monkeypatch.setattr(cli.ClaudeCLI, "available", classmethod(lambda c: True))
+    assert R.probe_cli_backends() == ["codex_cli", "claude_cli"]
+    assert R.default_backend() == "codex_cli"
+    monkeypatch.setattr(cli.GeminiCLI, "available", classmethod(lambda c: True))
+    assert R.default_backend() == "gemini_cli"
+
+
+def test_complete_reports_missing_config(settings):
+    r = R.complete("summary", "p", settings=settings)
+    assert not r.ok and r.error == "config" and "convo-index init" in r.detail
+
+
+def test_complete_respects_deny_policy(llm_settings, monkeypatch):
+    llm_settings["privacy"]["hosted_processing"] = "deny"
+    r = R.complete("summary", "p", settings=llm_settings)
+    assert r.error == "config" and "deny" in r.detail
+
+
+def test_complete_truncates_input_and_never_raises(llm_settings, monkeypatch):
+    seen = {}
+    class Boom:
+        def complete(self, req):
+            seen["len"] = len(req.prompt); raise RuntimeError("kaboom")
+    monkeypatch.setattr(R, "make_llm", lambda spec: Boom())
+    r = R.complete("summary", "x" * 100_000, settings=llm_settings, max_input_chars=1000)
+    assert r.error == "provider" and "kaboom" in r.detail
+    assert seen["len"] < 1100
+
+
+def test_is_hosted_treats_localhost_compat_as_local():
+    assert R.is_hosted({"backend": "claude_cli"}) is True
+    assert R.is_hosted({"backend": "openai_compat", "base_url": "http://localhost:11434/v1"}) is False
+    assert R.is_hosted({"backend": "openai_compat", "base_url": "https://openrouter.ai/api/v1"}) is True
+
+
+def test_explicit_empty_api_key_env_sends_no_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "leak-me")
+    assert http._key({"api_key_env": ""}, "OPENAI_API_KEY") == ""          # explicit "": no key
+    assert http._key({}, "OPENAI_API_KEY") == "leak-me"                     # absent: conventional var
+    assert http.OpenAICompat({"base_url": "https://internal-gpu/v1", "api_key_env": ""})._headers() == {}
+
 
 def test_validate_rejects_null_unless_schema_allows():
     assert "null" in base.validate({"category": None}, SCHEMA)
     assert base.validate({"x": None}, {"type": "object", "properties": {"x": {"type": ["string", "null"]}}}) is None
     assert base.validate({"x": 3}, {"type": "object", "properties": {"x": {"type": ["string", "null"]}}})
+
+
+def test_embedder_blocked_by_deny_policy_for_remote_only(settings):
+    settings["privacy"]["hosted_processing"] = "deny"
+    settings["embeddings"]["backend"] = "openai_compat"
+    assert R.embedder_blocked_reason(settings) is None                       # localhost Ollama is fine
+    settings["embeddings"]["base_url"] = "https://api.openai.com/v1"
+    assert "deny" in R.embedder_blocked_reason(settings)
+    assert R.make_embedder(settings) is None
+
+
+def test_is_local_url_uses_hostname_not_substring():
+    assert base.is_local_url("http://localhost:11434/v1") and base.is_local_url("http://127.0.0.1:8000/v1")
+    assert base.is_local_url("http://[::1]:8000/v1")
+    assert not base.is_local_url("https://localhost.evil.example/v1")
+    assert not base.is_local_url("https://evil.example/v1/localhost")
+    assert R.is_hosted({"backend": "openai_compat", "base_url": "https://localhost.evil.example/v1"})
+
+
+def test_unresolved_ask_policy_blocks_hosted_but_not_local(llm_settings):
+    llm_settings["privacy"]["hosted_processing"] = "ask"
+    r = R.complete("summary", "p", settings=llm_settings)
+    assert r.error == "config" and "ask" in r.detail and "convo-index init" in r.detail
+    assert R.policy_allows({"backend": "openai_compat", "base_url": "http://localhost:11434/v1"}, llm_settings)
+    assert R.embedder_blocked_reason(llm_settings) is None
+
+
+def test_openai_compat_headers_never_send_key_to_localhost_lookalike(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    assert http.OpenAICompat({"base_url": "http://localhost:11434/v1"})._headers() == {}
+    assert http.OpenAICompat({"base_url": "https://api.openai.com/v1"})._headers() == {"Authorization": "Bearer k"}
 
 
 def test_validate_anyof_nullable_enum():
@@ -331,6 +406,20 @@ def test_fastembed_model_cached_never_downloads(fake_fastembed, tmp_path):
     assert all(made[2] for made in fake_fastembed.made)                   # local_files_only every time
 
 
+def test_fastembed_is_the_default_and_blocked_only_when_not_installed(settings, monkeypatch):
+    assert settings["embeddings"]["backend"] == "fastembed"
+    monkeypatch.setattr(local, "installed", lambda: False)
+    reason = R.embedder_blocked_reason(settings)
+    assert "uv sync" in reason and "openai_compat" in reason
+    assert R.make_embedder(settings) is None
+    monkeypatch.setattr(local, "installed", lambda: True)
+    settings["privacy"]["hosted_processing"] = "deny"                     # policy is irrelevant in-process
+    assert R.embedder_blocked_reason(settings) is None
+    assert isinstance(R.make_embedder(settings), local.FastEmbed)
+    settings["embeddings"]["backend"] = "openai_compat"
+    assert isinstance(R.make_embedder(settings), http.OpenAICompat)
+
+
 def test_validate_applies_sibling_constraints_and_rejects_bool_as_number():
     assert base.validate(None, {"type": ["string", "null"], "enum": ["a"]})
     assert base.validate(True, {"type": ["integer", "null"]})
@@ -364,3 +453,18 @@ def test_cli_backends_never_raise(monkeypatch):
         assert not r.ok and r.error == "provider" and "envelope" in r.detail
     r = cli.CodexCLI().complete(LLMRequest(prompt="P", model="m"))
     assert not r.ok and r.error == "malformed"                               # no agent message at all
+
+
+def test_replacing_an_api_key_changes_the_usability_signature(monkeypatch):
+    spec = {"backend": "anthropic_api", "model": "m"}
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "bad-key")
+    before = R.usability_signature(spec)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "good-key")
+    assert R.usability_signature(spec) != before                    # a blocked job can be re-queued
+    assert "good-key" not in R.usability_signature(spec)            # the key itself is never recorded
+    monkeypatch.setattr(http.OpenAICompat, "available", lambda self: True)   # no probe of a real server
+    monkeypatch.setenv("MY_KEY", "x")
+    custom = {"backend": "openai_compat", "model": "m", "api_key_env": "MY_KEY"}
+    sig = R.usability_signature(custom)
+    monkeypatch.setenv("MY_KEY", "y")
+    assert R.usability_signature(custom) != sig                     # api_key_env is respected
