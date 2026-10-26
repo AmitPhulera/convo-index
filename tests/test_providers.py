@@ -1,10 +1,14 @@
 """Provider backends against recorded CLI/HTTP envelopes (no processes, no network)."""
 import io
 import json
+import math
+import os
+import sys
 import urllib.error
 
+import pytest
 
-from convo_index.providers import base, cli_backends as cli, http_backends as http
+from convo_index.providers import base, cli_backends as cli, http_backends as http, local_backends as local
 from convo_index.providers.base import LLMRequest
 
 SCHEMA = {"type": "object", "properties": {"category": {"type": "string", "enum": ["a", "b"]}},
@@ -252,6 +256,79 @@ def test_is_local_url_rejects_dns_lookalikes_of_loopback():
 
 
 # ---------------------------------------------------------------- fastembed (in-process)
+
+class _FakeTextEmbedding:
+    """Stand-in for fastembed.TextEmbedding: records construction, returns 3-dim vectors."""
+    made = []
+
+    def __init__(self, model_name, cache_dir=None, local_files_only=False, lazy_load=False, **kw):
+        self.made.append((model_name, cache_dir, local_files_only))
+        if local_files_only and not (os.path.isdir(cache_dir) and os.listdir(cache_dir)):
+            raise ValueError("model not in cache")
+
+    seen = []
+
+    def embed(self, documents, batch_size=256):
+        import numpy
+        for d in documents:
+            self.seen.append(d)
+            yield numpy.array([len(d), 0.5, -1.0])
+
+
+@pytest.fixture
+def fake_fastembed(monkeypatch):
+    import types
+    mod = types.ModuleType("fastembed")
+    _FakeTextEmbedding.made = []
+    _FakeTextEmbedding.seen = []
+    mod.TextEmbedding = _FakeTextEmbedding
+    monkeypatch.setitem(sys.modules, "fastembed", mod)
+    monkeypatch.setattr(local, "installed", lambda: True)
+    monkeypatch.setattr(local, "_MODELS", {})
+    return _FakeTextEmbedding
+
+
+def test_fastembed_embeds_truncates_normalises_and_reuses_one_loaded_model(fake_fastembed, tmp_path):
+    emb = local.FastEmbed({"model": "m", "cache_dir": str(tmp_path), "max_chars": 4, "dim": 3})
+    res = emb.embed(["abcdefgh", "xy"])
+    assert res.error is None
+    n = math.sqrt(16 + 0.25 + 1)
+    assert res.vectors[0] == pytest.approx([4 / n, 0.5 / n, -1 / n])         # truncated to 4 chars, unit length
+    assert res.vectors[1] == pytest.approx([2 / math.sqrt(5.25), 0.5 / math.sqrt(5.25), -1 / math.sqrt(5.25)])
+    emb.embed(["again"])
+    assert fake_fastembed.made == [("m", str(tmp_path), False)]      # loaded once per process
+    assert emb.fingerprint == "fastembed|m|dim=3|trunc=4|unit+task"
+    assert local.FastEmbed({"model": "m", "cache_dir": str(tmp_path), "dim": 2}).embed(["x"]).error == "config"
+
+
+def test_fastembed_prefixes_nomic_by_purpose_and_truncates_before_prefixing(fake_fastembed, tmp_path):
+    emb = local.FastEmbed({"model": "nomic-ai/nomic-embed-text-v1.5-Q", "cache_dir": str(tmp_path), "max_chars": 3})
+    emb.embed(["abcdef"]); emb.embed(["abcdef"], purpose="query")
+    assert fake_fastembed.seen == ["search_document: abc", "search_query: abc"]
+    other = local.FastEmbed({"model": "BAAI/bge-small-en-v1.5", "cache_dir": str(tmp_path)})
+    other.embed(["abc"], purpose="query")
+    assert fake_fastembed.seen[-1] == "abc"                             # only nomic models take a prefix
+
+
+def test_unit_rejects_zero_and_non_finite_vectors():
+    assert local._unit([3.0, 4.0]) == [0.6, 0.8]
+    assert local._unit([0.0, 0.0]) is None and local._unit([float("nan"), 1.0]) is None
+
+
+def test_fastembed_load_failure_is_a_provider_error_not_an_exception(fake_fastembed, monkeypatch, tmp_path):
+    def boom(*a, **k):
+        raise RuntimeError("no network")
+    monkeypatch.setattr(fake_fastembed, "__init__", boom)
+    res = local.FastEmbed({"model": "m", "cache_dir": str(tmp_path)}).embed(["x", "y"])
+    assert res.error == "provider" and "no network" in res.detail and res.vectors == [None, None]
+
+
+def test_fastembed_model_cached_never_downloads(fake_fastembed, tmp_path):
+    emb = local.FastEmbed({"model": "m", "cache_dir": str(tmp_path / "models")})
+    assert emb.model_cached() is False
+    (tmp_path / "models" / "x").mkdir(parents=True)
+    assert emb.model_cached() is True
+    assert all(made[2] for made in fake_fastembed.made)                   # local_files_only every time
 
 
 def test_validate_applies_sibling_constraints_and_rejects_bool_as_number():
