@@ -517,6 +517,9 @@ def list_sources(conn):
         "SELECT source FROM conversations GROUP BY source ORDER BY COUNT(*) DESC").fetchall()]
 
 
+_SUMMARY_FIELDS = ("problem", "solution", "is_resolved", "learning", "claude_failed")
+
+
 def mark_vector_stale(conn, conversation_id):
     """The summary or the conversation row changed: the conversation vector may be out of
     date. Found in SQL by vectors.pending_vectors; run_vector re-checks the text fingerprint."""
@@ -527,6 +530,65 @@ def mark_vector_stale(conn, conversation_id):
         # failed because the stored vector, if any, is for an older text
         conn.execute("UPDATE derived_jobs SET attempts=0 WHERE conversation_id=? AND kind='vector' AND status='failed'",
                      (conversation_id,))
+
+
+def set_summary(conn, conversation_id, summary, summarized_revision):
+    mark_vector_stale(conn, conversation_id)
+    conn.execute(
+        """INSERT INTO conversation_summary
+               (conversation_id, problem, solution, is_resolved, learning, claude_failed, summarized_revision)
+           VALUES(?,?,?,?,?,?,?)
+           ON CONFLICT(conversation_id) DO UPDATE SET
+               problem=excluded.problem, solution=excluded.solution,
+               is_resolved=excluded.is_resolved, learning=excluded.learning,
+               claude_failed=excluded.claude_failed, summarized_revision=excluded.summarized_revision""",
+        (conversation_id, *(summary.get(f) for f in _SUMMARY_FIELDS), summarized_revision),
+    )
+    conn.commit()
+
+
+def set_summary_if_current(conn, conversation_id, summary, revision):
+    """Store a summary only if the conversation still exists, is not deleted, and is still
+    at `revision` (the transcript the summary was made from). Returns True when written.
+    Summaries are produced by slow LLM calls, so the world may have moved on meanwhile."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT source_revision FROM conversations WHERE id=?",
+                           (conversation_id,)).fetchone()
+        if row is None or row[0] != revision or is_deleted(conn, conversation_id):
+            conn.execute("ROLLBACK")
+            return False
+        conn.execute(
+            """INSERT INTO conversation_summary
+                   (conversation_id, problem, solution, is_resolved, learning, claude_failed, summarized_revision)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(conversation_id) DO UPDATE SET
+                   problem=excluded.problem, solution=excluded.solution,
+                   is_resolved=excluded.is_resolved, learning=excluded.learning,
+                   claude_failed=excluded.claude_failed, summarized_revision=excluded.summarized_revision""",
+            (conversation_id, *(summary.get(f) for f in _SUMMARY_FIELDS), revision),
+        )
+        mark_vector_stale(conn, conversation_id)
+        conn.execute("COMMIT")
+        return True
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def get_summary(conn, conversation_id):
+    row = conn.execute(
+        f"SELECT {', '.join(_SUMMARY_FIELDS)} FROM conversation_summary WHERE conversation_id=?",
+        (conversation_id,),
+    ).fetchone()
+    return dict(zip(_SUMMARY_FIELDS, row, strict=False)) if row else None
+
+
+def get_summarized_revision(conn, conversation_id):
+    row = conn.execute(
+        "SELECT summarized_revision FROM conversation_summary WHERE conversation_id=?",
+        (conversation_id,)).fetchone()
+    return row[0] if row else None
 
 
 # ---------------------------------------------------------------- writes ----------

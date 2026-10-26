@@ -148,6 +148,17 @@ def test_fts_search_finds_message(tmp_path):
     assert hits == [("claude_code:s1",)]
 
 
+def test_summary_roundtrip_and_survives_reindex(tmp_path):
+    conn = _open(tmp_path)
+    dbm.upsert_conversation(conn, _conv(), "globex", "path", [], "/a", "1", _embed_none)
+    s = {"problem": "P", "solution": "S", "is_resolved": "Yes", "learning": "L", "claude_failed": "No"}
+    dbm.set_summary(conn, "claude_code:s1", s, "1")
+    assert dbm.get_summary(conn, "claude_code:s1") == s
+    assert dbm.get_summarized_revision(conn, "claude_code:s1") == "1"
+    dbm.upsert_conversation(conn, _conv(), "globex", "path", [], "/a", "2", _embed_none)
+    assert dbm.get_summary(conn, "claude_code:s1") == s
+
+
 def test_sources_and_namespacing(tmp_path):
     conn = _open(tmp_path)
     dbm.upsert_conversation(conn, _conv(native="same"), "globex", "path", [], None, "1", _embed_none)
@@ -221,6 +232,14 @@ def test_positional_fallback_only_claims_rows_without_native_id(tmp_path):
     assert [r[0] for r in conn.execute("SELECT native_id FROM messages ORDER BY seq")] == ["u1", "u2"]
 
 
+def test_set_summary_if_current(tmp_path):
+    conn = _open(tmp_path)
+    dbm.upsert_conversation(conn, _conv(), "globex", "path", [], None, "r1", _embed_none)
+    assert dbm.set_summary_if_current(conn, "claude_code:s1", {"problem": "old"}, "r0") is False  # stale
+    assert dbm.set_summary_if_current(conn, "claude_code:s1", {"problem": "new"}, "r1") is True
+    assert dbm.get_summary(conn, "claude_code:s1")["problem"] == "new"
+
+
 def test_v6_conversation_vectors_take_the_existing_message_vector_dim(tmp_path):
     from convo_index import db as dbm
     db = tmp_path / "t.db"
@@ -264,3 +283,38 @@ def test_titles_are_capped_to_one_display_line(tmp_path):
     conn.execute("DELETE FROM schema_migrations WHERE version=7"); conn.commit()
     dbm.init_schema(conn, db)
     assert len(conn.execute("SELECT title FROM conversations WHERE id=?", (conv.id,)).fetchone()[0]) == TITLE_LIMIT
+
+
+def test_parser_version_bump_with_changed_text_does_not_carry_the_summary(tmp_path):
+    """Same file, new parser: the summary moves to the new revision only when every text
+    message is as it was. Messages keep their native ids so the rows are matched, not
+    deleted and re-inserted; a kind change or a reorder of matched rows must still count."""
+    from convo_index.model import Conversation, Message, KIND_TOOL_CALL
+    db = tmp_path / "t.db"
+    conn = dbm.connect(db); dbm.init_schema(conn, db)
+    conv = Conversation(source="claude_code", native_id="s", title="T", first_prompt="p", source_ref="/a", cwd="/x",
+                        messages=[Message(seq=0, role="user", text="The task succeeded", native_id="m0")])
+    dbm.upsert_conversation(conn, conv, "unknown", None, [], None, "p1:100:200", _embed_none)
+    dbm.set_summary(conn, conv.id, {"problem": "P", "solution": "S"}, "p1:100:200")
+    with_tool = Conversation(source="claude_code", native_id="s", title="T", first_prompt="p", source_ref="/a", cwd="/x",
+                             messages=[Message(seq=0, role="user", text="The task succeeded", native_id="m0"),
+                                       Message(seq=1, role="assistant", kind=KIND_TOOL_CALL, text="[Read] x", native_id="m1")])
+    dbm.upsert_conversation(conn, with_tool, "unknown", None, [], None, "p2:100:200", _embed_none)
+    assert dbm.get_summarized_revision(conn, conv.id) == "p2:100:200"     # only tool messages appeared: carried
+    changed = Conversation(source="claude_code", native_id="s", title="T", first_prompt="p", source_ref="/a", cwd="/x",
+                           messages=[Message(seq=0, role="user", text="The task failed", native_id="m0")])
+    dbm.upsert_conversation(conn, changed, "unknown", None, [], None, "p3:100:200", _embed_none)
+    assert dbm.get_summarized_revision(conn, conv.id) == "p2:100:200"     # the text moved: summary stays stale
+    dbm.set_summary(conn, conv.id, {"problem": "P"}, "p3:100:200")
+    reclassified = Conversation(source="claude_code", native_id="s", title="T", first_prompt="p", source_ref="/a", cwd="/x",
+                                messages=[Message(seq=0, role="user", kind=KIND_TOOL_CALL, text="The task failed", native_id="m0")])
+    dbm.upsert_conversation(conn, reclassified, "unknown", None, [], None, "p4:100:200", _embed_none)
+    assert dbm.get_summarized_revision(conn, conv.id) == "p3:100:200"     # a text message became a tool call: stale
+    two = [Message(seq=0, role="user", text="a", native_id="a"), Message(seq=1, role="assistant", text="b", native_id="b")]
+    dbm.upsert_conversation(conn, Conversation(source="claude_code", native_id="s2", title="T", first_prompt="p", source_ref="/b",
+                                               cwd="/x", messages=two), "unknown", None, [], None, "p1:1:1", _embed_none)
+    dbm.set_summary(conn, "claude_code:s2", {"problem": "P"}, "p1:1:1")
+    swapped = [Message(seq=0, role="assistant", text="b", native_id="b"), Message(seq=1, role="user", text="a", native_id="a")]
+    dbm.upsert_conversation(conn, Conversation(source="claude_code", native_id="s2", title="T", first_prompt="p", source_ref="/b",
+                                               cwd="/x", messages=swapped), "unknown", None, [], None, "p2:1:1", _embed_none)
+    assert dbm.get_summarized_revision(conn, "claude_code:s2") == "p1:1:1"  # same texts in another order: stale
