@@ -2,12 +2,17 @@ import errno
 import os
 import json
 import socket
+import subprocess
+import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, urlsplit, parse_qs, unquote
 
 from convo_index.config import STATIC_DIR
 from convo_index.sources.base import resume_command
+from convo_index.indexer import EXIT_LOCKED
+from convo_index.lock import index_lock, IndexLocked
 from convo_index.providers import registry as R
 from convo_index import db as dbm
 from convo_index import search as S
@@ -101,6 +106,40 @@ def handle_config():
                        "semantic_search": ok, "semantic_reason": reason})
 
 
+def handle_hide(conversation_id, hidden):
+    conn = dbm.connect(_db())
+    try:
+        conversation_id = dbm.resolve_id(conn, conversation_id)
+        dbm.set_hidden(conn, conversation_id, hidden)
+    finally:
+        conn.close()
+    return json.dumps({"ok": True, "id": conversation_id, "hidden": hidden})
+
+
+def handle_delete(conversation_id):
+    """Remove the archive copy, then the rows, under the index lock so a refresh cannot write a
+    new copy in between. If the copy cannot be removed the conversation is kept and the
+    request fails: a plaintext copy is never left behind by a deletion that reported success."""
+    db = _db()
+    try:
+        with index_lock(db):
+            conn = dbm.connect(db)
+            try:
+                conversation_id = dbm.resolve_id(conn, conversation_id)
+                row = conn.execute("SELECT archive_path FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+                if row and row[0]:
+                    try:
+                        Path(row[0]).unlink(missing_ok=True)
+                    except OSError as e:
+                        raise RuntimeError(f"archive copy not removed, conversation kept: {e}") from e
+                dbm.delete_conversation(conn, conversation_id)
+            finally:
+                conn.close()
+    except IndexLocked:
+        raise RuntimeError("a refresh is running; retry when it has finished") from None
+    return json.dumps({"ok": True, "id": conversation_id})
+
+
 def handle_conversation(conversation_id):
     conn = dbm.connect(_db())
     try:
@@ -140,6 +179,33 @@ def handle_conversation(conversation_id):
 
 def handle_analytics():
     return json.dumps(A.analytics(_db(), CFG.load()))
+
+
+_refresh_lock = threading.Lock()
+
+
+def _run_indexer():
+    """Run a refresh in a subprocess. Returns {"ok", "busy", "totals"}: busy when another
+    indexer (this server, the scheduler or the CLI) already holds the lock, ok only when
+    every source and conversation indexed cleanly."""
+    if not _refresh_lock.acquire(blocking=False):
+        return {"ok": False, "busy": True, "totals": None}
+    try:
+        res = subprocess.run([sys.executable, "-m", "convo_index.indexer"],
+                             capture_output=True, text=True, check=False)
+        if res.returncode == EXIT_LOCKED:
+            return {"ok": False, "busy": True, "totals": None}
+        totals = None
+        for line in reversed(res.stdout.strip().splitlines()):
+            try:
+                totals = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+        return {"ok": res.returncode == 0, "busy": False, "totals": totals,
+                "error": None if res.returncode == 0 else (res.stderr or "")[-2000:]}
+    finally:
+        _refresh_lock.release()
 
 
 # Browser-facing guard (any web page can reach a localhost port): every request must name this
@@ -253,6 +319,25 @@ class Handler(BaseHTTPRequestHandler):
             body = handle_conversation(_segment(path, "/api/conversation/"))
             return self._send(404, "not found", "text/plain") if body is None else self._send(200, body)
         return self._send(404, "not found", "text/plain")
+
+    def do_POST(self):
+        if self._refused():
+            return
+        try:
+            u = urlparse(self.path)
+            path, qs = u.path, parse_qs(u.query)
+            if path == "/api/refresh":
+                return self._send(200, json.dumps(_run_indexer()))
+            if path.startswith("/api/hide/"):
+                hidden = qs.get("hidden", ["1"])[0] == "1"
+                return self._send(200, handle_hide(_segment(path, "/api/hide/"), hidden))
+            if path.startswith("/api/delete/"):
+                return self._send(200, handle_delete(_segment(path, "/api/delete/")))
+            return self._send(404, "not found", "text/plain")
+        except dbm.AmbiguousId as e:
+            self._send(409, json.dumps({"error": "ambiguous id; use a namespaced id", "candidates": e.args[0]}))
+        except Exception as e:
+            self._send(500, json.dumps({"error": str(e)}))
 
     def log_message(self, *a):
         pass

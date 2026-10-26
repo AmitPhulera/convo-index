@@ -66,6 +66,36 @@ def test_segment_decodes_encoded_ids():
     assert server._segment("/api/conversation/" + quote("claude_code:s1", safe=""), "/api/conversation/") == "claude_code:s1"
 
 
+def test_handle_hide_and_search_filter(tmp_path, monkeypatch):
+    _seed(tmp_path / "t.db", monkeypatch)
+    server.handle_hide("claude_code:s1", True)
+    assert json.loads(server.handle_search({"q": [""], "mode": ["hybrid"]})) == []
+    shown = json.loads(server.handle_search({"q": [""], "mode": ["hybrid"], "hidden": ["1"]}))
+    assert [r["id"] for r in shown] == ["claude_code:s1"] and shown[0]["hidden"] is True
+
+
+def test_handle_delete_removes_and_blocklists(tmp_path, monkeypatch):
+    _seed(tmp_path / "t.db", monkeypatch)
+    server.handle_delete("claude_code:s1")
+    assert server.handle_conversation("claude_code:s1") is None
+    conn = dbm.connect(tmp_path / "t.db")
+    assert dbm.get_deleted_ids(conn) == {"claude_code:s1"}
+
+
+def test_run_indexer_reports_busy_failure_and_totals(monkeypatch):
+    class R:
+        def __init__(self, rc, out="", err=""): self.returncode, self.stdout, self.stderr = rc, out, err
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: R(server.EXIT_LOCKED))
+    assert server._run_indexer() == {"ok": False, "busy": True, "totals": None}
+    monkeypatch.setattr(server.subprocess, "run",
+                        lambda *a, **k: R(0, 'claude_code: ...\n{"indexed": 3, "failed": 0}\n'))
+    r = server._run_indexer()
+    assert r["ok"] is True and r["busy"] is False and r["totals"]["indexed"] == 3
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: R(1, '{"indexed": 0, "failed": 1}', "WARN: x"))
+    r = server._run_indexer()
+    assert r["ok"] is False and r["totals"]["failed"] == 1 and "WARN" in r["error"]
+
+
 def test_first_run_serve_init_with_missing_data_dir(tmp_path, monkeypatch):
     p = tmp_path / "no" / "such" / "dir" / "convos.db"
     conn = dbm.connect(p); dbm.init_schema(conn, p); conn.close()
@@ -146,6 +176,24 @@ def test_rebinding_host_is_refused(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_post_without_csrf_header_is_refused(tmp_path, monkeypatch):
+    srv = _serve(tmp_path, monkeypatch)
+    try:
+        # a cross-site form/no-cors fetch can send neither the custom header nor a matching Origin
+        status, _ = _request(srv, "POST", "/api/delete/claude_code:s1")
+        assert status == 403
+        status, _ = _request(srv, "POST", "/api/delete/claude_code:s1",
+                             {"X-Convo-Index": "1", "Origin": "http://attacker.example"})
+        assert status == 403
+        assert server.handle_conversation("claude_code:s1") is not None   # nothing was deleted
+        port = srv.server_address[1]
+        status, _ = _request(srv, "POST", "/api/hide/claude_code:s1?hidden=1",
+                             {"X-Convo-Index": "1", "Origin": f"http://127.0.0.1:{port}"})
+        assert status == 200
+    finally:
+        srv.shutdown()
+
+
 def test_allowed_hosts():
     assert server.allowed_hosts("127.0.0.1", 9753) == {("127.0.0.1", None), ("localhost", None), ("::1", None)}
     assert ("box.lan", None) in server.allowed_hosts("0.0.0.0", 9753, ["box.lan"])
@@ -198,6 +246,31 @@ def test_make_server_binds_an_ipv6_address():
         assert server.advertised_url("::1", srv.server_address[1]).startswith("http://[::1]:")
     finally:
         srv.server_close()
+
+
+def test_delete_keeps_the_conversation_when_the_archive_cannot_be_removed(tmp_path, monkeypatch):
+    import pytest
+    from pathlib import Path
+    _seed(tmp_path / "t.db", monkeypatch)
+    arch = tmp_path / "copy.jsonl"; arch.write_text("{}")
+    conn = dbm.connect(tmp_path / "t.db")
+    conn.execute("UPDATE conversations SET archive_path=? WHERE id='claude_code:s1'", (str(arch),)); conn.commit(); conn.close()
+    def refuse(self, missing_ok=False):
+        raise PermissionError("read-only")
+    monkeypatch.setattr(Path, "unlink", refuse)
+    with pytest.raises(RuntimeError, match="archive copy not removed"):
+        server.handle_delete("claude_code:s1")
+    assert server.handle_conversation("claude_code:s1") is not None and arch.exists()
+
+
+def test_delete_waits_for_no_refresh(tmp_path, monkeypatch):
+    import pytest
+    from convo_index.lock import index_lock
+    _seed(tmp_path / "t.db", monkeypatch)
+    with index_lock(tmp_path / "t.db", blocking=True):                     # a refresh is running
+        with pytest.raises(RuntimeError, match="refresh is running"):
+            server.handle_delete("claude_code:s1")
+    assert server.handle_conversation("claude_code:s1") is not None
 
 
 def test_serve_steps_aside_when_the_port_is_taken(tmp_path, monkeypatch, capsys):
