@@ -1,7 +1,8 @@
 """Provider backends against recorded CLI/HTTP envelopes (no processes, no network)."""
+import json
 
 
-from convo_index.providers import base
+from convo_index.providers import base, cli_backends as cli
 from convo_index.providers.base import LLMRequest
 
 SCHEMA = {"type": "object", "properties": {"category": {"type": "string", "enum": ["a", "b"]}},
@@ -11,6 +12,16 @@ SCHEMA = {"type": "object", "properties": {"category": {"type": "string", "enum"
 class _Res:
     def __init__(self, rc=0, out="", err=""):
         self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+def _fake_run(monkeypatch, fn):
+    """fn(cmd) -> _Res | None (None = timeout)."""
+    recorded = []
+    def run(cmd, timeout, stdin=None):
+        recorded.append(cmd)
+        return fn(cmd)
+    monkeypatch.setattr(cli, "_run", run)
+    return recorded
 
 
 # ---------------------------------------------------------------- base helpers
@@ -46,11 +57,100 @@ def test_finish_marks_malformed_and_invalid():
 
 # ---------------------------------------------------------------- claude_cli
 
+def test_claude_cli_parses_envelope_and_usage(monkeypatch):
+    env = {"type": "result", "is_error": False, "result": "```json\n{\"category\":\"a\"}\n```",
+           "session_id": "sess", "total_cost_usd": 0.0194,
+           "usage": {"input_tokens": 10, "cache_creation_input_tokens": 8292, "cache_read_input_tokens": 13971,
+                     "output_tokens": 86},
+           "modelUsage": {"claude-haiku-4-5-20251001": {"costUSD": 0.0009}}}
+    cmds = _fake_run(monkeypatch, lambda cmd: _Res(0, json.dumps(env)))
+    r = cli.ClaudeCLI().complete(LLMRequest(prompt="P", model="claude-haiku-4-5", schema=SCHEMA, marker="MARK "))
+    assert r.ok and r.data == {"category": "a"} and r.backend == "claude_cli"
+    assert r.model_used == "claude-haiku-4-5-20251001"
+    assert (r.usage.input_uncached, r.usage.cache_write, r.usage.cache_read, r.usage.output) == (10, 8292, 13971, 86)
+    assert r.usage.reported_cost_usd == 0.0194
+    cmd = cmds[0]
+    assert cmd[:3] == ["claude", "-p", "--model"] and "--json-schema" in cmd and cmd[-1].startswith("MARK P")
+
+
+def test_claude_cli_failures_are_classified(monkeypatch):
+    _fake_run(monkeypatch, lambda cmd: _Res(1, "", "Not logged in. Please run /login"))
+    assert cli.ClaudeCLI().complete(LLMRequest(prompt="P", model="m")).error == "auth"
+    _fake_run(monkeypatch, lambda cmd: _Res(1, "", "429 rate limit exceeded"))
+    assert cli.ClaudeCLI().complete(LLMRequest(prompt="P", model="m")).error == "rate_limit"
+    _fake_run(monkeypatch, lambda cmd: None)
+    assert cli.ClaudeCLI().complete(LLMRequest(prompt="P", model="m")).error == "timeout"
+    _fake_run(monkeypatch, lambda cmd: _Res(0, "not json"))
+    assert cli.ClaudeCLI().complete(LLMRequest(prompt="P", model="m")).error == "provider"
+
 
 # ---------------------------------------------------------------- gemini_cli (agy)
 
+def test_agy_uses_structured_output_and_usage(monkeypatch):
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/agy")
+    env = {"conversation_id": "c1", "status": "SUCCESS", "response": "{\"category\": \"b\"}\n",
+           "structured_output": {"category": "b"},
+           "usage": {"input_tokens": 28459, "output_tokens": 65, "thinking_tokens": 3, "cache_read_tokens": 0}}
+    cmds = _fake_run(monkeypatch, lambda cmd: _Res(0, json.dumps(env)))
+    r = cli.GeminiCLI().complete(LLMRequest(prompt="P", model="gemini-3.8-flash-low", schema=SCHEMA))
+    assert r.ok and r.data == {"category": "b"} and r.usage.provider == "google"
+    assert (r.usage.input_uncached, r.usage.output, r.usage.reasoning) == (28459, 65, 3)
+    cmd = cmds[0]
+    assert cmd[0] == "agy" and "--json-schema" in cmd and cmd[-1] == "--print=P"   # prompt attached to the flag
+
+
+def test_agy_non_success_status_is_provider_error(monkeypatch):
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/agy")
+    _fake_run(monkeypatch, lambda cmd: _Res(0, json.dumps({"status": "FAILED", "response": ""})))
+    assert cli.GeminiCLI().complete(LLMRequest(prompt="P", model="m")).error == "provider"
+
+
+def test_agy_denied_tool_with_empty_response_names_the_tool(monkeypatch):
+    """Headless agy refuses a tool the model reached for, then reports SUCCESS with no text."""
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/agy")
+    env = {"status": "SUCCESS", "response": "", "denied_actions": [{"action": "command", "display_name": "RunCommand"}],
+           "usage": {"input_tokens": 67433, "output_tokens": 1481}}
+    _fake_run(monkeypatch, lambda cmd: _Res(0, json.dumps(env)))
+    r = cli.GeminiCLI().complete(LLMRequest(prompt="P", model="m", schema=SCHEMA))
+    assert r.error == "malformed" and "RunCommand" in r.detail and "denied" in r.detail
+    env["response"] = "{\"category\": \"a\"}"          # a denied tool with an answer anyway is fine
+    _fake_run(monkeypatch, lambda cmd: _Res(0, json.dumps(env)))
+    assert cli.GeminiCLI().complete(LLMRequest(prompt="P", model="m", schema=SCHEMA)).ok
+
+
+def test_gemini_cli_without_binary_is_config_error(monkeypatch):
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    assert cli.GeminiCLI().complete(LLMRequest(prompt="P", model="m")).error == "config"
+
 
 # ---------------------------------------------------------------- codex_cli
+
+def test_codex_parses_event_stream_and_writes_strict_schema(monkeypatch, tmp_path):
+    seen = {}
+    def run(cmd):
+        i = cmd.index("--output-schema")
+        with open(cmd[i + 1]) as fh:
+            seen["schema"] = json.load(fh)
+        seen["cmd"] = cmd
+        events = [{"type": "thread.started", "thread_id": "t"},
+                  {"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": '{"category":"a"}'}},
+                  {"type": "turn.completed", "usage": {"input_tokens": 12256, "cached_input_tokens": 256,
+                                                       "cache_write_input_tokens": 0, "output_tokens": 21,
+                                                       "reasoning_output_tokens": 5}}]
+        return _Res(0, "\n".join(json.dumps(e) for e in events))
+    _fake_run(monkeypatch, run)
+    r = cli.CodexCLI().complete(LLMRequest(prompt="P", model="gpt-5.6-luna", schema=SCHEMA))
+    assert r.ok and r.data == {"category": "a"} and r.usage.provider == "openai"
+    assert (r.usage.input_uncached, r.usage.cache_read, r.usage.output, r.usage.reasoning) == (12000, 256, 21, 5)
+    assert seen["schema"]["additionalProperties"] is False
+    assert "--ephemeral" in seen["cmd"] and "read-only" in seen["cmd"]
+
+
+def test_codex_turn_failed_is_classified(monkeypatch):
+    err = {"type": "turn.failed", "error": {"message": "invalid_json_schema: additionalProperties required"}}
+    _fake_run(monkeypatch, lambda cmd: _Res(0, json.dumps(err)))
+    r = cli.CodexCLI().complete(LLMRequest(prompt="P", model="m", schema=SCHEMA))
+    assert not r.ok and r.error == "provider" and "additionalProperties" in r.detail
 
 
 # ---------------------------------------------------------------- http backends
@@ -89,3 +189,30 @@ def test_validate_applies_sibling_constraints_and_rejects_bool_as_number():
     assert base.validate({}, {"anyOf": [{"type": "object"}, {"type": "null"}], "required": ["x"]})
     assert base.validate({"x": 1}, {"anyOf": [{"type": "object"}, {"type": "null"}], "required": ["x"]}) is None
     assert base.validate(None, {"type": ["string", "null"], "enum": ["a", None]}) is None
+
+
+def test_claude_cli_runs_without_tools_or_sessions(monkeypatch):
+    env = {"type": "result", "is_error": False, "result": "x"}
+    cmds = _fake_run(monkeypatch, lambda cmd: _Res(0, json.dumps(env)))
+    cli.ClaudeCLI().complete(LLMRequest(prompt="P", model="m"))
+    cmd = cmds[0]
+    assert cmd[cmd.index("--tools") + 1] == "" and "--strict-mcp-config" in cmd
+    assert "--disable-slash-commands" in cmd and "--no-session-persistence" in cmd
+
+
+def test_cli_backends_never_raise(monkeypatch):
+    def missing(cmd):
+        raise cli._Missing("No such file: claude")
+    _fake_run(monkeypatch, missing)
+    for backend in (cli.ClaudeCLI(), cli.CodexCLI()):
+        r = backend.complete(LLMRequest(prompt="P", model="m"))
+        assert not r.ok and r.error == "config" and "No such file" in r.detail
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/agy")
+    r = cli.GeminiCLI().complete(LLMRequest(prompt="P", model="m"))
+    assert not r.ok and r.error == "config"
+    _fake_run(monkeypatch, lambda cmd: _Res(0, "[]"))                       # valid JSON, wrong shape
+    for backend in (cli.ClaudeCLI(), cli.GeminiCLI()):
+        r = backend.complete(LLMRequest(prompt="P", model="m"))
+        assert not r.ok and r.error == "provider" and "envelope" in r.detail
+    r = cli.CodexCLI().complete(LLMRequest(prompt="P", model="m"))
+    assert not r.ok and r.error == "malformed"                               # no agent message at all
