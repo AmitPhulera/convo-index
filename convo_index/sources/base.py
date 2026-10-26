@@ -60,7 +60,8 @@ def shell_quote(s: str) -> str:
 def all_adapters() -> list[SourceAdapter]:
     """Adapters in a fixed order; import lazily so an optional source cannot break startup."""
     from convo_index.sources.claude_code import ClaudeCodeAdapter
-    return [ClaudeCodeAdapter()]
+    from convo_index.sources.opencode import OpencodeAdapter
+    return [ClaudeCodeAdapter(), OpencodeAdapter()]
 
 
 def enabled_adapters() -> list[SourceAdapter]:
@@ -72,6 +73,8 @@ def resume_command(conversation_id: str, cwd: str | None) -> str | None:
     source, _, _ = conversation_id.partition(":")
     if source == "claude_code":
         from convo_index.sources.claude_code import resume_command as rc
+    elif source == "opencode":
+        from convo_index.sources.opencode import resume_command as rc
     else:
         return None
     return rc(conversation_id, cwd)
