@@ -11,6 +11,8 @@ dependencies = [
     "fastembed>=0.7",
 ]
 
+[project.scripts]
+convo-index = "convo_index.cli:main"
 
 [build-system]
 requires = ["hatchling"]
