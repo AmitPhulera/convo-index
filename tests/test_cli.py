@@ -295,3 +295,38 @@ def test_init_picks_the_embedder_that_is_present(tmp_path, monkeypatch):
     cli.main(["init", "--yes"])
     data = tomllib.loads(cfg.read_text())["embeddings"]
     assert data["backend"] == "openai_compat" and data["model"] == "mxbai-embed-large"  # explicit choice stays
+
+
+def test_up_runs_init_services_and_the_first_index(tmp_path, monkeypatch, capsys):
+    import webbrowser
+    from convo_index import indexer
+    from convo_index import schedule as SCH
+    _isolate(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(cli, "cmd_init", lambda args: calls.append("init") or 0)
+    monkeypatch.setattr(SCH, "install", lambda settings, hour=None, minute=None, dry_run=False, system=None, home=None, job="refresh":
+                        calls.append(job) or {"kind": "launchd", "files": {"/x.plist": ""}, "results": [], "log": "/l"})
+    monkeypatch.setattr(SCH, "plan", lambda settings, **k: {"kind": "launchd", "argv": ["convo-index", "index"], "log": str(tmp_path / "refresh.log")})
+    monkeypatch.setattr(SCH, "start_detached", lambda plan: calls.append("background " + plan["argv"][-1]))
+    monkeypatch.setattr(indexer, "main", lambda: calls.append("index") or 0)
+    monkeypatch.setattr(cli, "_wait_for_port", lambda host, port, seconds=15: calls.append(f"port {host}:{port}") or True)
+    monkeypatch.setattr(webbrowser, "open", lambda url: calls.append("open " + url))
+    assert cli.main(["up"]) == 0
+    assert calls == ["init", "serve", "refresh", "background index", "port 127.0.0.1:9753", "open http://127.0.0.1:9753"]
+    out = capsys.readouterr().out
+    assert "convo-index is at http://127.0.0.1:9753" in out and "privacy decision" in out   # nothing hosted until the user decides
+    assert "tail -f" in out
+    calls.clear()
+    assert cli.main(["up", "--no-serve", "--no-schedule", "--wait"]) == 0 and calls == ["init", "index"]
+    calls.clear()
+    assert cli.main(["up", "--no-open"]) == 0 and "open" not in " ".join(calls)
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "_wait_for_port", lambda host, port, seconds=15: False)
+    assert cli.main(["up", "--no-schedule"]) == 1                        # no server answered: no URL, a failure
+    out, err = capsys.readouterr()
+    assert "convo-index is at" not in out and "did not answer" in err and "problems: serve" in err
+    monkeypatch.setattr(cli, "cmd_init", lambda args: 1)
+    assert cli.main(["up"]) == 1                                         # a failed init stops everything
+    monkeypatch.setattr(SCH, "uninstall", lambda settings, dry_run=False, job="refresh", **k:
+                        {"kind": "schtasks", "results": [{"cmd": ["schtasks"], "ok": False, "stderr": "Access is denied"}]})
+    assert cli.main(["service", "uninstall"]) == 1                       # a failed deregistration is a failure

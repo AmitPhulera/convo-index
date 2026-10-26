@@ -1,11 +1,14 @@
 """Export, MCP server, scheduler plan and the CLI round trips."""
 import json
+import os
+from pathlib import Path
 
 import pytest
 
 from convo_index import cli
 from convo_index import db as dbm
 from convo_index import export as X
+from convo_index import schedule as SCH
 from convo_index import settings as S
 from convo_index.model import Conversation, Message, UsageRecord, KIND_TOOL_CALL, KIND_TOOL_RESULT
 from convo_index.sources.base import resume_command
@@ -53,6 +56,37 @@ def test_export_dict_and_markdown(tmp_path, monkeypatch):
     assert "### Assistant → tool" not in md and "Restart the deployment." in md          # tools excluded by default
     assert "```" in X.as_markdown(conn, "claude_code:s0", st, include_tools=True)
     assert X.as_dict(conn, "claude_code:nope", st) is None and X.as_markdown(conn, "claude_code:nope", st) is None
+
+
+def test_schedule_plans_per_platform_without_touching_the_system(tmp_path, monkeypatch):
+    st = make_settings(tmp_path)
+    st["paths"]["db"] = str(tmp_path / "data" / "convos.db")
+    st.path = tmp_path / "cfg.toml"; st.path.write_text("")
+    monkeypatch.setattr(SCH, "command", lambda sub="index": ["/opt/bin/convo-index", "index"])
+    mac = SCH.plan(st, system="Darwin", home=tmp_path / "home")
+    assert mac["kind"] == "launchd" and mac["hour"] == 21 and mac["minute"] == 0
+    (path, plist), = mac["files"].items()
+    assert SCH.Path(path).parts[-3:] == ("Library", "LaunchAgents", "com.convo-index.refresh.plist")
+    assert "<string>/opt/bin/convo-index</string>" in plist and "<integer>21</integer>" in plist
+    assert f"CONVO_INDEX_CONFIG</key><string>{tmp_path / 'cfg.toml'}" in plist and str(tmp_path / "data" / "refresh.log") in plist
+    assert mac["commands"][1][:2] == ["launchctl", "bootstrap"]
+    monkeypatch.setattr(SCH.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+    lin = SCH.plan(st, hour=6, minute=30, system="Linux", home=tmp_path / "home")
+    assert lin["kind"] == "systemd" and {SCH.Path(p).name for p in lin["files"]} == {"convo-index.service", "convo-index.timer"}
+    assert "OnCalendar=*-*-* 06:30:00" in "".join(lin["files"].values()) and "ExecStart=/opt/bin/convo-index index" in "".join(lin["files"].values())
+    monkeypatch.setattr(SCH.shutil, "which", lambda name: None)
+    cron = SCH.plan(st, system="Linux", home=tmp_path / "home")
+    assert cron["kind"] == "cron" and cron["crontab"].startswith("0 21 * * * ") and "refresh.log" in cron["crontab"]
+    with pytest.raises(ValueError):
+        SCH.plan(st, hour=24)
+    # install writes files; commands are stubbed
+    ran = []
+    monkeypatch.setattr(SCH.subprocess, "run", lambda cmd, **k: ran.append(cmd) or type("R", (), {"returncode": 0, "stderr": ""})())
+    out = SCH.install(st, system="Darwin", home=tmp_path / "home")
+    assert all(__import__("pathlib").Path(p).exists() for p in out["files"]) and len(ran) == 2
+    assert SCH.status(st, system="Darwin", home=tmp_path / "home")["installed"] is True
+    rm = SCH.uninstall(st, system="Darwin", home=tmp_path / "home")
+    assert rm["removed"] and SCH.status(st, system="Darwin", home=tmp_path / "home")["installed"] is False
 
 
 def test_cli_search_export_backup(tmp_path, monkeypatch, capsys):
@@ -109,6 +143,14 @@ def test_cli_resummarize_makes_the_next_run_call_the_summarizer(tmp_path, monkey
     conn.close()
 
 
+def test_schedule_install_print_shows_the_plan(tmp_path, monkeypatch, capsys):
+    st, db = _seed(tmp_path, monkeypatch)
+    assert cli.main(["schedule", "install", "--print"]) == 0
+    out = capsys.readouterr().out
+    assert any(k in out for k in ("com.convo-index.refresh", "convo-index.timer", "crontab", "schtasks"))
+    assert cli.main(["schedule", "install", "--hour", "25", "--print"]) == 2
+
+
 def test_markdown_fences_outlast_backticks_in_tool_output(tmp_path, monkeypatch):
     st, db = _seed(tmp_path, monkeypatch)
     conn = dbm.connect(db)
@@ -120,6 +162,29 @@ def test_markdown_fences_outlast_backticks_in_tool_output(tmp_path, monkeypatch)
     assert X._fence("plain") == "```" and X._fence("a ``` b") == "````"
 
 
+def test_systemd_and_cron_quoting_and_uninstall_reload(tmp_path, monkeypatch):
+    st = make_settings(tmp_path)
+    # the config is at its default location (whether or not it exists): nothing to bake in
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(SCH.S, "CONFIG_PATH", SCH.C.user_dir("config") / "convo-index" / "config.toml")
+    monkeypatch.setattr(SCH, "command", lambda sub="index": ["/opt/my tools/convo-index", "index"])
+    monkeypatch.setattr(SCH.os, "pathsep", ":")                 # the PATH below is POSIX-shaped, whatever the host
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin:/usr/local/bin:/bin")
+    monkeypatch.setattr(SCH.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+    lin = SCH.plan(st, system="Linux", home=tmp_path / "home")
+    service = [c for p, c in lin["files"].items() if p.endswith(".service")][0]
+    assert 'ExecStart="/opt/my tools/convo-index" index' in service                        # systemd: double quotes only
+    assert 'Environment="PATH=/usr/local/bin:/usr/bin:/bin"' in service                    # deduplicated
+    ran = []
+    monkeypatch.setattr(SCH.subprocess, "run", lambda cmd, **k: ran.append(cmd) or type("R", (), {"returncode": 0, "stderr": ""})())
+    SCH.install(st, system="Linux", home=tmp_path / "home")
+    SCH.uninstall(st, system="Linux", home=tmp_path / "home")
+    assert ran[-1] == ["systemctl", "--user", "daemon-reload"] and ran[-2][:3] == ["systemctl", "--user", "disable"]
+    monkeypatch.setattr(SCH.shutil, "which", lambda name: None)
+    cron = SCH.plan(st, system="Linux", home=tmp_path / "home")["crontab"]
+    assert cron.startswith("0 21 * * * PATH=/usr/local/bin:/usr/bin:/bin ") and "'/opt/my tools/convo-index' index" in cron
+
+
 def test_coverage_counts_only_token_bearing_requests(tmp_path):
     from convo_index import cost as K
     p = K.load(make_settings(tmp_path))
@@ -129,6 +194,28 @@ def test_coverage_counts_only_token_bearing_requests(tmp_path):
     assert a["requests"] == 10 and a["token_requests"] == 1 and a["priced_requests"] == 0 and a["coverage"] == 0.0
     assert K.aggregate([("anthropic", "<synthetic>", 3, 0, 0, 0, 0, 0, None, 0)], p)["coverage"] is None
     assert p.rates("gpt-4o-2024-08-06")["input"] == 2.5 and p.rates("claude-3-5-sonnet-20241022")["input"] == 3.0
+
+
+def test_schedule_passes_env_through_and_refuses_a_missing_config(tmp_path, monkeypatch):
+    st = make_settings(tmp_path)
+    monkeypatch.setattr(SCH, "command", lambda sub="index": ["/opt/bin/convo-index", "index"])
+    monkeypatch.setenv("CODEX_HOME", "~/codex home")
+    monkeypatch.setenv("CONVO_INDEX_DB", str(tmp_path / "else" / "convos.db"))
+    monkeypatch.setenv("PATH", "/usr/bin:/opt/100%/bin")
+    st.path = tmp_path / "cfg.toml"; st.path.write_text("")
+    mac = SCH.plan(st, system="Darwin", home=tmp_path / "home")
+    plist = next(iter(mac["files"].values()))
+    assert "<key>CODEX_HOME</key>" in plist and str(Path("~/codex home").expanduser().resolve()) in plist
+    assert "<key>CONVO_INDEX_DB</key>" in plist and str(tmp_path / "else" / "refresh.log") in plist   # log next to the effective db
+    monkeypatch.setattr(SCH.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+    service = [c for p, c in SCH.plan(st, system="Linux", home=tmp_path / "home")["files"].items() if p.endswith(".service")][0]
+    assert 'Environment="PATH=/usr/bin:/opt/100%%/bin"' in service                  # systemd: %% is a literal percent sign
+    monkeypatch.setattr(SCH.shutil, "which", lambda name: None)
+    cron = SCH.plan(st, system="Linux", home=tmp_path / "home")["crontab"]
+    assert "100\\%" in cron and "CODEX_HOME=" in cron
+    st.path = tmp_path / "missing.toml"
+    with pytest.raises(ValueError):
+        SCH.plan(st, system="Darwin", home=tmp_path / "home")
 
 
 def test_markdown_export_escapes_heading_lines_and_single_lines_the_title(tmp_path, monkeypatch):
@@ -161,3 +248,80 @@ def test_markdown_export_keeps_code_blocks_as_they_are(tmp_path, monkeypatch):
     md = X.as_markdown(conn, "claude_code:s0", st)
     assert "\n# a comment\n" in md and "\n\\# not a heading\n" in md and "\n    # indented code" in md
     assert "\n# still code\n" in md                                      # a shorter fence does not close a longer one
+
+
+def test_service_plans_the_ui_server_from_login(tmp_path, monkeypatch):
+    st = make_settings(tmp_path)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(SCH, "command", lambda sub="index": ["/opt/convo-index", sub])
+    mac = SCH.plan(st, system="Darwin", home=tmp_path / "home", job="serve")
+    plist = next(iter(mac["files"].values()))
+    assert "com.convo-index.serve" in plist and "<string>serve</string>" in plist
+    assert "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>" in plist   # restart only after a crash
+    assert "StartCalendarInterval" not in plist and mac["log"].endswith("serve.log") and mac["hour"] is None
+    monkeypatch.setattr(SCH.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+    lin = SCH.plan(st, system="Linux", home=tmp_path / "home", job="serve")
+    assert list(lin["files"]) == [str(tmp_path / "home" / ".config" / "systemd" / "user" / "convo-index-serve.service")]
+    unit = next(iter(lin["files"].values()))
+    assert "Restart=on-failure" in unit and "WantedBy=default.target" in unit and lin["commands"][-1][-1] == "convo-index-serve.service"
+    assert SCH.uninstall(st, system="Linux", home=tmp_path / "home", dry_run=True, job="serve")["commands"][0][-1] == "convo-index-serve.service"
+    monkeypatch.setattr(SCH.shutil, "which", lambda name: None)
+    cron = SCH.plan(st, system="Linux", home=tmp_path / "home", job="serve")["crontab"]
+    assert cron.startswith("@reboot ") and "/opt/convo-index serve" in cron
+    assert SCH.status(st, system="Darwin", home=tmp_path / "home", job="serve")["installed"] is False
+    # the refresh job is untouched by the second job
+    assert SCH.plan(st, system="Darwin", home=tmp_path / "home")["hour"] == 21
+
+
+def test_windows_jobs_are_task_scheduler_tasks(tmp_path, monkeypatch):
+    st = make_settings(tmp_path)
+    monkeypatch.setattr(SCH, "command", lambda sub="index": ["C:\\Tools&A\\convo index\\convo-index.exe", sub])
+    monkeypatch.setenv("PATH", "C:\\Tools;C:\\100%\\bin")
+    ref = SCH.plan(st, system="Windows", home=tmp_path / "home")
+    data = Path(ref["log"]).parent
+    assert ref["kind"] == "schtasks" and sorted(ref["files"]) == [str(data / "convo-index.cmd"), str(data / "convo-index.xml")]
+    launcher, xml = ref["files"][str(data / "convo-index.cmd")], ref["files"][str(data / "convo-index.xml")]
+    assert '"C:\\Tools&A\\convo index\\convo-index.exe" "index" >> "' in launcher      # quoted: & stays literal
+    assert 'set "PATH=C:\\Tools;C:\\100%%\\bin"' in launcher                             # a batch file expands %x%: doubled
+    assert "CONVO_INDEX_CONFIG" not in launcher                                      # default config location: nothing to bake in
+    assert xml.startswith('<?xml version="1.0" encoding="UTF-16"?>')                 # what schtasks /XML reads
+    assert "<Arguments>/c convo-index.cmd</Arguments>" in xml and f"<WorkingDirectory>{data}</WorkingDirectory>" in xml
+    assert launcher.startswith("@echo off\nchcp 65001 >nul\n")                        # UTF-8 paths under any code page
+    assert "<CalendarTrigger>" in xml and "T21:00:00" in xml and "<ExecutionTimeLimit>PT12H" in xml
+    assert ref["commands"] == [["schtasks", "/Create", "/F", "/TN", "convo-index refresh", "/XML", str(data / "convo-index.xml")]]
+    srv = SCH.plan(st, system="Windows", home=tmp_path / "home", job="serve")
+    sxml = srv["files"][str(data / "convo-index-serve.xml")]
+    assert "<LogonTrigger>" in sxml and "<ExecutionTimeLimit>PT0S" in sxml and "<RestartOnFailure>" in sxml   # a server, not a 72-hour task
+    assert srv["commands"][1] == ["schtasks", "/Run", "/TN", "convo-index serve"]
+    assert SCH.uninstall(st, system="Windows", home=tmp_path / "home", dry_run=True, job="serve")["commands"] == \
+        [["schtasks", "/End", "/TN", "convo-index serve"], ["schtasks", "/Delete", "/F", "/TN", "convo-index serve"]]
+    monkeypatch.setenv("CONVO_INDEX_DB", str(tmp_path / "else" / "convos.db"))      # shell overrides reach the task
+    launcher = [c for p, c in SCH.plan(st, system="Windows", home=tmp_path / "home")["files"].items() if p.endswith(".cmd")][0]
+    assert f'set "CONVO_INDEX_DB={tmp_path / "else" / "convos.db"}"' in launcher
+
+
+@pytest.mark.skipif(os.name != "nt", reason="needs Task Scheduler")
+def test_windows_tasks_register_run_and_unregister(tmp_path, monkeypatch):
+    """The real thing: register a task from the generated XML, run it, see the launcher run."""
+    import subprocess
+    import sys
+    import time
+    st = make_settings(tmp_path)
+    st["paths"]["db"] = str(tmp_path / "Jos\u00e9 data" / "convos.db")   # no data directory yet; a non-ASCII path
+    monkeypatch.delenv("CONVO_INDEX_DB", raising=False)
+    marker = tmp_path / "ran.txt"
+    monkeypatch.setattr(SCH, "command", lambda sub="index": [
+        sys.executable, "-c", "import sys, pathlib; pathlib.Path(sys.argv[1]).write_text(sys.argv[2])", str(marker), sub])
+    monkeypatch.setitem(SCH.JOBS, "refresh", {**SCH.JOBS["refresh"], "task": "convo-index test refresh", "unit": "convo-index-test"})
+    out = SCH.install(st, system="Windows")
+    assert [r["ok"] for r in out["results"]] == [True], out["results"]
+    assert SCH.status(st, system="Windows")["installed"] is True
+    subprocess.run(["schtasks", "/Run", "/TN", "convo-index test refresh"], check=True, capture_output=True)
+    for _ in range(120):
+        if marker.exists():
+            break
+        time.sleep(0.5)
+    assert marker.read_text() == "index"
+    un = SCH.uninstall(st, system="Windows")
+    assert all(r["ok"] for r in un["results"]), un["results"]
+    assert SCH.status(st, system="Windows")["installed"] is False and not (tmp_path / "Jos\u00e9 data" / "convo-index-test.xml").exists()

@@ -354,6 +354,136 @@ def cmd_backup(args):
     return 0
 
 
+def _job_cmd(args, job):
+    """`schedule` (the daily refresh) and `service` (the UI server from login) share one shape."""
+    from convo_index import schedule as SCH
+    from convo_index import settings as S
+    settings = S.load()
+    hour, minute = (args.hour, args.minute) if job == "refresh" else (None, None)
+    try:
+        if args.action == "status":
+            print(json.dumps(SCH.status(settings, job=job), indent=1))
+            return 0
+        if args.action == "uninstall":
+            out = SCH.uninstall(settings, dry_run=args.dry_run, job=job)
+            print(json.dumps(out, indent=1))
+            return 1 if any(not r["ok"] for r in out.get("results", [])) else 0
+        out = SCH.install(settings, hour, minute, dry_run=args.dry_run, job=job)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if args.dry_run or out["kind"] == "cron":
+        for path, content in out["files"].items():
+            print(f"--- {path}\n{content}")
+        for cmd in out["commands"]:
+            print("$ " + " ".join(cmd))
+        if out.get("crontab"):
+            print("add to `crontab -e`:\n" + out["crontab"])
+        return 0
+    bad = [r for r in out.get("results", []) if not r["ok"]]
+    for path in out["files"]:
+        print(f"wrote {path}")
+    for r in out.get("results", []):
+        print(("ok  " if r["ok"] else "FAIL") + " $ " + " ".join(r["cmd"]) + (f"\n     {r['stderr']}" if r["stderr"] and not r["ok"] else ""))
+    if job == "refresh":
+        print(f"daily refresh at {out['hour']:02d}:{out['minute']:02d}; log: {out['log']}")
+    else:
+        print(f"UI server runs from login; log: {out['log']}")
+    return 1 if bad else 0
+
+
+def cmd_schedule(args):
+    return _job_cmd(args, "refresh")
+
+
+def cmd_service(args):
+    return _job_cmd(args, "serve")
+
+
+def _green(text):
+    """Highlight the one line the user needs, only when writing to a terminal."""
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return text
+    if os.name == "nt":
+        os.system("")          # switches the console to VT processing (no-op on Windows Terminal)
+    return f"\033[32m{text}\033[0m"
+
+
+def _wait_for_port(host, port, seconds=15):
+    """True once something accepts connections on host:port (the login service starting)."""
+    import socket
+    import time
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.3)
+    return False
+
+
+def cmd_up(args):
+    """The first run in one go: write the config, keep the UI server running from login,
+    schedule the daily refresh, start the index build in the background and open the UI.
+    Nothing goes to a hosted model until the privacy choice is made (init asks on a
+    terminal; otherwise it stays "ask")."""
+    import webbrowser
+    from convo_index import indexer, server
+    from convo_index import schedule as SCH
+    from convo_index import settings as S
+    rc = cmd_init(args)
+    if rc:
+        return rc
+    S.reset_cache()
+    settings = S.load(use_cache=False)
+    problems = []
+    for job, skip in (("serve", args.no_serve), ("refresh", args.no_schedule)):
+        if skip:
+            continue
+        try:
+            out = SCH.install(settings, job=job)
+        except ValueError as e:
+            print(f"{job}: {e}", file=sys.stderr)
+            problems.append(job)
+            continue
+        if out["kind"] == "cron":
+            print(f"{job}: add to `crontab -e`:\n  {out['crontab']}")
+            if job == "serve":
+                SCH.start_detached(out)
+        else:
+            bad = [r for r in out.get("results", []) if not r["ok"]]
+            if bad:
+                problems.append(job)
+            print(f"{job}: {'installed' if not bad else 'FAILED: ' + bad[0]['stderr']} ({', '.join(out['files'])})")
+    host, port = settings["server"]["host"], int(settings["server"]["port"])
+    url = server.advertised_url(host, port)
+    if args.wait:
+        print("building the index (the first run downloads the 130 MB embedding model) ...")
+        rc = indexer.main()
+    else:
+        plan = SCH.plan(settings, job="refresh")
+        SCH.start_detached(plan)
+        print(f"building the index in the background (the first run downloads the 130 MB embedding model);"
+              f" progress: tail -f {plan['log']}")
+        rc = 0
+    if settings["privacy"].get("hosted_processing") == "ask":
+        print("summaries and tags wait for a privacy decision: run `convo-index init` on a terminal "
+              "(or `convo-index init --yes` to allow hosted LLM processing)")
+    if not args.no_serve:
+        if _wait_for_port("127.0.0.1" if host in ("0.0.0.0", "::", "") else host, port):
+            print(_green(f"convo-index is at {url}"))
+            if not args.no_open:
+                webbrowser.open(url)
+        else:
+            print(f"the UI server did not answer at {url} within 15 s; see {SCH.log_path(settings, 'serve')}", file=sys.stderr)
+            problems.append("serve")
+    if problems:
+        print(f"up finished with problems: {', '.join(dict.fromkeys(problems))}", file=sys.stderr)
+        return rc or 1
+    return rc
+
+
 def cmd_resummarize(args):
     from convo_index import settings as S
     from convo_index import db as dbm
@@ -425,6 +555,19 @@ def main(argv=None):
     p_exp.add_argument("--force", action="store_true", help="overwrite an existing --out file")
     p_bak = sub.add_parser("backup", help="copy the database (SQLite backup API, WAL-safe) to a path")
     p_bak.add_argument("path")
+    p_sch = sub.add_parser("schedule", help="daily refresh via LaunchAgent (macOS), systemd user timer (Linux) or a crontab line")
+    p_sch.add_argument("action", choices=["install", "uninstall", "status"])
+    p_sch.add_argument("--hour", type=int); p_sch.add_argument("--minute", type=int)
+    p_sch.add_argument("--print", dest="dry_run", action="store_true", help="show what would be written and run")
+    p_svc = sub.add_parser("service", help="keep the UI server running from login (LaunchAgent / systemd user service / @reboot line)")
+    p_svc.add_argument("action", choices=["install", "uninstall", "status"])
+    p_svc.add_argument("--print", dest="dry_run", action="store_true", help="show what would be written and run")
+    p_up = sub.add_parser("up", help="first run: init, UI server from login, daily refresh, then build the index")
+    p_up.add_argument("--yes", "-y", action="store_true", help="no prompts; allow hosted processing if a CLI was found")
+    p_up.add_argument("--no-serve", action="store_true", help="do not install the UI server service")
+    p_up.add_argument("--no-schedule", action="store_true", help="do not install the daily refresh")
+    p_up.add_argument("--no-open", action="store_true", help="do not open the UI in a browser")
+    p_up.add_argument("--wait", action="store_true", help="build the index in the foreground instead of the background")
     p_jobs = sub.add_parser("jobs", help="derived-job maintenance")
     p_jobs.add_argument("action", choices=["unblock"], help="unblock: re-queue jobs blocked on auth/config now")
     p_res = sub.add_parser("resummarize", help="forget summary jobs so the next index run re-summarizes")
@@ -461,6 +604,12 @@ def main(argv=None):
         return cmd_export(args)
     if args.cmd == "backup":
         return cmd_backup(args)
+    if args.cmd == "schedule":
+        return cmd_schedule(args)
+    if args.cmd == "service":
+        return cmd_service(args)
+    if args.cmd == "up":
+        return cmd_up(args)
     if args.cmd == "resummarize":
         return cmd_resummarize(args)
     if args.cmd == "jobs":
