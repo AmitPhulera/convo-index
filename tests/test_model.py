@@ -1,5 +1,6 @@
 from convo_index.model import content_hash, make_id, split_id, Message, Conversation, KIND_TEXT
 from convo_index.lock import index_lock, IndexLocked
+from convo_index.sources.base import resume_command
 
 
 def test_content_hash_depends_on_role_kind_text():
@@ -32,3 +33,18 @@ def test_index_lock_is_exclusive(tmp_path):
             pass
     with index_lock(p):  # released properly
         pass
+
+
+def test_resume_command_dispatch():
+    assert resume_command("claude_code:abc", None) == "claude --resume abc"
+    assert resume_command("opencode:ses", None) == "opencode --session ses"
+    assert resume_command("mystery:1", None) is None
+
+
+def test_shell_quote_targets_the_platform_shell(monkeypatch):
+    from convo_index.sources.base import shell_quote
+    monkeypatch.setattr("os.name", "posix")
+    assert shell_quote("id; echo x") == "'id; echo x'"
+    monkeypatch.setattr("os.name", "nt")
+    assert shell_quote("a b") == "'a b'" and shell_quote("it's") == "'it''s'"      # PowerShell literal strings
+    assert shell_quote("ses_1") == "ses_1" and shell_quote("$(calc)") == "'$(calc)'"
