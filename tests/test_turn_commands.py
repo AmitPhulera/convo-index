@@ -130,3 +130,113 @@ def test_claude_last_activity_is_the_transcript_mtime(tmp_path):
     assert abs(base.last_activity("claude_code:s", str(f)) - then) < 2
     assert base.last_activity("claude_code:s", str(tmp_path / "gone.jsonl")) is None
     assert base.last_activity("claude_code:s", None) is None
+
+
+# ---- opencode ---------------------------------------------------------------------------------
+
+from convo_index.sources import opencode as oc   # noqa: E402
+from tests.test_opencode import make_opencode_db   # noqa: E402
+from tests.test_opencode_v2 import make_opencode_v2_db, T0   # noqa: E402
+
+
+@pytest.fixture
+def opencode_on_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(oc.shutil, "which", lambda name: "/opt/bin/opencode" if name == "opencode" else None)
+    monkeypatch.setattr(base, "is_windows", lambda: False)
+    monkeypatch.setattr(oc.C, "DATA_DIR", tmp_path / "data")
+    return tmp_path
+
+
+def test_opencode_read_only_turn(opencode_on_path):
+    cmd = base.turn_command("opencode:ses_abc", "what changed?", "/proj")
+    assert cmd.argv == ["/opt/bin/opencode", "run", "--standalone", "--format", "json", "--session", "ses_abc",
+                        "--agent", "plan", "what changed?"]
+    assert cmd.stdin is None and cmd.cwd == "/proj"
+    assert cmd.env["OPENCODE_CONFIG_PROJECT_DISABLE"] == "1" and cmd.env["OPENCODE_DISABLE_CLAUDE_CODE"] == "1"
+    home = cmd.env["XDG_CONFIG_HOME"]
+    assert home == str(opencode_on_path / "data" / "opencode-turns" / "config") and os.path.isdir(home)
+    assert os.listdir(home) == []                                   # nothing of the user's configuration is in it
+    assert cmd.unset == ("OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CLI_CONFIG_CONTENT")
+    rules = json.loads(cmd.env["OPENCODE_CONFIG_CONTENT"])["permissions"]
+    assert rules[0] == {"action": "*", "resource": "*", "effect": "deny"}
+    assert [r["action"] for r in rules[1:]] == ["read", "glob", "grep", "list"]
+    assert all(r["effect"] == "allow" for r in rules[1:])
+
+
+def test_opencode_edits_turn_allows_edit_never_bash(opencode_on_path):
+    cmd = base.turn_command("opencode:ses_abc", "fix it", "/proj", edits=True)
+    assert "--agent" not in cmd.argv and "--auto" not in cmd.argv
+    rules = json.loads(cmd.env["OPENCODE_CONFIG_CONTENT"])["permissions"]
+    assert [r["action"] for r in rules] == ["*", "read", "glob", "grep", "list", "edit"]
+    assert rules[-1] == {"action": "edit", "resource": "*", "effect": "allow"}       # project-relative paths
+    assert not any(r["action"] == "bash" and r["effect"] != "deny" for r in rules)
+    assert base.turn_launcher("opencode:ses_abc") == ["/opt/bin/opencode"]
+
+
+def test_opencode_prompt_is_one_argv_element(opencode_on_path):
+    cmd = base.turn_command("opencode:ses_abc", "a; rm -rf / $(x) `y`", "/proj")
+    assert cmd.argv[-1] == "a; rm -rf / $(x) `y`"
+
+
+def test_opencode_dash_prompt_cannot_become_an_option(opencode_on_path):
+    cmd = base.turn_command("opencode:ses_abc", "--help me with this", "/proj")
+    assert cmd.argv[-1] == " --help me with this" and not any(a == "--help" for a in cmd.argv)
+
+
+def test_opencode_turns_are_refused_on_windows(monkeypatch):
+    monkeypatch.setattr(oc.shutil, "which", lambda name: "C:\\x\\opencode.cmd")
+    monkeypatch.setattr(base, "is_windows", lambda: True)
+    assert base.supports_turns("opencode:ses_abc") is False
+    assert base.turn_command("opencode:ses_abc", "x", "C:\\proj") is None
+    assert base.turn_launcher("opencode:ses_abc") is None
+
+
+def test_opencode_missing_binary(monkeypatch):
+    monkeypatch.setattr(oc.shutil, "which", lambda name: None)
+    monkeypatch.setattr(base, "is_windows", lambda: False)
+    assert base.turn_command("opencode:ses_abc", "x", "/proj") is None
+
+
+# Shapes captured from `opencode run --format json` on 2.1.4, content replaced.
+OPENCODE_STREAM = [
+    {"type": "step_start", "timestamp": 1, "sessionID": "ses_1", "part": {"id": "p1", "type": "step-start"}},
+    {"type": "tool_use", "timestamp": 2, "sessionID": "ses_1", "part": {
+        "id": "p2", "type": "tool", "tool": "read", "state": {"status": "running", "input": {"path": "hello.txt"}}}},
+    {"type": "tool_use", "timestamp": 3, "sessionID": "ses_1", "part": {
+        "id": "p2", "type": "tool", "tool": "read", "state": {"status": "completed", "input": {"path": "hello.txt"},
+                                                              "output": "Read file hello.txt, lines 1-1\n1: hello"}}},
+    {"type": "step_finish", "timestamp": 4, "sessionID": "ses_1", "part": {"id": "p3", "type": "step-finish",
+                                                                             "reason": "tool-calls", "cost": 0}},
+    {"type": "tool_use", "timestamp": 5, "sessionID": "ses_1", "part": {
+        "id": "p4", "type": "tool", "tool": "write", "state": {"status": "error", "input": {}, "error": "denied"}}},
+    {"type": "text", "timestamp": 6, "sessionID": "ses_1", "part": {"id": "p5", "type": "text", "text": "hello"}},
+]
+
+
+def test_opencode_stream_is_translated():
+    events = [e for line in OPENCODE_STREAM for e in base.turn_events("opencode:ses_1", json.dumps(line))]
+    assert events == [
+        {"kind": "tool", "name": "read", "input": '{"path": "hello.txt"}'},
+        {"kind": "tool_result", "text": "Read file hello.txt, lines 1-1\n1: hello", "error": False},
+        {"kind": "tool_result", "text": "denied", "error": True},
+        {"kind": "text", "text": "hello"},
+    ]
+    assert oc.turn_events("garbage") == [] and oc.turn_events('{"type": "text"}') == []
+    assert oc.turn_events(json.dumps({"type": "error", "part": {"type": "error", "error": "no provider"}})) == [
+        {"kind": "error", "message": "no provider"}]
+
+
+def test_opencode_last_activity_is_the_session_row_not_the_file(tmp_path):
+    db = tmp_path / "opencode.db"
+    make_opencode_v2_db(db)
+    locator = f"sqlite:{db}#ses_1"
+    assert base.last_activity("opencode:ses_1", locator) == (T0 + 60_000) / 1000
+    assert base.last_activity("opencode:ses_other", locator) is None      # locator and id must agree
+    assert base.last_activity("opencode:ses_1", str(db)) is None           # not a sqlite locator
+    assert base.last_activity("opencode:ses_1", f"sqlite:{tmp_path / 'none.db'}#ses_1") is None
+
+
+def test_opencode_last_activity_reads_the_1x_layout_too(tmp_path):
+    db = tmp_path / "old.db"
+    make_opencode_db(db)
+    assert base.last_activity("opencode:ses_1", f"sqlite:{db}#ses_1") is not None
