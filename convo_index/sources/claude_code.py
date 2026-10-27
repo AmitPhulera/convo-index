@@ -10,14 +10,13 @@ usage is de-duplicated on `requestId`. `ai-title` events carry the generated tit
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 
 from convo_index.config import PROJECTS_DIR, CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX
 from convo_index.model import (Conversation, Message, ToolCall, UsageRecord, KIND_TEXT, KIND_THINKING,
                                KIND_TOOL_CALL, KIND_TOOL_RESULT, FIDELITY_FULL, FIDELITY_PARTIAL, split_id)
-from convo_index.sources.base import SourceRef, UnreadableSource, shell_quote
+from convo_index.sources.base import SourceRef, UnreadableSource, read_snapshot, shell_quote
 
 TOOL_TEXT_LIMIT = 4000
 # tool names -> file action for the files-touched facet
@@ -138,23 +137,6 @@ def _usage_record(d, seq):
         reasoning=(u.get("output_tokens_details") or {}).get("thinking_tokens"),
         ts=d.get("timestamp"),
     ) if any(k in u for k in ("input_tokens", "output_tokens")) else None
-
-
-def read_snapshot(path):
-    """Read a session file as a consistent snapshot.
-
-    Claude Code appends to the file while a session is live. We fstat the open descriptor
-    first and read exactly that many bytes, so the revision we report describes precisely
-    the bytes we parsed: an append that lands during or after the read changes mtime/size
-    and is picked up next run instead of being silently acknowledged. A trailing partial
-    line (a write in progress) is dropped. Returns (text, revision)."""
-    with open(path, "rb") as fh:
-        st = os.fstat(fh.fileno())
-        data = fh.read(st.st_size)
-    if data and not data.endswith(b"\n"):
-        cut = data.rfind(b"\n")
-        data = data[:cut + 1] if cut >= 0 else b""
-    return data.decode("utf-8", "replace"), f"{st.st_mtime}:{st.st_size}"
 
 
 def parse_conversation(path, text=None):
