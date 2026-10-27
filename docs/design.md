@@ -6,8 +6,8 @@ Date: 2026-09-16
 
 A tool anyone can install that:
 
-1. Indexes conversations from **Claude Code, Opencode, Codex CLI and Antigravity CLI** (and
-   new tools via a small adapter).
+1. Indexes conversations from **Claude Code, Opencode, Codex CLI, Antigravity CLI and the pi
+   coding agent** (and new tools via a small adapter).
 2. Lets the user **define their own tags** and classifies conversations into them with a
    cheap model (Haiku by default, Sonnet or any other model by config).
 3. **Learns from manual tags**: tagging one conversation feeds the classifier and suggests
@@ -37,6 +37,7 @@ A tool anyone can install that:
 | **Opencode** | `opencode db path` → default `~/.local/share/opencode/opencode.db`; `OPENCODE_DB` overrides. Preferred read path: `opencode export <session-id>` → `{info, messages:[{info, parts}]}`. | 1.x: `session(id, title, directory, project_id, parent_id, model JSON, cost, tokens_*, revert, time_created, time_updated, time_archived)`; `message.data`: user rows have `model{providerID,modelID}`, assistant rows have `modelID`, `providerID`, `tokens{input,output,reasoning,cache{read,write}}`, `cost`, `time`; `part.data.type ∈ text, tool (callID, state{status,input,output}), reasoning, step-start, step-finish (tokens, cost), patch`. 2.x (verified on 2.1): `session_v2` keeps those columns, `session_message(id, session_id, type ∈ user/assistant/idle/synthetic/compaction, seq, data)` replaces message+part; user `data.text`, assistant `data.model{id,providerID}`, `tokens`, `cost`, `content[]` of text/reasoning/tool items (`id`, `name`, `state{status,input,content[{text}],error{message}}`); no branch on 2.x workspaces. | `session.time_updated` (1.x) / `session_v2.time_updated` (2.x) | Authoritative usage: **assistant `message.tokens` + `message.cost`**. `step-finish` parts repeat the same numbers and must not be summed. `cost` defaults to 0 and free models legitimately report 0, so 0 means "reported zero", not "unknown". |
 | **Codex CLI** (0.154) | `$CODEX_HOME` (default `~/.codex`). `state_5.sqlite` `threads(id, rollout_path, cwd, title, first_user_message, model, model_provider, tokens_used, git_branch, git_origin_url, git_sha, history_mode, archived, created_at_ms, updated_at_ms)` pointing at `sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl`. `thread_history_1.sqlite` holds `thread_turns` / `thread_items` projections. | Rollout events: `session_meta` (cwd, cli_version, model_provider, originator), `turn_context` (turn_id, cwd, model, sandbox), `response_item` with `payload.type ∈ message (role user/developer/assistant, content input_text/output_text), reasoning (may be encrypted), custom_tool_call, custom_tool_call_output, function_call…`, `event_msg` with `payload.type ∈ task_started, item_completed, token_count, task_complete`, `token_usage_record`, `world_state`. | `threads.updated_at_ms` | `event_msg/token_count.info.last_token_usage{input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens, reasoning_output_tokens}` per request; `total_token_usage` is cumulative and must not be summed. `cached_input_tokens` is a **subset** of `input_tokens`. Model from `turn_context` / `threads.model`. Use `response_item` as the canonical transcript, not `item_completed`, to avoid duplicates. |
 | **Antigravity CLI** | `~/.gemini/antigravity-cli/brain/<conversation-id>/.system_generated/logs/transcript_full.jsonl` (`transcript.jsonl` had identical line counts for every local conversation; `chunks/` unused). `conversation_summaries.db` (title, workspace_uris, parent_conversation_id) is incomplete (11 rows for 15 transcripts on 2026-09-16); when absent the title is the first prompt and the workspace comes from the first tool call's `Cwd`/`SearchDirectory`. `history.jsonl` has user prompts (`display`, `timestamp`, `workspace`, optional `conversationId`); 7 of 24 records lack the id. `conversations/<id>.db` holds protobuf step blobs and is **not** used. | Transcript records: `step_index`, `source ∈ USER_EXPLICIT, MODEL`, `type ∈ USER_INPUT, PLANNER_RESPONSE, GENERIC`, `status`, `created_at`, `content`, `tool_calls[{name,args}]`, `thinking`. `USER_INPUT.content` is wrapped in `<USER_REQUEST>`. `GENERIC` rows are tool output. | transcript file mtime + size | No model or token data in the transcript. Model name exists only inside `conversations/<id>.db` blobs; leave `model = null`, `usage = none`. Workspace from `conversation_summaries.db` when present, else from `tool_calls[].args.Cwd`, else from `history.jsonl` records that carry `conversationId`. |
+| **pi coding agent** (1.4) | `$PI_CODING_AGENT_DIR/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl` (default `~/.pi/agent`); `$PI_CODING_AGENT_SESSION_DIR` replaces the sessions dir with a flat directory of session files. | JSONL, format version 3: a `session` header (`id`, `cwd`, `timestamp`) then entries with `id`/`parentId` forming a tree; the live conversation is the path to the last entry, other branches are skipped and counted. `message` entries carry `{role, content}`: `user` (string or text blocks), `assistant` (text, thinking, toolCall blocks plus `provider`, `model`, `usage`), `toolResult` (`toolCallId`, `isError`, text blocks), `bashExecution` (a `!command` run from the prompt). `session_info.name` is the user's title; `model_change` adds to the model list; `compaction`, `label`, `branch_summary`, `context_edit`, `custom*` are skipped. | file mtime + size + parser version | `usage` per assistant message (`input`, `output`, `cacheRead`, `cacheWrite`, `reasoning`, `cost.total`); models as `provider/model`. |
 
 Each adapter ships with a **fixture** captured from this machine (one real session, secrets
 scrubbed) and a `supported_versions` note. Adapters check the version they find and set
@@ -52,7 +53,7 @@ string "PR 123" appears 181 times as an example in prompts and must not create l
 ```
 convo_index/
   sources/                 adapters: available() / discover() / load(ref) -> (Conversation, revision)
-    claude_code.py  opencode.py  codex.py  antigravity.py
+    claude_code.py  opencode.py  codex.py  antigravity.py  pi.py
     fixtures/              one scrubbed real session per adapter, used by tests
   model.py                 Conversation / Message / ToolCall / UsageRecord dataclasses
   providers/
@@ -289,6 +290,7 @@ claude_code = { enabled = true }
 opencode    = { enabled = true }                  # db path from `opencode db path` / OPENCODE_DB
 codex       = { enabled = true }                  # honours CODEX_HOME
 antigravity = { enabled = true }
+pi          = { enabled = true }                  # honours PI_CODING_AGENT_DIR / PI_CODING_AGENT_SESSION_DIR
 
 [references]
 ticket_regex = "\\b[A-Z]{2,}-\\d+\\b"

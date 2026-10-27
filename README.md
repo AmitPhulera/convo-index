@@ -3,7 +3,7 @@
 [![CI](https://github.com/AmitPhulera/convo-index/actions/workflows/ci.yml/badge.svg)](https://github.com/AmitPhulera/convo-index/actions/workflows/ci.yml)
 
 Local index + browser for AI coding-assistant conversations: Claude Code, Opencode, Codex
-CLI and Antigravity CLI. Full-text + semantic search, summaries and user-defined tags through
+CLI, Antigravity CLI and the pi coding agent. Full-text + semantic search, summaries and user-defined tags through
 whichever LLM CLI you already have, related work by ticket/PR/branch, token usage with
 API-equivalent cost estimates, and an MCP server so your agents can search the archive.
 Design: `docs/design.md`.
@@ -107,6 +107,7 @@ time across the CLI, the scheduler and the UI's refresh button.
 | **Opencode** | the SQLite DB reported by `opencode db path` (1.x `session`/`message`/`part` and 2.x `session_v2`/`session_message` layouts) | `OPENCODE_DB` | `opencode --session <id>` |
 | **Codex CLI** | `~/.codex/state_*.sqlite` threads + `sessions/**/rollout-*.jsonl` | `CODEX_HOME` | `codex resume <id>` |
 | **Antigravity CLI** | `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl` (+ `conversation_summaries.db` for titles/workspaces) | `ANTIGRAVITY_HOME` | `agy --conversation <id>` |
+| **pi coding agent** | `~/.pi/agent/sessions/*/*.jsonl` (the live branch of each session tree; text, thinking, tool calls and results) | `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR` | `pi --session <id>` |
 
 Tool calls, tool results and thinking are indexed as their own messages (keyword-searchable,
 collapsed in the UI, never embedded or summarized). Antigravity records no model or token data;
@@ -114,7 +115,7 @@ Codex records the repository URL, which lets bare "PR 123" mentions link. Disabl
 `[sources.<name>] enabled = false`.
 
 Conversation ids are namespaced by source, e.g. `claude_code:<session-uuid>`,
-`opencode:<session-id>`. Databases created before 0.2 are migrated in place on first run,
+`opencode:<session-id>`, `pi:<session-uuid>`. Databases created before 0.2 are migrated in place on first run,
 after an automatic backup to `convos.db.bak-<timestamp>`.
 
 ## Daily refresh and the server from login

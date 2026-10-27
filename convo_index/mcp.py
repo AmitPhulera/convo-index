@@ -35,11 +35,11 @@ SERVER_INFO = {"name": "convo-index", "version": _version()}
 
 TOOLS = [
     {"name": "search_conversations",
-     "description": "Search indexed AI coding-assistant conversations (Claude Code, Opencode, Codex, Antigravity). "
+     "description": "Search indexed AI coding-assistant conversations (Claude Code, Opencode, Codex, Antigravity, pi). "
                     "Hybrid keyword + semantic search; returns ids to pass to get_conversation.",
      "inputSchema": {"type": "object", "properties": {
          "query": {"type": "string", "description": "search text; empty lists the most recent conversations"},
-         "source": {"type": "string", "enum": ["claude_code", "opencode", "codex", "antigravity"]},
+         "source": {"type": "string", "enum": ["claude_code", "opencode", "codex", "antigravity", "pi"]},
          "tags": {"type": "array", "items": {"type": "string"}, "description": '"group:tag" filters, e.g. "workspace:work"'},
          "project": {"type": "string", "description": "repo root / cwd to restrict to"},
          "mode": {"type": "string", "enum": ["hybrid", "keyword", "semantic"], "default": "hybrid"},

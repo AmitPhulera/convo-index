@@ -540,7 +540,7 @@ def main(argv=None):
     p_tag.add_argument("--suggestions", action="store_true", help="list open neighbour suggestions")
     p_search = sub.add_parser("search", help="search the index from the terminal")
     p_search.add_argument("query", nargs="?", default="", help="search text; empty lists recent conversations")
-    p_search.add_argument("--source", choices=["claude_code", "opencode", "codex", "antigravity"])
+    p_search.add_argument("--source", choices=["claude_code", "opencode", "codex", "antigravity", "pi"])
     p_search.add_argument("--tag", action="append", default=[], help="group:tag filter (repeatable)")
     p_search.add_argument("--project", help="repo root / cwd")
     p_search.add_argument("--since", help="e.g. 30d, 12h, 2026-06-01")

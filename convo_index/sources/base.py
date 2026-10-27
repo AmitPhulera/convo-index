@@ -7,6 +7,7 @@ it actually read so the indexer never records a change key it observed before re
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Iterable, Protocol
 
@@ -63,7 +64,8 @@ def all_adapters() -> list[SourceAdapter]:
     from convo_index.sources.opencode import OpencodeAdapter
     from convo_index.sources.codex import CodexAdapter
     from convo_index.sources.antigravity import AntigravityAdapter
-    return [ClaudeCodeAdapter(), OpencodeAdapter(), CodexAdapter(), AntigravityAdapter()]
+    from convo_index.sources.pi import PiAdapter
+    return [ClaudeCodeAdapter(), OpencodeAdapter(), CodexAdapter(), AntigravityAdapter(), PiAdapter()]
 
 
 def enabled_adapters() -> list[SourceAdapter]:
@@ -81,6 +83,25 @@ def resume_command(conversation_id: str, cwd: str | None) -> str | None:
         from convo_index.sources.codex import resume_command as rc
     elif source == "antigravity":
         from convo_index.sources.antigravity import resume_command as rc
+    elif source == "pi":
+        from convo_index.sources.pi import resume_command as rc
     else:
         return None
     return rc(conversation_id, cwd)
+
+
+def read_snapshot(path):
+    """Read a session file as a consistent snapshot.
+
+    Tools append to their session files while a session is live. We fstat the open descriptor
+    first and read exactly that many bytes, so the revision we report describes precisely
+    the bytes we parsed: an append that lands during or after the read changes mtime/size
+    and is picked up next run instead of being silently acknowledged. A trailing partial
+    line (a write in progress) is dropped. Returns (text, revision)."""
+    with open(path, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        data = fh.read(st.st_size)
+    if data and not data.endswith(b"\n"):
+        cut = data.rfind(b"\n")
+        data = data[:cut + 1] if cut >= 0 else b""
+    return data.decode("utf-8", "replace"), f"{st.st_mtime}:{st.st_size}"

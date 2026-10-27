@@ -27,7 +27,7 @@ LABEL = JOBS["refresh"]["label"]
 BEST_EFFORT = (("launchctl", "bootout"), ("schtasks", "/End"))
 # environment the indexer honours; passed through when set at install time
 ENV_PASSTHROUGH = ("CONVO_INDEX_DB", "CONVO_INDEX_ARCHIVE", "OPENCODE_DB", "CODEX_HOME", "ANTIGRAVITY_HOME",
-                   "XDG_CONFIG_HOME", "XDG_DATA_HOME", "HOME")
+                   "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "HOME")
 
 
 def command(sub="index"):

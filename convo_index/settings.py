@@ -41,6 +41,7 @@ DEFAULTS = {
         "opencode": {"enabled": True, "exclude_cwd": []},
         "codex": {"enabled": True, "exclude_cwd": []},        # CODEX_HOME
         "antigravity": {"enabled": True, "exclude_cwd": []},  # ANTIGRAVITY_HOME
+        "pi": {"enabled": True, "exclude_cwd": []},           # PI_CODING_AGENT_DIR, PI_CODING_AGENT_SESSION_DIR
     },
     # Per-job LLM backend. Empty backend = "not configured": `init` fills it from the probe
     # order gemini_cli -> codex_cli -> claude_cli; `doctor` warns when a job has none.
