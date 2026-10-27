@@ -11,7 +11,7 @@ let TICKET_URL = "https://example.atlassian.net/browse/{key}";
 let TAG_GROUPS = {};
 let WINDOWS = false;          // the server's platform: decides how the resume command is quoted          // {group: {exclusive, description, tags: [{name, description}]}}
 let tagFiltersFromUrl = [];   // ["workspace:globex", ...]
-const SOURCE_LABELS = { claude_code: "Claude Code", opencode: "Opencode", codex: "Codex", antigravity: "Antigravity" };
+const SOURCE_LABELS = { claude_code: "Claude Code", opencode: "Opencode", codex: "Codex", antigravity: "Antigravity", pi: "pi" };
 const ROLE_LABELS = { user: "You", assistant: "Assistant", system: "System", tool: "Tool" };
 const ICON = {
   copy: '<svg class="icon" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>',

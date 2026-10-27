@@ -64,7 +64,8 @@ def all_adapters() -> list[SourceAdapter]:
     from convo_index.sources.opencode import OpencodeAdapter
     from convo_index.sources.codex import CodexAdapter
     from convo_index.sources.antigravity import AntigravityAdapter
-    return [ClaudeCodeAdapter(), OpencodeAdapter(), CodexAdapter(), AntigravityAdapter()]
+    from convo_index.sources.pi import PiAdapter
+    return [ClaudeCodeAdapter(), OpencodeAdapter(), CodexAdapter(), AntigravityAdapter(), PiAdapter()]
 
 
 def enabled_adapters() -> list[SourceAdapter]:
@@ -82,6 +83,8 @@ def resume_command(conversation_id: str, cwd: str | None) -> str | None:
         from convo_index.sources.codex import resume_command as rc
     elif source == "antigravity":
         from convo_index.sources.antigravity import resume_command as rc
+    elif source == "pi":
+        from convo_index.sources.pi import resume_command as rc
     else:
         return None
     return rc(conversation_id, cwd)

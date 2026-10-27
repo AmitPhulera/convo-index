@@ -18,11 +18,12 @@ name the user gave the session) are metadata; `compaction`, `branch_summary`, `l
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from convo_index.model import (Conversation, Message, ToolCall, UsageRecord, KIND_TEXT, KIND_THINKING,
-                               KIND_TOOL_CALL, KIND_TOOL_RESULT, FIDELITY_FULL, FIDELITY_PARTIAL)
-from convo_index.sources.base import UnreadableSource, read_snapshot
+                               KIND_TOOL_CALL, KIND_TOOL_RESULT, FIDELITY_FULL, FIDELITY_PARTIAL, split_id)
+from convo_index.sources.base import SourceRef, UnreadableSource, read_snapshot, shell_quote
 
 TOOL_TEXT_LIMIT = 4000
 SOURCE = "pi"
@@ -360,3 +361,67 @@ def to_conversation(parsed, path):
         fidelity=FIDELITY_PARTIAL if parsed.get("malformed_lines") else FIDELITY_FULL,
         warnings=warnings, metadata=metadata, usage=list(parsed.get("usage") or []),
     )
+
+
+def sessions_dir():
+    """Where pi keeps sessions: `$PI_CODING_AGENT_SESSION_DIR` (a flat directory of session
+    files), else `sessions/` under `$PI_CODING_AGENT_DIR` or `~/.pi/agent` (one subdirectory
+    per encoded cwd). Returns (path, flat)."""
+    override = os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+    if override:
+        return Path(override).expanduser(), True
+    agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
+    base = Path(agent_dir).expanduser() if agent_dir else Path.home() / ".pi" / "agent"
+    return base / "sessions", False
+
+
+def revision_of(path):
+    """Change key "p<parser version>:<mtime>:<size>", like the Claude Code adapter's."""
+    st = Path(path).stat()
+    return f"p{PARSER_VERSION}:{st.st_mtime}:{st.st_size}"
+
+
+class PiAdapter:
+    name = SOURCE
+    supported_versions = "pi coding agent 1.x session files (format version 3)"
+
+    def __init__(self, sessions=None, flat=False):
+        """`sessions` is the sessions directory (tests); by default it comes from the environment."""
+        if sessions is None:
+            self.sessions, self.flat = sessions_dir()
+        else:
+            self.sessions, self.flat = Path(sessions), flat
+
+    def available(self):
+        return self.sessions.is_dir()
+
+    def iter_files(self):
+        if not self.sessions.is_dir():
+            return
+        yield from sorted(self.sessions.glob("*.jsonl" if self.flat else "*/*.jsonl"))
+
+    def discover(self):
+        for path in self.iter_files():
+            try:
+                key = revision_of(path)
+            except OSError:
+                continue
+            yield SourceRef(SOURCE, native_id_of(path), key, str(path))
+
+    def load(self, ref):
+        text, revision = read_snapshot(ref.locator)
+        revision = f"p{PARSER_VERSION}:{revision}"
+        parsed = parse_session(ref.locator, text)
+        if exclude_reason(parsed):
+            return None
+        conv = to_conversation(parsed, ref.locator)
+        # The file name carries the session id; the header should agree, but the namespaced
+        # id must follow the ref so discovery and storage stay aligned.
+        conv.native_id = ref.native_id
+        return conv, revision
+
+
+def resume_command(conversation_id, cwd):
+    """Shell command to continue this conversation in pi."""
+    _, native = split_id(conversation_id)
+    return f"pi --session {shell_quote(native)}"

@@ -251,3 +251,86 @@ def test_dangling_parent_keeps_the_tail(tmp_path):
                _entry("message", "e6", "e5", _ts(6), message={"role": "assistant", "content": [{"type": "text", "text": "late answer"}]})]
     parsed = pi.parse_session(write_session(tmp_path, entries))
     assert [m["text"] for m in parsed["messages"]] == ["late question", "late answer"]
+
+
+def test_adapter_discovers_the_default_layout_and_loads(tmp_path):
+    sessions = tmp_path / "sessions"
+    write_session(sessions / "--Users-alice-Development-globex-widgets-hq--")
+    write_session(sessions / "--Users-alice--", [header("other-id", "/Users/alice")], name="2026-08-22T01-00-00-000Z_other-id.jsonl")
+    (sessions / "stray.jsonl").write_text("")        # not in a cwd directory: not a session
+    ad = pi.PiAdapter(sessions)
+    assert ad.available()
+    write_session(sessions / "--Users-alice--", [header("renamed-id")], name="custom.jsonl")
+    refs = list(ad.discover())
+    assert [r.native_id for r in refs] == ["other-id", "renamed-id", SID] and refs[2].id == f"pi:{SID}"
+    assert refs[1].change_key.startswith("p1:")
+    conv, revision = ad.load(refs[2])
+    assert conv.native_id == SID and conv.cwd == CWD and revision == refs[2].change_key
+    assert ad.load(refs[0]) is None                   # header only: confirmed empty
+
+
+def test_adapter_discovers_a_flat_session_dir(tmp_path):
+    flat = tmp_path / "flat"
+    write_session(flat)
+    (flat / "nested").mkdir(); write_session(flat / "nested", name="2026-08-22T01-00-00-000Z_nested-id.jsonl")
+    assert [r.native_id for r in pi.PiAdapter(flat, flat=True).discover()] == [SID]
+
+
+def test_sessions_dir_comes_from_the_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.delenv("PI_CODING_AGENT_SESSION_DIR", raising=False)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    assert pi.sessions_dir() == (tmp_path / ".pi" / "agent" / "sessions", False)
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "agent"))
+    assert pi.sessions_dir() == (tmp_path / "agent" / "sessions", False)
+    monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", str(tmp_path / "flat"))
+    assert pi.sessions_dir() == (tmp_path / "flat", True)
+    assert pi.PiAdapter().available() is False
+    (tmp_path / "flat").mkdir()
+    assert pi.PiAdapter().available() is True and pi.PiAdapter().flat is True
+
+
+def test_load_revision_describes_exactly_the_bytes_parsed(tmp_path, monkeypatch):
+    """An append that lands after the read must not be acknowledged by the returned revision."""
+    sessions = tmp_path / "sessions"
+    f = write_session(sessions / "--x--")
+    ad = pi.PiAdapter(sessions)
+    ref = next(iter(ad.discover()))
+    real = pi.read_snapshot
+
+    def read_then_append(path):
+        out = real(path)
+        with open(path, "a") as fh:
+            fh.write(json.dumps(_entry("message", "e9", "e6", _ts(9), message={"role": "user", "content": "late"})) + "\n")
+        return out
+    monkeypatch.setattr(pi, "read_snapshot", read_then_append)
+    conv, revision = ad.load(ref)
+    assert not any(m.text == "late" for m in conv.messages)
+    assert revision != pi.revision_of(f)     # next discovery sees a different key -> re-read
+
+
+def test_unreadable_file_raises_through_the_adapter(tmp_path):
+    sessions = tmp_path / "sessions"
+    f = write_session(sessions / "--x--", [header()])
+    f.write_text(f.read_text() + "NOT JSON\n")
+    ad = pi.PiAdapter(sessions)
+    with pytest.raises(UnreadableSource):
+        ad.load(next(iter(ad.discover())))
+
+
+def test_resume_command_quotes_for_the_shell(monkeypatch):
+    assert pi.resume_command(f"pi:{SID}", None) == f"pi --session {SID}"
+    assert pi.resume_command("pi:odd id", "/x") == "pi --session 'odd id'"
+    monkeypatch.setattr("os.name", "nt")
+    assert pi.resume_command(f"pi:{SID}", None) == f"pi --session {SID}"
+    assert pi.resume_command("pi:it's", None) == "pi --session 'it''s'"
+
+
+def test_registered_with_the_other_sources(tmp_path, monkeypatch):
+    from convo_index.sources.base import all_adapters, resume_command
+    monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", str(tmp_path))
+    names = [a.name for a in all_adapters()]
+    assert names[-1] == "pi" and len(names) == len(set(names))
+    assert resume_command(f"pi:{SID}", None) == f"pi --session {SID}"
+    from convo_index.settings import DEFAULTS
+    assert DEFAULTS["sources"]["pi"] == {"enabled": True, "exclude_cwd": []}
