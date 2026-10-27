@@ -103,6 +103,26 @@ def test_doctor_json_reports_warnings(tmp_path, monkeypatch, capsys):
     assert any("no index yet" in w for w in rep["warnings"])
 
 
+def test_doctor_reports_turn_harnesses(tmp_path, monkeypatch, capsys):
+    _isolate(tmp_path, monkeypatch)
+    from convo_index import doctor
+    monkeypatch.setattr(R, "probe_cli_backends", lambda: [])
+    from convo_index.sources import base as sources
+    monkeypatch.setattr(sources, "is_windows", lambda: False)
+    monkeypatch.setattr("shutil.which", lambda name: "/opt/bin/claude" if name == "claude" else None)   # one module object for all
+    rc = cli.main(["doctor", "--json"])
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["turns"]["enabled"] is True
+    assert rep["turns"]["harnesses"]["claude_code"]["path"] == "/opt/bin/claude"
+    assert rep["turns"]["harnesses"]["opencode"]["path"] is None
+    assert rep["turns"]["harnesses"]["claude_code"]["launcher"] == ["/opt/bin/claude"]
+    assert rep["turns"]["harnesses"]["opencode"]["launcher"] is None
+    assert set(rep["turns"]["harnesses"]) == {"claude_code", "opencode"}
+    text = doctor.format_report(rep)
+    assert "browser turns: on; usable harness: claude_code (/opt/bin/claude)" in text
+    assert rc == 1   # the usual warnings (no config, no index) still apply
+
+
 def test_init_preserves_explicit_disabled_source(tmp_path, monkeypatch):
     cfg = _isolate(tmp_path, monkeypatch)
     cfg.parent.mkdir(parents=True)

@@ -1,7 +1,10 @@
 """`convo-index doctor`: what this install can see, what it will call, what is failing."""
 from __future__ import annotations
 
+import importlib
 import json
+import os
+import shutil
 import urllib.request
 
 from convo_index import db as dbm
@@ -9,7 +12,7 @@ from convo_index import jobs
 from convo_index import settings as S
 from convo_index.lock import index_lock, IndexLocked
 from convo_index.providers import registry as R
-from convo_index.sources.base import all_adapters
+from convo_index.sources.base import all_adapters, TURN_MODULES
 
 
 def _embedding_model_present(spec):
@@ -39,6 +42,8 @@ def report(settings=None):
         spec = settings["sources"].get(a.name) or {}
         rep["sources"].append({"name": a.name, "enabled": spec.get("enabled", True),
                                "available": a.available(), "versions": a.supported_versions})
+
+    rep["turns"] = harness_report(settings)
 
     probe = R.probe_cli_backends()
     rep["llm"]["installed_clis"] = probe
@@ -153,6 +158,20 @@ def report(settings=None):
     return rep
 
 
+def harness_report(settings):
+    """Which coding agents a browser turn could launch: per source with a turn module, the
+    binary on PATH and the launcher a turn would use (None when it cannot be started here)."""
+    out = {"enabled": bool(settings["ui"]["turns"].get("enabled", True)), "harnesses": {}}
+    for source, module in TURN_MODULES.items():
+        binary = {"claude_code": "claude", "opencode": "opencode"}.get(source, source)
+        mod = importlib.import_module(module)
+        on_platform = bool(getattr(mod, "TURNS_ON_WINDOWS", True) or os.name != "nt")
+        launcher = mod.launcher() if on_platform else None     # what a turn would actually run
+        out["harnesses"][source] = {"binary": binary, "path": shutil.which(binary),
+                                    "supported_here": on_platform, "launcher": launcher}
+    return out
+
+
 def format_report(rep):
     lines = [f"config: {rep['config_path'] or 'defaults (no file at ' + rep['config_default_path'] + ')'}",
              f"database: {rep['db_path']} ({'schema v' + str(rep['index'].get('schema_version')) if rep['index'].get('exists') else 'missing'})"]
@@ -160,6 +179,10 @@ def format_report(rep):
     for s in rep["sources"]:
         state = "disabled" if not s["enabled"] else ("found" if s["available"] else "not found")
         lines.append(f"  {s['name']:12s} {state:9s} {s['versions']}")
+    t = rep.get("turns") or {}
+    if t:
+        found = [f"{src} ({' '.join(h['launcher'])})" for src, h in t["harnesses"].items() if h.get("launcher")]
+        lines.append(f"browser turns: {'on' if t['enabled'] else 'off'}; usable harness: {', '.join(found) or 'none'}")
     lines.append(f"llm: installed CLIs in preference order: {', '.join(rep['llm']['installed_clis']) or 'none'}")
     for job in ("classify", "summary"):
         e = rep["llm"][job]
