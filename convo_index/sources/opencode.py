@@ -1,14 +1,23 @@
-"""Opencode adapter: one SQLite database for every session.
+"""Opencode adapter: one SQLite database for every session, in one of two layouts.
 
-Verified layout (Opencode 1.18.x): `session(id, project_id, workspace_id, parent_id,
-title, directory, model JSON, cost, tokens_*, time_created, time_updated, time_archived,
-revert)`, `message(id, session_id, time_created, data JSON)` and
-`part(id, message_id, session_id, data JSON)`. `message.data.role` is `user` or
-`assistant`; assistant rows carry `providerID`, `modelID`, `tokens{input, output,
-reasoning, cache{read, write}}` and `cost`. Part `data.type` is one of text, reasoning,
-tool (with `callID`, `tool`, `state{status, input, output}`), step-start, step-finish,
-patch, file. `step-finish` repeats the message tokens and is ignored so nothing is
-double counted. Timestamps are epoch milliseconds.
+Opencode 1.x (verified on 1.18): `session(id, project_id, workspace_id, parent_id, title,
+directory, model JSON, cost, tokens_*, time_created, time_updated, time_archived, revert)`,
+`message(id, session_id, time_created, data JSON)` and `part(id, message_id, session_id,
+data JSON)`. `message.data.role` is `user` or `assistant`; assistant rows carry
+`providerID`, `modelID`, `tokens{input, output, reasoning, cache{read, write}}` and
+`cost`. Part `data.type` is one of text, reasoning, tool (with `callID`, `tool`,
+`state{status, input, output}`), step-start, step-finish, patch, file. `step-finish`
+repeats the message tokens and is ignored so nothing is double counted.
+
+Opencode 2.x (verified on 2.1): `session_v2` keeps the same session columns (the
+`workspace` row no longer records a branch) and `session_message(id, session_id, type,
+seq, data JSON)` replaces both `message` and `part`. `type` is `user` (data: `text`,
+`files`, `agents`), `assistant` (data: `model{id, providerID}`, `tokens`, `cost`,
+`content[]` of text / reasoning / tool items, where a tool item has `id`, `name`,
+`state{status, input, content[{text}], error{message}}`), or bookkeeping without
+transcript text: `idle`, `synthetic` (text Opencode injects for the model, e.g. system
+reminders) and `compaction`. Both layouts are normalized into the same message/part shape
+before anything else looks at them. Timestamps are epoch milliseconds.
 
 The database is located via `OPENCODE_DB`, then `opencode db path`, then the default
 XDG data path. It is opened read-only and every session is read inside one
@@ -21,6 +30,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +44,7 @@ SOURCE = "opencode"
 TOOL_TEXT_LIMIT = 4000       # chars of tool input+output kept per tool call
 KNOWN_PART_TYPES = {"text", "reasoning", "tool", "step-start", "step-finish", "patch",
                     "file", "snapshot", "agent", "subtask", "retry", "compaction"}
+KNOWN_ROW_TYPES = {"user", "assistant", "idle", "synthetic", "compaction"}   # 2.x session_message.type
 
 
 def _iso(ms):
@@ -59,24 +70,43 @@ def _loads(s):
     return data if isinstance(data, dict) else _Malformed()
 
 
-# Every table/column load_session() reads. Anything else is optional metadata.
-REQUIRED_TABLES = {"session": {"id", "project_id", "workspace_id", "parent_id", "slug", "directory",
-                               "title", "version", "agent", "model", "revert",
-                               "time_created", "time_updated", "time_archived"},
-                   "message": {"id", "session_id", "time_created", "data"},
-                   "part": {"id", "message_id", "session_id", "data"},
-                   "project": {"id", "worktree"},
-                   "workspace": {"id", "branch"}}
+# Every table/column load_session() reads per layout. Anything else is optional metadata.
+SESSION_COLUMNS = {"id", "project_id", "workspace_id", "parent_id", "slug", "directory", "title", "version",
+                   "agent", "model", "revert", "time_created", "time_updated", "time_archived"}
+SCHEMAS = {   # newest first: a migrated database may still carry the old tables, stale
+    "2.x": {"session_v2": SESSION_COLUMNS,
+            "session_message": {"id", "session_id", "type", "seq", "time_created", "data"},
+            "project": {"id", "worktree"}},
+    "1.x": {"session": SESSION_COLUMNS,
+            "message": {"id", "session_id", "time_created", "data"},
+            "part": {"id", "message_id", "session_id", "data"},
+            "project": {"id", "worktree"},
+            "workspace": {"id", "branch"}},
+}
+SESSION_TABLE = {"1.x": "session", "2.x": "session_v2"}
 
 
-def check_schema(conn):
-    """Raise if the database lacks the tables/columns this adapter was written against."""
-    for table, cols in REQUIRED_TABLES.items():
+def _schema_gap(conn, tables):
+    """First table that is absent or lacks a column this adapter reads, or None."""
+    for table, cols in tables.items():
         have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not have:
+            return f"table {table!r} is absent"
         missing = cols - have
         if missing:
-            raise RuntimeError(f"opencode db: table {table!r} is missing {sorted(missing)}; "
-                               f"supported: {OpencodeAdapter.supported_versions}")
+            return f"table {table!r} is missing {sorted(missing)}"
+    return None
+
+
+def detect_schema(conn):
+    """Name the layout this database uses ("1.x" or "2.x"); raise when it matches neither."""
+    gaps = []
+    for name, tables in SCHEMAS.items():
+        gap = _schema_gap(conn, tables)
+        if gap is None:
+            return name
+        gaps.append(f"{name}: {gap}")
+    raise RuntimeError(f"opencode db: {'; '.join(gaps)}; supported: {OpencodeAdapter.supported_versions}")
 
 
 def locate_db():
@@ -148,29 +178,58 @@ def _file_actions(name, state):
     return [(action, path)] if action else []
 
 
-def apply_revert(message_rows, part_rows_by_msg, revert):
+def _dict(value):
+    """A JSON object field, or {} when the row holds something else there."""
+    return value if isinstance(value, dict) else {}
+
+
+@dataclass
+class Turn:
+    """One Opencode message in the 1.x shape, whichever layout it was read from: `data` is
+    the parsed message JSON (role, time, modelID, providerID, tokens, cost) and `parts` the
+    parsed part JSONs in Opencode's own order, each with the id Opencode gave it. 2.x text
+    items have no stored id and get a positional one, `<message id>/<index>`."""
+    id: str
+    created_ms: int | None
+    data: dict
+    parts: list[tuple[str, dict]]
+    warning: str | None = None     # about the row itself (e.g. an unknown type); reported if the turn survives revert
+
+
+def _positional(pid, mid):
+    return pid.startswith(f"{mid}/")
+
+
+def apply_revert(turns, revert):
     """Opencode's `session.revert` = {"messageID": ..., "partID": ...} marks everything from
     that message (and, within it, from that part) onward as reverted: hidden in Opencode's
     UI and dropped when the user continues. Mirror that so reverted turns are not indexed."""
     if not isinstance(revert, dict) or not revert.get("messageID"):
-        return message_rows, part_rows_by_msg
+        return turns
     boundary, part_boundary = revert["messageID"], revert.get("partID")
     kept = []
-    for row in message_rows:  # ids are time-ordered, but rely on the ordering we already have
-        if row["id"] == boundary:
+    for turn in turns:
+        if turn.id == boundary:
             if part_boundary:
-                parts = [p for p in part_rows_by_msg.get(row["id"], []) if p["id"] < part_boundary]
+                ids = [pid for pid, _ in turn.parts]
+                if part_boundary in ids:
+                    cut = ids.index(part_boundary)   # parts are in Opencode's order: the position is the cut
+                else:
+                    # the boundary part itself is gone: Opencode's ids are time-sortable, so the
+                    # first id past it is the cut; positional ids say nothing and ride along
+                    cut = next((i for i, pid in enumerate(ids)
+                                if not _positional(pid, turn.id) and pid > part_boundary), None)
+                parts = turn.parts if cut is None else turn.parts[:cut]
                 if parts:
-                    part_rows_by_msg[row["id"]] = parts
-                    kept.append(row)
+                    kept.append(Turn(turn.id, turn.created_ms, turn.data, parts, turn.warning))
             break
-        kept.append(row)
+        kept.append(turn)
     else:  # boundary message not present: nothing to cut
-        return message_rows, part_rows_by_msg
-    return kept, part_rows_by_msg
+        return turns
+    return kept
 
 
-def build_messages(message_rows, part_rows_by_msg, warnings):
+def build_messages(turns, warnings):
     """Flatten Opencode messages+parts into normalized messages, preserving order.
     Consecutive text (or reasoning) parts of one message merge into one entry."""
     messages, usage = [], []
@@ -186,13 +245,15 @@ def build_messages(message_rows, part_rows_by_msg, warnings):
         seq += 1
         return m
 
-    for row in message_rows:
-        data = _loads(row["data"])
+    for turn in turns:
+        data = turn.data
+        if turn.warning:
+            warnings.append(turn.warning)
         if isinstance(data, _Malformed):
-            warnings.append(f"malformed message json {row['id']}")
+            warnings.append(f"malformed message json {turn.id}")
         role = data.get("role") or "assistant"
-        mid = row["id"]
-        created = _iso((data.get("time") or {}).get("created") or row["time_created"])
+        mid = turn.id
+        created = _iso(_dict(data.get("time")).get("created") or turn.created_ms)
         model = data.get("modelID") if role == "assistant" else None
         pending_kind = pending_text = pending_id = pending_ts = None
 
@@ -204,29 +265,31 @@ def build_messages(message_rows, part_rows_by_msg, warnings):
             pending_kind = pending_text = pending_id = pending_ts = None
 
         first_seq = seq  # first normalized message emitted for this Opencode message, any kind
-        for prow in part_rows_by_msg.get(mid, []):
-            p = _loads(prow["data"])
+        for pid, p in turn.parts:
             if isinstance(p, _Malformed):
-                warnings.append(f"malformed part json {prow['id']}")
+                warnings.append(f"malformed part json {pid}")
                 continue
             ptype = p.get("type")
-            pts = _iso(((p.get("time") or {}).get("start"))) or created
+            pts = _iso(_dict(p.get("time")).get("start")) or created
             if ptype in ("text", "reasoning"):
                 kind = KIND_TEXT if ptype == "text" else KIND_THINKING
                 if pending_kind != kind:
                     flush()
-                    pending_kind, pending_text, pending_id, pending_ts = kind, [], prow["id"], pts
-                if p.get("text"):
-                    pending_text.append(p["text"])
+                    pending_kind, pending_text, pending_id, pending_ts = kind, [], pid, pts
+                text = p.get("text")
+                if isinstance(text, str) and text:
+                    pending_text.append(text)
+                elif text not in (None, ""):
+                    warnings.append(f"malformed part json {pid}")
             elif ptype == "tool":
                 flush()
-                state = p.get("state") or {}
+                state = _dict(p.get("state"))
                 name = p.get("tool") or "tool"
                 tc = ToolCall(native_id=p.get("callID"), name=name,
                               args=state.get("input") if isinstance(state.get("input"), dict) else None,
                               result_text=_as_text(state.get("output")) or None,
                               file_actions=_file_actions(name, state))
-                emit(role, KIND_TOOL_CALL, _tool_text(name, state), pts, prow["id"], model, tc)
+                emit(role, KIND_TOOL_CALL, _tool_text(name, state), pts, pid, model, tc)
             elif ptype in KNOWN_PART_TYPES or ptype is None:
                 continue  # step markers, patches, files: no transcript text
             else:
@@ -234,8 +297,8 @@ def build_messages(message_rows, part_rows_by_msg, warnings):
         flush()
 
         if role == "assistant":
-            tok = data.get("tokens") or {}
-            cache = tok.get("cache") or {}
+            tok = _dict(data.get("tokens"))
+            cache = _dict(tok.get("cache"))
             if tok or data.get("cost") is not None:
                 usage.append(UsageRecord(
                     native_request_id=mid, message_seq=first_seq if seq > first_seq else None,
@@ -247,41 +310,110 @@ def build_messages(message_rows, part_rows_by_msg, warnings):
     return messages, usage
 
 
+def _read_v1(conn, session_id):
+    """1.x: message rows plus their part rows, parts in id order like Opencode's own hydrate()."""
+    rows = conn.execute(
+        "SELECT id, time_created, data FROM message WHERE session_id=? ORDER BY time_created, id",
+        (session_id,)).fetchall()
+    parts = conn.execute(
+        "SELECT id, message_id, data FROM part WHERE session_id=? ORDER BY id", (session_id,)).fetchall()
+    by_msg = {}
+    for p in parts:
+        by_msg.setdefault(p["message_id"], []).append((p["id"], _loads(p["data"])))
+    return [Turn(r["id"], r["time_created"], _loads(r["data"]), by_msg.get(r["id"], [])) for r in rows]
+
+
+def _v2_part(item, index, mid):
+    """One 2.x assistant content item as a 1.x part: (id, part JSON). Text and reasoning
+    items carry no id in the stored row, so they get a positional one. An item without a
+    type, or whose required fields hold the wrong kind of value, is malformed."""
+    kind = item.get("type")
+    pid = item.get("id") if isinstance(item.get("id"), str) else f"{mid}/{index}"
+    created = _dict(item.get("time")).get("created")
+    if kind in ("text", "reasoning"):
+        if not isinstance(item.get("text"), str):
+            return f"{mid}/{index}", _Malformed()
+        return f"{mid}/{index}", {"type": kind, "text": item["text"], "time": {"start": created}}
+    if kind == "tool":
+        state = _dict(item.get("state"))
+        content = state.get("content") if isinstance(state.get("content"), list) else []
+        output = "\n".join(c["text"] for c in content
+                           if isinstance(c, dict) and isinstance(c.get("text"), str) and c["text"])
+        error = state.get("error")
+        if isinstance(error, dict):
+            error = error.get("message") or _as_text(error)
+        return pid, {
+            "type": "tool", "tool": item.get("name"), "callID": item.get("id"), "time": {"start": created},
+            "state": {"status": state.get("status"), "input": state.get("input"),
+                      "output": output or None, "error": error}}
+    if not isinstance(kind, str):
+        return pid, _Malformed()
+    return pid, item   # known markers pass, unknown types warn
+
+
+def _v2_turn(row):
+    """One 2.x session_message row as a Turn, or None for bookkeeping rows without
+    transcript text. Rows of a type this adapter does not know are kept as a Turn with a
+    warning, so a session made only of such rows is unreadable rather than confirmed empty."""
+    kind, mid, created = row["type"], row["id"], row["time_created"]
+    if kind in KNOWN_ROW_TYPES - {"user", "assistant"}:
+        return None
+    if kind not in KNOWN_ROW_TYPES:
+        return Turn(mid, created, {"role": kind}, [], warning=f"unknown message type {kind!r}")
+    d = _loads(row["data"])
+    if isinstance(d, _Malformed):
+        return Turn(mid, created, d, [])
+    if kind == "user":
+        if not isinstance(d.get("text"), str):
+            return Turn(mid, created, _Malformed(), [])
+        return Turn(mid, created, {"role": "user", "time": d.get("time")}, [(mid, {"type": "text", "text": d["text"]})])
+    content = d.get("content")
+    if not isinstance(content, list):
+        return Turn(mid, created, _Malformed(), [])
+    model = _dict(d.get("model"))
+    head = {"role": "assistant", "time": d.get("time"), "modelID": model.get("id"),
+            "providerID": model.get("providerID"), "tokens": d.get("tokens"),
+            "cost": d.get("cost") if isinstance(d.get("cost"), (int, float)) else None}
+    parts = [_v2_part(item, i, mid) if isinstance(item, dict) else (f"{mid}/{i}", _Malformed())
+             for i, item in enumerate(content)]
+    return Turn(mid, created, head, parts)
+
+
+def _read_v2(conn, session_id):
+    """2.x: one session_message row per turn, in Opencode's `seq` order."""
+    rows = conn.execute(
+        "SELECT id, type, time_created, data FROM session_message WHERE session_id=? ORDER BY seq, id",
+        (session_id,)).fetchall()
+    turns = (_v2_turn(r) for r in rows)
+    return [t for t in turns if t is not None]
+
+
 def load_session(conn, session_id, db_path):
     """Read one session inside a single read transaction. Returns (Conversation, revision)
     or None when the session is empty or is the indexer's own LLM call."""
     conn.execute("BEGIN")
     try:
-        s = conn.execute("SELECT * FROM session WHERE id=?", (session_id,)).fetchone()
+        schema = detect_schema(conn)
+        s = conn.execute(f"SELECT * FROM {SESSION_TABLE[schema]} WHERE id=?", (session_id,)).fetchone()
         if s is None:
             return None
         proj = conn.execute("SELECT worktree FROM project WHERE id=?", (s["project_id"],)).fetchone()
         branch = None
-        if s["workspace_id"]:
+        if schema == "1.x" and s["workspace_id"]:
             w = conn.execute("SELECT branch FROM workspace WHERE id=?", (s["workspace_id"],)).fetchone()
             branch = w["branch"] if w else None
-        message_rows = conn.execute(
-            "SELECT id, time_created, data FROM message WHERE session_id=? ORDER BY time_created, id",
-            (session_id,)).fetchall()
-        parts = conn.execute(
-            # Opencode itself orders a message's parts by id (message-v2.ts hydrate()/parts());
-            # ids are time-sortable, and mirroring the source is what keeps revert boundaries right.
-            "SELECT id, message_id, data FROM part WHERE session_id=? ORDER BY id",
-            (session_id,)).fetchall()
+        turns = _read_v1(conn, session_id) if schema == "1.x" else _read_v2(conn, session_id)
     finally:
         conn.execute("COMMIT")
 
-    parts_by_msg = {}
-    for p in parts:
-        parts_by_msg.setdefault(p["message_id"], []).append(p)
-    warnings = []
     revert = _loads(s["revert"]) if s["revert"] else None
-    message_rows, parts_by_msg = apply_revert(message_rows, parts_by_msg, revert)
-    messages, usage = build_messages(message_rows, parts_by_msg, warnings)
+    turns = apply_revert(turns, revert)   # reverted rows are gone for good: they say nothing about readability
+    warnings = []
+    messages, usage = build_messages(turns, warnings)
     if not messages:
-        if message_rows and warnings:
+        if turns and warnings:
             # Records exist but we could not interpret any of them: not a confirmed empty session.
-            raise UnreadableSource(f"session {session_id}: {len(message_rows)} messages, none readable: "
+            raise UnreadableSource(f"session {session_id}: {len(turns)} messages, none readable: "
                                    + "; ".join(sorted(set(warnings))[:3]))
         return None
     first_prompt = next((m.text for m in messages if m.role == "user" and m.kind == KIND_TEXT), "")
@@ -318,7 +450,7 @@ def load_session(conn, session_id, db_path):
 
 class OpencodeAdapter:
     name = SOURCE
-    supported_versions = "Opencode 1.18.x SQLite (tables session/message/part)"
+    supported_versions = "Opencode 1.x SQLite (session/message/part) and 2.x (session_v2/session_message)"
 
     def __init__(self, db_path=None):
         self._db_path = Path(db_path) if db_path else None
@@ -338,8 +470,8 @@ class OpencodeAdapter:
     def discover(self):
         conn = _connect_ro(self.db_path)
         try:
-            check_schema(conn)
-            rows = conn.execute("SELECT id, time_updated FROM session ORDER BY time_created").fetchall()
+            table = SESSION_TABLE[detect_schema(conn)]
+            rows = conn.execute(f"SELECT id, time_updated FROM {table} ORDER BY time_created").fetchall()
         finally:
             conn.close()
         for r in rows:

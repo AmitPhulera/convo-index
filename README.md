@@ -104,7 +104,7 @@ time across the CLI, the scheduler and the UI's refresh button.
 | Tool | Where it is read from | Override | Resume from the UI |
 |---|---|---|---|
 | **Claude Code** | `~/.claude/projects/*/*.jsonl` (text, thinking, tool_use and tool_result blocks) | — | `claude --resume <id>` |
-| **Opencode** | the SQLite DB reported by `opencode db path` | `OPENCODE_DB` | `opencode --session <id>` |
+| **Opencode** | the SQLite DB reported by `opencode db path` (1.x `session`/`message`/`part` and 2.x `session_v2`/`session_message` layouts) | `OPENCODE_DB` | `opencode --session <id>` |
 | **Codex CLI** | `~/.codex/state_*.sqlite` threads + `sessions/**/rollout-*.jsonl` | `CODEX_HOME` | `codex resume <id>` |
 | **Antigravity CLI** | `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl` (+ `conversation_summaries.db` for titles/workspaces) | `ANTIGRAVITY_HOME` | `agy --conversation <id>` |
 
