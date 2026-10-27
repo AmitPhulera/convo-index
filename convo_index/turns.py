@@ -3,7 +3,8 @@
 A turn belongs to the UI server process, not to the HTTP request that started it: the
 harness runs to completion (or the timeout) whether or not a browser is still listening, its
 events are kept in a bounded buffer that any number of streams can read from any position,
-and a terminal event closes the buffer once the process has exited.
+and the terminal event is appended only after the index refresh that follows the process,
+so a client that reloads the conversation on `done` sees the new turn.
 
 The runner knows nothing about harnesses. It is handed a `TurnCommand` (argv, cwd, extra
 environment, optional stdin) and a line translator, keeps one process per conversation and
@@ -177,9 +178,10 @@ def _kill_group(turn):
 
 
 class TurnRunner:
-    def __init__(self, *, timeout=1200, max_concurrent=2):
+    def __init__(self, *, timeout=1200, max_concurrent=2, refresh=None):
         self.timeout = timeout
         self.max_concurrent = max_concurrent
+        self.refresh = refresh            # callable -> {"ok", "busy", "error"?}; the UI's refresh path
         self._turns: dict[str, Turn] = {}
         self._lock = threading.Lock()
         self.closed = False               # set by shutdown(): no turn starts afterwards
@@ -389,14 +391,31 @@ class TurnRunner:
                         f"the harness exited with status {turn.exit_code}"))
 
     def _finish(self, turn):
+        indexed, reason = self._refresh_index()
         ok, message = turn.outcome
-        event = {"kind": "done" if ok else "error", "exit_code": turn.exit_code, "cost_usd": turn.cost_usd}
+        event = {"kind": "done" if ok else "error", "exit_code": turn.exit_code, "cost_usd": turn.cost_usd,
+                 "indexed": indexed, "reason": reason}
         if not ok:
             event["message"] = message
             stderr = turn.stderr.decode("utf-8", "replace").strip()
             if stderr:
                 event["stderr"] = stderr[-4000:]
         turn.finish(event)
+
+    def _refresh_index(self):
+        """(indexed, reason): the refresh ran cleanly, or why the new turn may not show yet. It
+        runs after every exit, a killed turn included: whatever the harness wrote is real."""
+        if self.refresh is None:
+            return False, "no refresh configured"
+        try:
+            res = self.refresh() or {}
+        except Exception as e:
+            return False, f"refresh failed: {e}"
+        if res.get("busy"):
+            return False, "indexer busy; the turn appears on the next refresh"
+        if not res.get("ok"):
+            return False, (res.get("error") or "refresh reported failures")[-500:]
+        return True, None
 
     # -- reading ------------------------------------------------------------------------------
 

@@ -59,8 +59,12 @@ def pid_alive(pid):
     return True
 
 
+def ok_refresh():
+    return {"ok": True, "busy": False}
+
+
 def test_events_stream_while_the_harness_is_still_running():
-    r = turns.TurnRunner()
+    r = turns.TurnRunner(refresh=ok_refresh)
     t = r.start("claude_code:s1", command([{"line": '{"kind": "text", "text": "one"}'}, {"sleep": 1.5},
                                            {"line": '{"kind": "text", "text": "two"}'}]), translate)
     gen = r.events(t.id)
@@ -68,7 +72,8 @@ def test_events_stream_while_the_harness_is_still_running():
     assert first == {"kind": "text", "text": "one"} and idx == 0
     assert not t.done                       # received before the harness exited
     rest = [ev for _, ev in gen if ev is not None]
-    assert rest == [{"kind": "text", "text": "two"}, {"kind": "done", "exit_code": 0, "cost_usd": None}]
+    assert rest == [{"kind": "text", "text": "two"},
+                    {"kind": "done", "exit_code": 0, "cost_usd": None, "indexed": True, "reason": None}]
 
 
 def test_prompt_reaches_stdin_and_env_and_cwd_apply(tmp_path):
@@ -79,6 +84,13 @@ def test_prompt_reaches_stdin_and_env_and_cwd_apply(tmp_path):
     texts = [e["text"] for e in drain(r, t) if e["kind"] == "text"]
     assert texts[0] == "a; rm -rf / $(x) `y` ünï" and texts[1] == "on"
     assert Path(texts[2]).resolve() == tmp_path.resolve()
+
+
+def test_an_unencodable_prompt_still_closes_stdin_and_is_reported():
+    r = turns.TurnRunner()
+    t = r.start("claude_code:s1", command([{"echo_stdin": True}], stdin="a\ud800b"), translate)
+    last = drain(r, t, timeout=20)[-1]                 # the harness saw EOF at once rather than waiting for the timeout
+    assert last["kind"] == "error" and "not valid Unicode" in last["message"]
 
 
 def test_stdin_is_closed_when_the_command_has_no_prompt():
@@ -356,10 +368,47 @@ def test_stop_ends_a_running_turn_and_detaching_does_not():
     assert r.stop(t.id) is False                         # nothing left to stop
 
 
+def test_stop_during_the_refresh_keeps_a_completed_turns_outcome():
+    gate = threading.Event()
+
+    def slow_refresh():
+        gate.wait(10)
+        return {"ok": True, "busy": False}
+    r = turns.TurnRunner(refresh=slow_refresh)
+    t = r.start("claude_code:s1", command([{"line": '{"kind": "done", "cost_usd": 0.5}'}]), translate)
+    deadline = time.time() + 10
+    while t.outcome is None and time.time() < deadline:
+        time.sleep(0.02)
+    assert t.outcome == (True, None) and not t.done        # exited, refreshing
+    assert r.stop(t.id) is False
+    gate.set()
+    last = drain(r, t)[-1]
+    assert last["kind"] == "done" and last["cost_usd"] == 0.5 and last["indexed"] is True
+    assert r.last_own_activity("claude_code:none") is None
+
+
+def test_the_activity_marker_is_sampled_after_the_harness_and_before_the_refresh():
+    marks = iter([10.0, 20.0])
+    gate = threading.Event()
+
+    def refresh():
+        gate.wait(10)
+        return {"ok": True}
+    r = turns.TurnRunner(refresh=refresh)
+    t = r.start("claude_code:s1", command([]), translate, activity=lambda: next(marks))
+    deadline = time.time() + 10
+    while t.activity_after is None and time.time() < deadline:
+        time.sleep(0.02)
+    assert t.activity_after == 10.0 and r.last_own_activity("claude_code:s1") is None   # not finished yet
+    gate.set()
+    wait_done(t)
+    assert r.last_own_activity("claude_code:s1") == 10.0                   # the marker from before the refresh
+
+
 def test_harness_done_and_error_events_feed_the_terminal_event():
-    r = turns.TurnRunner()
+    r = turns.TurnRunner(refresh=ok_refresh)
     t = r.start("claude_code:s1", command([{"line": '{"kind": "done", "cost_usd": 0.42}'}]), translate)
-    assert drain(r, t)[-1] == {"kind": "done", "exit_code": 0, "cost_usd": 0.42}
+    assert drain(r, t)[-1] == {"kind": "done", "exit_code": 0, "cost_usd": 0.42, "indexed": True, "reason": None}
     t = r.start("claude_code:s2", command([{"line": '{"kind": "error", "message": "no credits"}'}]), translate)
     last = drain(r, t)[-1]
     assert last["kind"] == "error" and last["message"] == "no credits" and last["exit_code"] == 0
@@ -418,3 +467,52 @@ def test_harness_runs_in_its_own_session():
     assert os.getpgid(t.proc.pid) == t.proc.pid != os.getpgid(0)
     os.killpg(t.proc.pid, signal.SIGKILL)
     wait_done(t)
+
+
+# ---- the refresh before the terminal event -------------------------------------------------------
+
+def test_terminal_event_waits_for_the_refresh_and_reports_it():
+    seen = {}
+
+    def slow_refresh():
+        seen["started"] = time.time()
+        time.sleep(1.0)
+        return {"ok": True, "busy": False}
+    r = turns.TurnRunner(refresh=slow_refresh)
+    t = r.start("claude_code:s1", command([{"line": '{"kind": "text", "text": "x"}'}]), translate)
+    events = drain(r, t)
+    assert events[-1]["indexed"] is True and events[-1]["reason"] is None
+    assert t.finished - seen["started"] >= 0.9           # done was appended after the refresh returned
+
+
+@pytest.mark.parametrize("result, indexed, reason", [
+    ({"ok": False, "busy": True}, False, "indexer busy; the turn appears on the next refresh"),
+    ({"ok": False, "busy": False, "error": "WARN: codex: failed"}, False, "WARN: codex: failed"),
+    ({"ok": False, "busy": False}, False, "refresh reported failures"),
+    (None, False, "refresh reported failures"),
+])
+def test_refresh_outcomes_are_reported(result, indexed, reason):
+    r = turns.TurnRunner(refresh=lambda: result)
+    t = r.start("claude_code:s1", command([]), translate)
+    last = drain(r, t)[-1]
+    assert last["kind"] == "done" and last["indexed"] is indexed and last["reason"] == reason
+
+
+def test_refresh_exception_and_missing_refresh():
+    def boom():
+        raise RuntimeError("db locked")
+    r = turns.TurnRunner(refresh=boom)
+    t = r.start("claude_code:s1", command([]), translate)
+    assert drain(r, t)[-1]["reason"] == "refresh failed: db locked"
+    r = turns.TurnRunner()
+    t = r.start("claude_code:s1", command([]), translate)
+    assert drain(r, t)[-1]["reason"] == "no refresh configured"
+
+
+def test_refresh_runs_even_when_the_turn_was_stopped():
+    calls = []
+    r = turns.TurnRunner(refresh=lambda: calls.append(1) or {"ok": True})
+    t = r.start("claude_code:s1", command([{"sleep": 30}]), translate)
+    r.stop(t.id)
+    last = drain(r, t)[-1]
+    assert calls == [1] and last["kind"] == "error" and last["indexed"] is True
