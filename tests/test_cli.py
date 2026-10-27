@@ -317,6 +317,13 @@ def test_up_runs_init_services_and_the_first_index(tmp_path, monkeypatch, capsys
     assert "convo-index is at http://127.0.0.1:9753" in out and "privacy decision" in out   # nothing hosted until the user decides
     assert "tail -f" in out
     calls.clear()
+    from convo_index import server
+    from convo_index import settings as S
+    S.reset_cache()
+    server.turn_token_path(S.load(use_cache=False)).write_text("tok123")   # a running server left its turn token
+    assert cli.main(["up"]) == 0 and calls[-1] == "open http://127.0.0.1:9753#turns=tok123"
+    assert "convo-index is at http://127.0.0.1:9753#turns=tok123" in capsys.readouterr().out
+    calls.clear()
     assert cli.main(["up", "--no-serve", "--no-schedule", "--wait"]) == 0 and calls == ["init", "index"]
     calls.clear()
     assert cli.main(["up", "--no-open"]) == 0 and "open" not in " ".join(calls)

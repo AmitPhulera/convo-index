@@ -1,17 +1,23 @@
 import errno
+import ipaddress
 import os
 import json
+import secrets
+import signal
 import socket
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, urlsplit, parse_qs, unquote
 
 from convo_index.config import STATIC_DIR
-from convo_index.sources.base import resume_command
-from convo_index.indexer import EXIT_LOCKED
+from convo_index.sources.base import (resume_command, supports_turns, turn_command, turn_events, last_activity,
+                                      turn_launcher)
+from convo_index.indexer import EXIT_LOCKED, cwd_excluded
+from convo_index import turns as TURNS
 from convo_index.lock import index_lock, IndexLocked
 from convo_index.providers import registry as R
 from convo_index import db as dbm
@@ -238,6 +244,9 @@ def handle_conversation(conversation_id):
         "models": json.loads(head[12] or "[]"), "warnings": json.loads(head[13] or "[]"),
         "metadata": json.loads(head[14] or "{}"), "children": children,
         "resume_cmd": resume_command(conversation_id, head[3]),
+        "turns_supported": (bool(CFG.load()["ui"]["turns"].get("enabled", True)) and supports_turns(conversation_id)
+                            and turn_launcher(conversation_id) is not None),
+        "active_turn": (lambda t: t.snapshot() if t else None)(_runner().active(conversation_id)),
         "hidden": hidden, "summary": summary, "tags": tag_detail, "usage": usage,
         "references": refs, "related": related,
         "messages": [{"role": m[0], "kind": m[1] or "text", "ts": m[2], "text": m[3]} for m in msgs],
@@ -276,8 +285,200 @@ def _run_indexer():
         _refresh_lock.release()
 
 
+# --- Browser turns -------------------------------------------------------------------------------
+
+TURN_TOKEN_HEADER = "X-Convo-Index-Turn"
+_turn_token = None          # per server process; see turn_token()
+RUNNER = None               # one TurnRunner per server process, built from settings on first use
+_runner_lock = threading.Lock()
+_stopping = False           # set by stop_turns(): a runner created afterwards is born closed
+RECENT_ACTIVITY = 30        # seconds: a session that just changed is probably open in a terminal
+
+
+def _runner():
+    global RUNNER
+    with _runner_lock:      # concurrent first requests must share one runner, or its limits mean nothing
+        if RUNNER is None:
+            t = CFG.load()["ui"]["turns"]
+            RUNNER = TURNS.TurnRunner(timeout=int(t.get("timeout_seconds") or 1200),
+                                      max_concurrent=int(t.get("max_concurrent") or 2), refresh=_run_indexer)
+            RUNNER.closed = _stopping
+        return RUNNER
+
+
+def stop_turns():
+    """End every running harness and accept no more; the server calls this on its way out so
+    none outlives it. A request that is past its preconditions when this runs is refused by
+    the runner, which closes under its own lock before it picks what to stop."""
+    global _stopping
+    with _runner_lock:
+        _stopping = True
+        runner = RUNNER
+    return runner.shutdown() if runner is not None else 0
+
+
+def turn_token():
+    """The secret a turn request must carry. It is generated once per server process and
+    written, once the port is bound, to a file only this user can read, next to the database;
+    `serve` on a terminal and `up` put it in the fragment of the URL they print and open, so a
+    page reached through that URL has it and nothing served over HTTP ever does. That is what
+    keeps a reverse proxy on this machine out: it can forward requests, but not read the file
+    or the terminal."""
+    global _turn_token
+    with _runner_lock:
+        if _turn_token is None:
+            _turn_token = secrets.token_urlsafe(24)
+        return _turn_token
+
+
+def turn_token_path(settings=None):
+    return (settings or CFG.load()).db_path().with_name("turn-token")
+
+
+def write_turn_token(settings=None):
+    path = turn_token_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(turn_token())
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
+def read_turn_token(settings=None):
+    """The running server's token, for a CLI that prints or opens the UI; None when no server
+    has written one."""
+    try:
+        return turn_token_path(settings).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def token_refusal(headers, qs=None):
+    """Why the request's turn token is not acceptable, or None. POST and DELETE send it in a
+    header; the event stream may send it as ?token= because EventSource cannot set headers."""
+    given = (headers or {}).get(TURN_TOKEN_HEADER) or ((qs or {}).get("token") or [None])[0]
+    if not given or not secrets.compare_digest(given, turn_token()):
+        return "missing or wrong turn token; open the UI through the URL that `convo-index serve` or `up` prints"
+    return None
+
+
+def _loopback(address):
+    try:
+        ip = ipaddress.ip_address((address or "").split("%")[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)        # ::ffff:127.0.0.1 on a dual-stack socket
+    return ip.is_loopback or (mapped is not None and mapped.is_loopback)
+
+
+def turns_refusal(server_address, client_address, headers=None):
+    """Why this request may not run a turn, or None. A turn runs a coding agent with the
+    user's credentials, so beyond the Host/Origin/CSRF checks (which say a page this server
+    served sent it) the request must have come over loopback at all: the socket is bound to a
+    loopback address, the peer is one, and the browser addressed the server by a loopback name.
+    A same-host reverse proxy connects from 127.0.0.1, so it is kept out by what it leaves in
+    the request: the name it serves in Host or Origin, or the forwarding headers proxies add
+    (the CSRF header is no secret). A proxy that rewrites Host to the upstream and adds no
+    forwarding header is indistinguishable from a local browser; the README says such a
+    deployment must keep the port unreachable or switch turns off."""
+    if not _loopback(server_address[0]):
+        return f"browser turns run only when the server listens on a loopback address (it is bound to {server_address[0]})"
+    if not _loopback(client_address[0]):
+        return f"browser turns are accepted only from this machine (request from {client_address[0]})"
+    for name in PROXY_HEADERS:
+        if (headers or {}).get(name) is not None:
+            return f"browser turns are not accepted through a proxy ({name} header present)"
+    for name in ("Host", "Origin"):
+        value = (headers or {}).get(name)
+        if value is None:
+            continue
+        key = host_key(urlsplit(value).netloc if name == "Origin" else value, 80)
+        if not key or key[0] not in LOOPBACK_HOSTS:
+            return f"browser turns are accepted only when the server is addressed as localhost ({name}: {value})"
+    return None
+
+
+PROXY_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP", "Via")
+MAX_TURN_BODY = 1024 * 1024
+PROMPT_FORBIDDEN = {chr(c) for c in range(32)} - {"\n", "\r", "\t"}
+
+
+def turn_preconditions(conversation_id, prompt, edits, cfg=None):
+    """Everything that must hold before a harness is spawned. Returns (conversation_id, command);
+    raises TurnRefused with the status and the message the UI shows verbatim."""
+    cfg = cfg or CFG.load()
+    if not cfg["ui"]["turns"].get("enabled", True):
+        raise TURNS.TurnRefused(403, "browser turns are disabled in settings ([ui.turns] enabled = false)")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise TURNS.TurnRefused(400, "prompt is required")
+    if any(c in PROMPT_FORBIDDEN for c in prompt):
+        raise TURNS.TurnRefused(400, "prompt contains control characters")
+    try:
+        prompt.encode("utf-8")
+    except UnicodeEncodeError:        # a lone surrogate: JSON carries it, no pipe or argv can
+        raise TURNS.TurnRefused(400, "prompt is not valid Unicode text") from None
+    if not isinstance(edits, bool):
+        raise TURNS.TurnRefused(400, "edits must be a JSON boolean")
+    conn = dbm.connect(_db())
+    try:
+        conversation_id = dbm.resolve_id(conn, conversation_id)
+        row = conn.execute("SELECT source, native_id, cwd, source_ref, metadata FROM conversations WHERE id=?",
+                           (conversation_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise TURNS.TurnRefused(404, "conversation not found")
+    source, cwd, locator, metadata = row[0], row[2], row[3], json.loads(row[4] or "{}")
+    spec = cfg["sources"].get(source) or {}
+    if spec.get("enabled", True) is False:
+        raise TURNS.TurnRefused(403, f"source {source} is disabled in settings")
+    if cwd_excluded(cwd, spec.get("exclude_cwd") or []):
+        raise TURNS.TurnRefused(403, f"this project is excluded by [sources.{source}] exclude_cwd")
+    if not supports_turns(conversation_id):
+        raise TURNS.TurnRefused(400, f"no browser turns for {source} conversations on this platform")
+    if not cwd or not os.path.isdir(cwd):
+        raise TURNS.TurnRefused(412, f"the conversation's directory no longer exists: {cwd or '(none recorded)'}")
+    if metadata.get("cwd_source") not in (None, "summaries"):
+        raise TURNS.TurnRefused(412, "the conversation's directory was inferred, not recorded; continue it in the terminal")
+    changed = last_activity(conversation_id, locator)
+    own = _runner().last_own_activity(conversation_id)  # where the previous browser turn left the transcript
+    if changed is not None and 0 <= time.time() - changed < RECENT_ACTIVITY and not (own is not None and changed <= own):
+        raise TURNS.TurnRefused(423, f"the session changed {int(time.time() - changed)} s ago; "
+                                     "if it is open in a terminal, continue it there")
+    command = turn_command(conversation_id, prompt, cwd, edits=edits)
+    if command is None:
+        raise TURNS.TurnRefused(424, f"the {source} command is not installed on this machine (not on PATH)")
+    return conversation_id, command, locator
+
+
+def handle_turn_start(conversation_id, body):
+    """POST /api/conversation/<id>/turn {prompt, edits}: (status, json)."""
+    if not isinstance(body, dict):
+        return 400, json.dumps({"error": "body must be a JSON object"})
+    try:
+        conversation_id, command, locator = turn_preconditions(conversation_id, body.get("prompt"), body.get("edits", False))
+        turn = _runner().start(conversation_id, command, lambda line: turn_events(conversation_id, line),
+                               edits=bool(body.get("edits", False)),
+                               activity=lambda: last_activity(conversation_id, locator))
+    except TURNS.TurnRefused as e:
+        return e.status, json.dumps({"error": str(e)})
+    return 200, json.dumps(turn.snapshot())
+
+
+def handle_turn_stop(turn_id):
+    turn = _runner().get(turn_id)
+    if turn is None:
+        return 404, json.dumps({"error": "no such turn"})
+    stopped = bool(_runner().stop(turn_id))
+    return 200, json.dumps({"ok": True, "stopped": stopped, **turn.snapshot()})
+
+
 # Browser-facing guard (any web page can reach a localhost port): every request must name this
-# server in Host, which defeats DNS rebinding, and every POST must carry CSRF_HEADER, which a
+# server in Host, which defeats DNS rebinding, and every POST/DELETE must carry CSRF_HEADER, which a
 # cross-origin page cannot send without a CORS preflight that this server never approves.
 CSRF_HEADER = "X-Convo-Index"
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -321,7 +522,7 @@ def request_error(method, headers, allowed):
     """Why this request must be refused, or None. `headers` is the request's header mapping."""
     if not _permitted(host_key(headers.get("Host"), 80), allowed):
         return "unexpected Host header"
-    if method == "POST":
+    if method in ("POST", "DELETE"):
         origin = headers.get("Origin")
         if origin is not None:
             o = urlsplit(origin)
@@ -397,10 +598,66 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, handle_suggestions())
         if path.startswith("/api/related/"):
             return self._send(200, handle_related(_segment(path, "/api/related/")))
+        if path.startswith("/api/turn/"):
+            return self._stream_turn(_segment(path, "/api/turn/"), qs)
         if path.startswith("/api/conversation/"):
             body = handle_conversation(_segment(path, "/api/conversation/"))
             return self._send(404, "not found", "text/plain") if body is None else self._send(200, body)
         return self._send(404, "not found", "text/plain")
+
+    def _turns_refused(self, qs=None):
+        err = (turns_refusal(self.server.server_address, self.client_address, self.headers)
+               or token_refusal(self.headers, qs))
+        if err:
+            self._send(403, json.dumps({"error": err}))
+        return err is not None
+
+    def _stream_turn(self, turn_id, qs):
+        """GET /api/turn/<id>?after=<n>: the turn's events as server-sent events from `after`,
+        following it live until its terminal event. Closing the connection detaches the
+        stream; the turn keeps running."""
+        if self._turns_refused(qs):
+            return
+        if _runner().get(turn_id) is None:
+            return self._send(404, json.dumps({"error": "no such turn"}))
+        try:   # a reconnecting EventSource sends the last id it saw, which is the count of events seen
+            after = max(0, int(self.headers.get("Last-Event-ID") or qs.get("after", ["0"])[0]))
+        except ValueError:
+            return self._send(400, json.dumps({"error": "after must be an integer"}))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        try:
+            for idx, ev in _runner().events(turn_id, after):
+                if ev is None:
+                    self.wfile.write(b": keepalive\n\n")
+                else:
+                    self.wfile.write(f"id: {idx + 1}\ndata: {json.dumps(ev)}\n\n".encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return   # the client went away; the turn does not
+
+    def _json_body(self, limit=MAX_TURN_BODY):
+        """The request body as JSON; raises ValueError for a negative or oversized length."""
+        length = int(self.headers.get("Content-Length") or 0)
+        if not 0 <= length <= limit:
+            raise ValueError(f"body must be between 0 and {limit} bytes")
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw or b"{}")
+
+    def do_DELETE(self):
+        if self._refused():
+            return
+        try:
+            path = urlparse(self.path).path
+            if path.startswith("/api/turn/"):
+                if self._turns_refused():
+                    return
+                return self._send(*handle_turn_stop(_segment(path, "/api/turn/")))
+            return self._send(404, "not found", "text/plain")
+        except Exception as e:
+            self._send(500, json.dumps({"error": str(e)}))
 
     def do_POST(self):
         if self._refused():
@@ -410,6 +667,16 @@ class Handler(BaseHTTPRequestHandler):
             path, qs = u.path, parse_qs(u.query)
             if path == "/api/refresh":
                 return self._send(200, json.dumps(_run_indexer()))
+            if path.startswith("/api/conversation/") and path.endswith("/turn"):
+                if self._turns_refused():
+                    return
+                try:
+                    body = self._json_body()
+                except json.JSONDecodeError:
+                    return self._send(400, json.dumps({"error": "invalid json"}))
+                except ValueError as e:
+                    return self._send(413, json.dumps({"error": str(e)}))
+                return self._send(*handle_turn_start(_segment(path[:-len("/turn")], "/api/conversation/"), body))
             if path.startswith("/api/hide/"):
                 hidden = qs.get("hidden", ["1"])[0] == "1"
                 return self._send(200, handle_hide(_segment(path, "/api/hide/"), hidden))
@@ -483,14 +750,15 @@ def make_server(host, port, extra_hosts=()):
     return srv
 
 
-def advertised_url(bind_host, port):
+def advertised_url(bind_host, port, token=None):
     """The URL to open: a wildcard bind is reached through loopback (the allow-list never
-    carries "0.0.0.0"), and an IPv6 literal needs brackets."""
+    carries "0.0.0.0"), an IPv6 literal needs brackets, and the turn token travels in the
+    fragment, which the browser keeps to itself (it is never sent to the server or a proxy)."""
     if bind_host in ("0.0.0.0", "::", ""):
         bind_host = "127.0.0.1"
     elif ":" in bind_host:
         bind_host = f"[{bind_host}]"
-    return f"http://{bind_host}:{port}"
+    return f"http://{bind_host}:{port}" + (f"#turns={token}" if token else "")
 
 
 def main():
@@ -506,8 +774,23 @@ def main():
         # so a service manager does not restart this one in a loop
         print(f"{advertised_url(host, port)} is already served by another process; nothing to do")
         return 0
-    print(f"serving on {advertised_url(host, srv.server_address[1])}")
-    srv.serve_forever()
+    token_file = write_turn_token(cfg)        # only once the port is ours: a stepped-aside serve must not replace it
+    if sys.stdout.isatty():                   # a person at a terminal gets the one-click URL; a service log never holds the secret
+        print(f"serving on {advertised_url(host, srv.server_address[1], turn_token())}")
+    else:
+        print(f"serving on {advertised_url(host, srv.server_address[1])} (turn token in {token_file})")
+
+    def _terminate(signum, frame):        # SIGTERM from a service manager ends the loop like Ctrl-C does
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _terminate)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        n = stop_turns()
+        if n:
+            print(f"stopped {n} running turn(s)", file=sys.stderr)
     return 0
 
 

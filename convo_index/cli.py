@@ -472,6 +472,7 @@ def cmd_up(args):
               "(or `convo-index init --yes` to allow hosted LLM processing)")
     if not args.no_serve:
         if _wait_for_port("127.0.0.1" if host in ("0.0.0.0", "::", "") else host, port):
+            url = server.advertised_url(host, port, server.read_turn_token(settings))   # the running server's turn token
             print(_green(f"convo-index is at {url}"))
             if not args.no_open:
                 webbrowser.open(url)

@@ -359,8 +359,12 @@ def test_serve_steps_aside_when_the_port_is_taken(tmp_path, monkeypatch, capsys)
     cfg = {"server": {"host": "127.0.0.1", "port": port, "allowed_hosts": []}, "embeddings": {"dim": EMBED_DIM}}
     monkeypatch.setattr(server.CFG, "load", lambda *a, **k: cfg)
     monkeypatch.setattr(server, "prepare", lambda c: None)
+    token_file = tmp_path / "turn-token"
+    token_file.write_text("live-servers-token")
+    monkeypatch.setattr(server, "turn_token_path", lambda settings=None: token_file)
     try:
         assert server.main() == 0
     finally:
         holder.server_close()
     assert "already served" in capsys.readouterr().out
+    assert token_file.read_text() == "live-servers-token"      # the running server's token is left alone

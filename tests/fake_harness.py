@@ -49,7 +49,7 @@ def main():
                 fh.write("\n".join(sys.argv[1:]))
         elif "stdin_to" in step:
             with open(step["stdin_to"], "w", encoding="utf-8") as fh:
-                fh.write(sys.stdin.read())
+                fh.write(read_stdin())
         elif "echo_env" in step:
             sys.stdout.write(json.dumps(os.environ.get(step["echo_env"])) + "\n"); sys.stdout.flush()
         elif step.get("echo_cwd"):
