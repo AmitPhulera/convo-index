@@ -1,7 +1,7 @@
 [project]
 name = "convo-index"
 version = "0.3.0"
-description = "Local index + browser for AI coding-assistant conversations (Claude Code, Opencode, Codex, Antigravity)"
+description = "Local index + browser for AI coding-assistant conversations (Claude Code, Opencode, Codex, Antigravity, pi)"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
