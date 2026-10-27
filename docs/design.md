@@ -483,6 +483,20 @@ The MCP server exposes `search_conversations`, `get_conversation`, `get_related`
 Claude Code, Opencode and Codex can query the archive. It respects the same exclusions and
 returns `fidelity` and `source` on every hit.
 
+**Browser turns.** The UI server can continue a conversation in its own tool. The source
+adapter supplies `turn_command(native_id, prompt, cwd, edits)` (argv with fixed closing flags,
+the validated session id and nothing else conversation-derived; the prompt on stdin where the
+tool reads it), `turn_events(line)` (its stream translated to `text`, `tool`, `tool_result`,
+`denied`, `done`, `error`) and `last_activity(native_id, locator)`. `turns.TurnRunner` owns the
+process: one per conversation, a global cap, its own process group (ended on timeout, stop,
+server exit and after the harness returns), stdout and stderr drained concurrently into
+buffers bounded by count and bytes, a watchdog, and a terminal event appended only after the
+same refresh the UI's button runs, so the new turn is indexed when the client reloads. The
+server exposes `POST /api/conversation/<id>/turn`, `GET /api/turn/<id>` (server-sent events,
+resumable with `after`) and `DELETE /api/turn/<id>`, only on a loopback listener and from a
+loopback peer, behind the Host/Origin/CSRF checks, and refuses disabled or excluded sources,
+inferred directories and sessions that changed in the last 30 s.
+
 ### 12. Deferred or cut
 
 | Item | Decision | Why |
