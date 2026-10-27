@@ -228,6 +228,29 @@ def test_malformed_part_json_is_a_warning_and_partial_fidelity(tmp_path):
     assert conv.fidelity == "partial"
 
 
+def test_non_string_text_part_is_a_warning_not_silently_dropped(tmp_path):
+    p = make_opencode_db(tmp_path / "oc.db")
+    conn = sqlite3.connect(str(p))
+    conn.execute("UPDATE part SET data=? WHERE id='prt_a4'", (json.dumps({"type": "text", "text": 42}),))
+    conn.commit(); conn.close()
+    ad = oc.OpencodeAdapter(p)
+    conv, _ = ad.load(next(iter(ad.discover())))
+    assert "malformed part json prt_a4" in conv.warnings and conv.fidelity == "partial"
+    assert conv.messages[2].text == "I'll investigate `translate_app`."
+
+
+def test_session_whose_only_text_is_not_a_string_is_unreadable(tmp_path):
+    from convo_index.sources.base import UnreadableSource
+    p = make_opencode_db(tmp_path / "oc.db")
+    conn = sqlite3.connect(str(p))
+    conn.execute("DELETE FROM message WHERE id='msg_a1'"); conn.execute("DELETE FROM part WHERE message_id='msg_a1'")
+    conn.execute("UPDATE part SET data=? WHERE id='prt_u1a'", (json.dumps({"type": "text", "text": 42}),))
+    conn.commit(); conn.close()
+    ad = oc.OpencodeAdapter(p)
+    with pytest.raises(UnreadableSource):
+        ad.load(next(iter(ad.discover())))
+
+
 def test_all_malformed_session_is_unreadable_not_empty(tmp_path):
     from convo_index.sources.base import UnreadableSource
     p = make_opencode_db(tmp_path / "oc.db")

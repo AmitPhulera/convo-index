@@ -110,17 +110,12 @@ def _set_message(path, mid, data):
     conn.commit(); conn.close()
 
 
-NOT_YET = pytest.mark.xfail(strict=True, reason="the 2.x schema is not read yet")
-
-
-@NOT_YET
 def test_discover_lists_sessions_with_time_updated_key(ocdb):
     refs = list(oc.OpencodeAdapter(ocdb).discover())
     assert [(r.source, r.native_id, r.change_key) for r in refs] == [
         ("opencode", "ses_1", str(T0 + 60_000)), ("opencode", "ses_child", str(T0 + 3000))]
 
 
-@NOT_YET
 def test_load_normalizes_messages_in_content_order(ocdb):
     conv, revision = _load(ocdb)
     assert revision == str(T0 + 60_000)
@@ -157,7 +152,6 @@ def test_load_normalizes_messages_in_content_order(ocdb):
     assert read.tool_call.result_text == "1: print(1)\n2: print(2)"   # content items joined
 
 
-@NOT_YET
 def test_usage_comes_from_the_assistant_row(ocdb):
     conv, _ = _load(ocdb)
     assert len(conv.usage) == 1
@@ -167,14 +161,12 @@ def test_usage_comes_from_the_assistant_row(ocdb):
     assert u.native_request_id == "msg_a1" and u.message_seq == 1
 
 
-@NOT_YET
 def test_idle_synthetic_and_compaction_rows_are_not_transcript(ocdb):
     conv, _ = _load(ocdb)
     assert not any("system-reminder" in m.text or "We grepped." in m.text for m in conv.messages)
     assert conv.warnings == ["unknown part type 'flux-capacitor'"]   # bookkeeping rows raise none
 
 
-@NOT_YET
 def test_session_with_only_bookkeeping_rows_is_confirmed_empty(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     conn = sqlite3.connect(str(p))
@@ -182,7 +174,6 @@ def test_session_with_only_bookkeeping_rows_is_confirmed_empty(tmp_path):
     assert _load(p) is None
 
 
-@NOT_YET
 def test_unknown_row_type_is_a_warning(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     conn = sqlite3.connect(str(p))
@@ -192,7 +183,6 @@ def test_unknown_row_type_is_a_warning(tmp_path):
     assert "unknown message type 'hologram'" in conv.warnings and conv.fidelity == "partial"
 
 
-@NOT_YET
 def test_session_of_only_unknown_rows_is_unreadable_not_empty(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     conn = sqlite3.connect(str(p))
@@ -202,7 +192,6 @@ def test_session_of_only_unknown_rows_is_unreadable_not_empty(tmp_path):
         _load(p)
 
 
-@NOT_YET
 def test_errored_assistant_turn_has_no_usage_record(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     _set_message(p, "msg_a1", {   # a provider error: no tokens, no cost, text so far kept
@@ -213,7 +202,6 @@ def test_errored_assistant_turn_has_no_usage_record(tmp_path):
     assert conv.usage == []
 
 
-@NOT_YET
 def test_text_item_that_is_not_a_string_is_skipped(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     _set_message(p, "msg_a1", {"model": MODEL, "time": {"created": T0 + 1000}, "content": [
@@ -222,14 +210,12 @@ def test_text_item_that_is_not_a_string_is_skipped(tmp_path):
     assert [m.text for m in conv.messages if m.role == "assistant"] == ["kept"]
 
 
-@NOT_YET
 def test_child_session_carries_subagent_relation(ocdb):
     conv, _ = _load(ocdb, "ses_child")
     assert conv.relation == ("subagent", "opencode:ses_1")
     assert conv.first_prompt == "find translation files"
 
 
-@NOT_YET
 def test_revert_drops_reverted_turns(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     _set_revert(p, {"messageID": "msg_a1"})
@@ -238,7 +224,6 @@ def test_revert_drops_reverted_turns(tmp_path):
     assert conv.usage == []
 
 
-@NOT_YET
 def test_revert_with_part_boundary_keeps_earlier_items(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     _set_revert(p, {"messageID": "msg_a1", "partID": "prt_a5"})
@@ -247,7 +232,6 @@ def test_revert_with_part_boundary_keeps_earlier_items(tmp_path):
         ("user", KIND_TEXT), ("assistant", KIND_THINKING), ("assistant", KIND_TEXT)]
 
 
-@NOT_YET
 def test_tool_error_text_is_indexed(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     _set_message(p, "msg_a1", {
@@ -260,7 +244,6 @@ def test_tool_error_text_is_indexed(tmp_path):
     assert shell.text.endswith("STATUS: error\nERROR: command not found: x")
 
 
-@NOT_YET
 def test_malformed_row_json_is_a_warning_and_partial_fidelity(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     _set_message(p, "msg_a1", "{not json")
@@ -269,7 +252,6 @@ def test_malformed_row_json_is_a_warning_and_partial_fidelity(tmp_path):
     assert [m.role for m in conv.messages] == ["user"]
 
 
-@NOT_YET
 def test_content_that_is_not_a_list_is_malformed(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     _set_message(p, "msg_a1", {"model": MODEL, "time": {"created": T0 + 1000}, "content": "nope"})
@@ -277,7 +259,6 @@ def test_content_that_is_not_a_list_is_malformed(tmp_path):
     assert "malformed message json msg_a1" in conv.warnings and [m.role for m in conv.messages] == ["user"]
 
 
-@NOT_YET
 def test_all_malformed_session_is_unreadable_not_empty(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     conn = sqlite3.connect(str(p))
@@ -287,14 +268,12 @@ def test_all_malformed_session_is_unreadable_not_empty(tmp_path):
         _load(p)
 
 
-@NOT_YET
 def test_load_excludes_indexers_own_prompt(tmp_path):
     from convo_index.config import CLASSIFY_PROMPT_PREFIX
     p = make_opencode_v2_db(tmp_path / "oc.db", first_prompt=CLASSIFY_PROMPT_PREFIX + " ...")
     assert _load(p) is None
 
 
-@NOT_YET
 def test_migrated_db_that_still_carries_1x_tables_reads_the_2x_layout(tmp_path):
     from tests.test_opencode import _SCHEMA as V1_SCHEMA
     p = make_opencode_v2_db(tmp_path / "oc.db")
@@ -308,7 +287,6 @@ def test_migrated_db_that_still_carries_1x_tables_reads_the_2x_layout(tmp_path):
     assert [r.native_id for r in oc.OpencodeAdapter(p).discover()] == ["ses_1"]
 
 
-@NOT_YET
 def test_check_schema_covers_every_column_load_reads(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     conn = sqlite3.connect(str(p))
@@ -317,7 +295,6 @@ def test_check_schema_covers_every_column_load_reads(tmp_path):
         list(oc.OpencodeAdapter(p).discover())
 
 
-@NOT_YET
 def test_user_row_without_text_is_malformed_not_silently_empty(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     _set_message(p, "msg_u1", {"text": 42, "time": {"created": T0}})
@@ -326,7 +303,6 @@ def test_user_row_without_text_is_malformed_not_silently_empty(tmp_path):
     assert conv.first_prompt == "" and len(conv.messages) == 4
 
 
-@NOT_YET
 def test_item_without_a_type_is_malformed(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     _set_message(p, "msg_a1", {"model": MODEL, "time": {"created": T0 + 1000}, "content": [
@@ -336,7 +312,6 @@ def test_item_without_a_type_is_malformed(tmp_path):
     assert "malformed part json msg_a1/0" in conv.warnings
 
 
-@NOT_YET
 def test_wrongly_typed_nested_fields_do_not_abort_the_load(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     _set_message(p, "msg_a1", {"model": MODEL, "time": 3, "tokens": [1], "cost": "free", "content": [
@@ -350,7 +325,6 @@ def test_wrongly_typed_nested_fields_do_not_abort_the_load(tmp_path):
     assert conv.usage == [] and "malformed part json msg_a1/2" in conv.warnings
 
 
-@NOT_YET
 def test_absent_part_boundary_cuts_at_the_first_later_tool_id(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     content = [{"type": "text", "text": f"t{i}"} for i in range(11)]
@@ -363,7 +337,6 @@ def test_absent_part_boundary_cuts_at_the_first_later_tool_id(tmp_path):
     assert assistant[0].text.endswith("t10") and [m.native_id for m in assistant[1:]] == ["prt_b"]
 
 
-@NOT_YET
 def test_exact_part_boundary_wins_over_the_fallback(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     _set_message(p, "msg_a1", {"model": MODEL, "time": {"created": T0 + 1000}, "content": [
@@ -375,7 +348,6 @@ def test_exact_part_boundary_wins_over_the_fallback(tmp_path):
     assert [m.native_id for m in conv.messages if m.role == "assistant"] == ["msg_a1/0", "prt_b"]
 
 
-@NOT_YET
 def test_warnings_from_reverted_rows_do_not_make_an_empty_session_unreadable(tmp_path):
     p = make_opencode_v2_db(tmp_path / "oc.db")
     conn = sqlite3.connect(str(p))
@@ -385,7 +357,6 @@ def test_warnings_from_reverted_rows_do_not_make_an_empty_session_unreadable(tmp
     assert _load(p) is None
 
 
-@NOT_YET
 def test_schema_error_names_both_layouts(tmp_path):
     p = tmp_path / "weird.db"
     conn = sqlite3.connect(str(p)); conn.execute("CREATE TABLE session(id text)"); conn.commit(); conn.close()
