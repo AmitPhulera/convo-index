@@ -42,6 +42,7 @@ Hugging Face into `models/` next to the database, and nothing leaves the machine
     convo-index doctor  # what will be indexed, which backends will be called, what is failing
     convo-index index   # build/refresh convos.db (incremental)
     convo-index serve   # browse at http://127.0.0.1:9753
+    convo-index stop    # stop the running UI server (running browser turns end first)
     convo-index search "kubernetes crash" --source codex --since 30d   # from the terminal
     convo-index export <id> --md          # one conversation as Markdown (or JSON without --md)
     convo-index backup ~/backups/         # WAL-safe copy of the database
@@ -172,6 +173,13 @@ check that the closing flags still hold after a tool upgrade.
     convo-index service install             # keep `convo-index serve` running from login (same mechanisms; @reboot line for cron)
     convo-index service status
     convo-index service uninstall
+
+`convo-index stop`, or the power button in the UI's header, stops the running server without
+uninstalling the service: running browser turns end, the server exits cleanly, and the service
+(which restarts it only after a crash) starts it again at the next login; `convo-index serve`
+or `up` start it sooner. Both go through `POST /api/shutdown`, which needs the turn token, a
+request from this machine and no proxy in between; the button is disabled in a tab that was
+not opened through the URL `serve` or `up` prints. `service uninstall` keeps it off for good.
 
 Time comes from `[schedule] hour/minute` in the config (default 21:00 local); the log is
 `refresh.log` next to the database. The job runs `convo-index index`, which is incremental and
