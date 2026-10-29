@@ -750,8 +750,23 @@ $("refresh").addEventListener("click", async () => {
 // The compact title in the sticky bar only shows once the big one has scrolled away.
 $("detail-pane").addEventListener("scroll", () => $("detail-pane").classList.toggle("scrolled", $("detail-pane").scrollTop > 60));
 
+// The turn token arrives in the fragment of the URL `serve` and `up` print (#turns=<token>).
+// It is kept for this tab (sessionStorage outlives a reload, never leaves the browser) and
+// taken out of the address bar before the fragment is read as a conversation id.
+let turnToken = null;
+try { turnToken = sessionStorage.getItem("turnToken"); } catch (e) { /* storage blocked */ }
+function takeTurnToken() {
+  const m = /^#turns=([A-Za-z0-9_-]+)$/.exec(location.hash);
+  if (!m) return false;
+  turnToken = m[1];
+  try { sessionStorage.setItem("turnToken", turnToken); } catch (e) { /* kept in memory only */ }
+  history.replaceState(null, "", location.pathname + location.search);
+  return true;
+}
+
 // Back/forward and hand-edited hashes open the named conversation; an empty hash closes it.
 window.addEventListener("hashchange", () => {
+  if (takeTurnToken()) return;
   let id = location.hash.slice(1);
   try { id = decodeURIComponent(id); } catch (e) { /* use as-is */ }
   if (!id) { if (selectedId) closeDetail(); return; }
@@ -764,6 +779,7 @@ const debouncedSearch = debounce(runSearch, 220);
 // Deep link: open the conversation named in the URL hash (bookmarkable / shareable).
 // Also honor ?q= / ?category= / ?source= / ?project= (used by the analytics page links).
 async function init() {
+  takeTurnToken();
   applyTranscriptView(transcriptViewPref());
   const p = new URLSearchParams(location.search);
   if (p.get("q")) { $("q").value = p.get("q"); $("search-box").classList.add("has-value"); }

@@ -148,10 +148,11 @@ about is denied and reported as a `denied` event, so the step can be finished in
 
 Turns are accepted only on a loopback listener, from a loopback peer, when the browser
 addresses the server by a loopback name, with no proxy header present, and with the server's
-turn token: a secret generated per server start, written to `turn-token` next to the database
-(readable by you only, and only once the port is bound) and carried in the fragment of the URL
-that `convo-index serve` prints on a terminal and `up` prints and opens; the login service's
-log never holds it. A page reached any other way, a reverse proxy on this machine, or a
+turn token: a secret kept in `turn-token` next to the database (readable by you only; a
+restarted server keeps it, a file others can read gets a new one) and carried in the fragment of
+the URL that `convo-index serve` prints on a terminal and `up` prints and opens. The page moves
+it out of the address bar into the tab's session storage, so a reload keeps it; the login
+service's log never holds it. A page reached any other way, a reverse proxy on this machine, or a
 client that only has what the HTTP API serves cannot run turns; everything else keeps
 working, and with `[server] host = "0.0.0.0"` the endpoint answers 403. A
 conversation whose transcript changed in the last 30 seconds is refused as well (it is
