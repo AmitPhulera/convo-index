@@ -261,14 +261,15 @@ def handle_analytics():
 _refresh_lock = threading.Lock()
 
 
-def _run_indexer():
+def _run_indexer(derived=True):
     """Run a refresh in a subprocess. Returns {"ok", "busy", "totals"}: busy when another
     indexer (this server, the scheduler or the CLI) already holds the lock, ok only when
-    every source and conversation indexed cleanly."""
+    every source and conversation indexed cleanly. `derived=False` ingests only, leaving
+    summaries and vectors to the next full run."""
     if not _refresh_lock.acquire(blocking=False):
         return {"ok": False, "busy": True, "totals": None}
     try:
-        res = subprocess.run([sys.executable, "-m", "convo_index.indexer"],
+        res = subprocess.run([sys.executable, "-m", "convo_index.indexer"] + ([] if derived else ["--no-jobs"]),
                              capture_output=True, text=True, check=False)
         if res.returncode == EXIT_LOCKED:
             return {"ok": False, "busy": True, "totals": None}
@@ -287,6 +288,12 @@ def _run_indexer():
 
 # --- Browser turns -------------------------------------------------------------------------------
 
+def _refresh_after_turn():
+    """The refresh a turn waits for before its terminal event: ingest only, so `done` never
+    waits for a queue of LLM summaries (the next scheduled or manual refresh runs those)."""
+    return _run_indexer(derived=False)
+
+
 TURN_TOKEN_HEADER = "X-Convo-Index-Turn"
 _turn_token = None          # per server process; see turn_token()
 RUNNER = None               # one TurnRunner per server process, built from settings on first use
@@ -301,7 +308,7 @@ def _runner():
         if RUNNER is None:
             t = CFG.load()["ui"]["turns"]
             RUNNER = TURNS.TurnRunner(timeout=int(t.get("timeout_seconds") or 1200),
-                                      max_concurrent=int(t.get("max_concurrent") or 2), refresh=_run_indexer)
+                                      max_concurrent=int(t.get("max_concurrent") or 2), refresh=_refresh_after_turn)
             RUNNER.closed = _stopping
         return RUNNER
 

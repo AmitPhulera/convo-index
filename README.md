@@ -129,7 +129,7 @@ The UI server can run one more turn of an indexed conversation in the tool that 
 (`claude -p --resume`, `opencode run --session`). The tool appends the turn to its own
 transcript, so `claude --resume <id>` or `opencode --session <id>` in a terminal afterwards
 sees exactly what happened in the browser, and the index is refreshed before the turn is
-reported finished. Claude Code and Opencode are supported today; the other sources will follow.
+reported finished (ingest only: its summary and tags come with the next full refresh). Claude Code and Opencode are supported today; the other sources will follow.
 
     POST   /api/conversation/<id>/turn   {"prompt": "...", "edits": false}   -> {"turn_id": ...}
     GET    /api/turn/<turn_id>?after=<n>  server-sent events: text, tool, tool_result, denied, done | error

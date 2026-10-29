@@ -426,3 +426,24 @@ def test_archives_are_namespaced_by_source(tmp_path, monkeypatch):
                          messages=[Message(seq=0, role="user", text="hello")])
     indexer.index_conversation(conn, other, "r", settings=settings)
     assert len(list(settings.archive_dir().glob("*.jsonl"))) == 2                   # same native id, two copies
+
+
+def test_run_without_derived_jobs_ingests_only(tmp_path, monkeypatch):
+    settings = _quiet(monkeypatch, tmp_path)
+    from convo_index import jobs
+    calls = []
+    monkeypatch.setattr(jobs, "dispatch", lambda *a, **k: calls.append("dispatch") or {})
+    monkeypatch.setattr(jobs, "backfill_vectors", lambda *a, **k: calls.append("backfill") or 0)
+    projects = tmp_path / "projects"
+    _make_file(projects, "s1", "/x", "real content")
+    totals = indexer.run([ClaudeCodeAdapter(projects)], tmp_path / "t.db", settings, derived=False)
+    assert totals["indexed"] == 1 and totals["jobs"] == {} and calls == []
+    indexer.run([ClaudeCodeAdapter(projects)], tmp_path / "t.db", settings)
+    assert calls == ["dispatch", "backfill"]
+
+
+def test_main_no_jobs_flag(monkeypatch):
+    seen = []
+    monkeypatch.setattr(indexer, "run", lambda derived=True: seen.append(derived) or {"failed": 0})
+    assert indexer.main(["--no-jobs"]) == indexer.EXIT_OK and indexer.main([]) == indexer.EXIT_OK
+    assert seen == [False, True]

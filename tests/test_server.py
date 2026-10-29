@@ -368,3 +368,14 @@ def test_serve_steps_aside_when_the_port_is_taken(tmp_path, monkeypatch, capsys)
         holder.server_close()
     assert "already served" in capsys.readouterr().out
     assert token_file.read_text() == "live-servers-token"      # the running server's token is left alone
+
+
+def test_refresh_after_turn_skips_derived_jobs(monkeypatch):
+    seen = []
+
+    class R:
+        returncode, stdout, stderr = 0, '{"indexed": 1, "failed": 0}', ""
+    monkeypatch.setattr(server.subprocess, "run", lambda argv, **k: seen.append(argv) or R())
+    assert server._refresh_after_turn()["ok"] is True
+    server._run_indexer()
+    assert seen[0][-1] == "--no-jobs" and "--no-jobs" not in seen[1]

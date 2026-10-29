@@ -475,7 +475,7 @@ def test_concurrent_first_requests_share_one_runner(tmp_path, monkeypatch):
     for t in ts:
         t.join()
     assert len(seen) == 16 and all(r is seen[0] for r in seen)
-    assert seen[0].max_concurrent == 2 and seen[0].timeout == 1200 and seen[0].refresh is server._run_indexer
+    assert seen[0].max_concurrent == 2 and seen[0].timeout == 1200 and seen[0].refresh is server._refresh_after_turn
 
 
 def test_stop_turns_ends_running_harnesses_and_closes_admission(site, monkeypatch):

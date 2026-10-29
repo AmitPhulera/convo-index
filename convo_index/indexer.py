@@ -201,19 +201,21 @@ def index_conversation(conn, conv: Conversation, revision, embed_fn=None, summar
     return stats
 
 
-def run(adapters=None, db_path=None, settings=None):
-    """Index every enabled source. Returns totals, or None when another indexer holds the lock."""
+def run(adapters=None, db_path=None, settings=None, derived=True):
+    """Index every enabled source. Returns totals, or None when another indexer holds the lock.
+    `derived=False` skips the derived-job dispatch (summaries, vectors, tagging): the new
+    content is searchable at once and the next full run picks the jobs up."""
     settings = settings or S.load()
     db_path = db_path or settings.db_path()
     try:
         with index_lock(db_path):
-            return _run(adapters, db_path, settings)
+            return _run(adapters, db_path, settings, derived)
     except IndexLocked as e:
         print(f"skipped: {e}", file=sys.stderr)
         return None
 
 
-def _run(adapters, db_path, settings):
+def _run(adapters, db_path, settings, derived=True):
     conn = dbm.connect(db_path)
     dbm.init_schema(conn, db_path, have_lock=True, dim=settings["embeddings"].get("dim"))  # run() holds the lock
     totals = {"indexed": 0, "skipped": 0, "removed": 0, "failed": 0, "sources": {}, "warnings": [],
@@ -276,8 +278,9 @@ def _run(adapters, db_path, settings):
     # summaries first (they feed the conversation vector), then conversation vectors (they
     # feed the tag prompt's examples), then LLM tagging of the groups still open.
     try:
-        totals["jobs"] = jobs.dispatch(conn, settings, embed_fn=embed_fn, embedder_fp=embedder_fp)
-        totals["jobs"]["vectors_backfilled"] = jobs.backfill_vectors(conn, embed_fn, settings=settings)
+        if derived:
+            totals["jobs"] = jobs.dispatch(conn, settings, embed_fn=embed_fn, embedder_fp=embedder_fp)
+            totals["jobs"]["vectors_backfilled"] = jobs.backfill_vectors(conn, embed_fn, settings=settings)
     except Exception as e:
         totals["failed"] += 1
         print(f"WARN: derived jobs failed: {e}", file=sys.stderr)
@@ -288,8 +291,10 @@ def _run(adapters, db_path, settings):
     return totals
 
 
-def main():
-    totals = run()
+def main(argv=None):
+    # --no-jobs: ingest only (the server's post-turn refresh, which must not wait for LLM calls)
+    argv = sys.argv[1:] if argv is None else argv
+    totals = run(derived="--no-jobs" not in argv)
     if totals is None:
         return EXIT_LOCKED
     return EXIT_FAILED if totals["failed"] else EXIT_OK
