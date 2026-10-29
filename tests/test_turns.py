@@ -516,3 +516,26 @@ def test_refresh_runs_even_when_the_turn_was_stopped():
     r.stop(t.id)
     last = drain(r, t)[-1]
     assert calls == [1] and last["kind"] == "error" and last["indexed"] is True
+
+
+def test_activity_is_sampled_before_the_output_drains():
+    """A terminal write while the readers are still draining is not the browser's own."""
+    marker, calls, release = [1.0], [], threading.Event()
+
+    def slow_translate(line):
+        release.wait(10)
+        return translate(line)
+
+    def activity():
+        calls.append(marker[0])
+        return marker[0]
+    r = turns.TurnRunner(refresh=ok_refresh)
+    t = r.start("claude_code:s1", command([{"line": '{"kind": "text", "text": "hi"}'}]), slow_translate,
+                activity=activity)
+    deadline = time.time() + 5
+    while not calls and time.time() < deadline:
+        time.sleep(0.05)
+    marker[0] = 2.0                          # the terminal writes while the translator is still busy
+    release.set()
+    wait_done(t)
+    assert t.activity_after == 1.0 and r.last_own_activity("claude_code:s1") == 1.0

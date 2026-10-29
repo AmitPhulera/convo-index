@@ -358,6 +358,14 @@ class TurnRunner:
             _kill_group(turn)
             turn.proc.wait()
         turn.exit_code = turn.proc.returncode
+        # The marker is read the moment the harness is gone, before the readers drain: a
+        # terminal write during the drain must not pass for the browser's own (a descendant
+        # still writing afterwards only makes the next turn's recent-activity check stricter).
+        if turn.activity is not None:
+            try:
+                turn.activity_after = turn.activity()
+            except Exception:
+                turn.activity_after = None
         # Every line the harness wrote must be in the buffer before the terminal event. The
         # readers end when the pipes close; a descendant that inherited them and outlived the
         # harness keeps them open, so after a grace period the group is ended, and it is ended
@@ -371,11 +379,6 @@ class TurnRunner:
             t.join(GRACE)
         unread = any(t.is_alive() for t in turn.readers)
         turn.outcome = self._outcome(turn, unread)   # latched now: a late stop() changes nothing
-        if turn.activity is not None:
-            try:
-                turn.activity_after = turn.activity()
-            except Exception:
-                turn.activity_after = None
         self._finish(turn)
         if turn.job is not None:
             winjob.close(turn.job)
