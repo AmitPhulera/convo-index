@@ -221,6 +221,16 @@ def test_oversized_or_negative_bodies_are_refused(site):
         assert res.status == 413 and "bytes" in json.loads(body)["error"]
 
 
+def test_a_malformed_content_length_is_a_bad_request(site):
+    conn = http.client.HTTPConnection("127.0.0.1", site.port, timeout=10)
+    conn.putrequest("POST", f"/api/conversation/{CID}/turn", skip_host=True)
+    conn.putheader("Host", f"127.0.0.1:{site.port}"); conn.putheader(server.CSRF_HEADER, "1")
+    conn.putheader(server.TURN_TOKEN_HEADER, server.turn_token())
+    conn.putheader("Content-Length", "abc"); conn.endheaders()
+    res = conn.getresponse(); res.read(); conn.close()
+    assert res.status == 400 and site.runner.running() == 0
+
+
 def test_last_event_id_resumes_like_after(site):
     status, body = start(site, claude_lines("a", "b", "c"))
     sse_events(site, body["turn_id"])

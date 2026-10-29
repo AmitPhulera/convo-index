@@ -433,13 +433,18 @@ def turns_refusal(server_address, client_address, headers=None):
     return None
 
 
+class BodyTooLarge(ValueError):
+    """A request body outside the accepted size."""
+
+
 PROXY_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP", "Via")
 MAX_TURN_BODY = 1024 * 1024
 PROMPT_FORBIDDEN = {chr(c) for c in range(32)} - {"\n", "\r", "\t"}
 
 
 def turn_preconditions(conversation_id, prompt, edits, cfg=None):
-    """Everything that must hold before a harness is spawned. Returns (conversation_id, command);
+    """Everything that must hold before a harness is spawned. Returns (conversation_id, command,
+    locator);
     raises TurnRefused with the status and the message the UI shows verbatim."""
     cfg = cfg or CFG.load()
     if not cfg["ui"]["turns"].get("enabled", True):
@@ -670,10 +675,14 @@ class Handler(BaseHTTPRequestHandler):
             return   # the client went away; the turn does not
 
     def _json_body(self, limit=MAX_TURN_BODY):
-        """The request body as JSON; raises ValueError for a negative or oversized length."""
-        length = int(self.headers.get("Content-Length") or 0)
+        """The request body as JSON. Raises BodyTooLarge for a negative or oversized length and
+        json.JSONDecodeError for a body (or a Content-Length) that is not what it says."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise json.JSONDecodeError("Content-Length is not a number", "", 0) from None
         if not 0 <= length <= limit:
-            raise ValueError(f"body must be between 0 and {limit} bytes")
+            raise BodyTooLarge(f"body must be between 0 and {limit} bytes")
         raw = self.rfile.read(length) if length else b"{}"
         return json.loads(raw or b"{}")
 
@@ -703,9 +712,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 try:
                     body = self._json_body()
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, UnicodeDecodeError):
                     return self._send(400, json.dumps({"error": "invalid json"}))
-                except ValueError as e:
+                except BodyTooLarge as e:
                     return self._send(413, json.dumps({"error": str(e)}))
                 return self._send(*handle_turn_start(_segment(path[:-len("/turn")], "/api/conversation/"), body))
             if path.startswith("/api/hide/"):

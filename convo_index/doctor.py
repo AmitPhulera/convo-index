@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import os
 import shutil
 import urllib.request
 
@@ -12,7 +11,7 @@ from convo_index import jobs
 from convo_index import settings as S
 from convo_index.lock import index_lock, IndexLocked
 from convo_index.providers import registry as R
-from convo_index.sources.base import all_adapters, TURN_MODULES
+from convo_index.sources.base import all_adapters, is_windows, TURN_MODULES
 
 
 def _embedding_model_present(spec):
@@ -165,7 +164,7 @@ def harness_report(settings):
     for source, module in TURN_MODULES.items():
         binary = {"claude_code": "claude", "opencode": "opencode"}.get(source, source)
         mod = importlib.import_module(module)
-        on_platform = bool(getattr(mod, "TURNS_ON_WINDOWS", True) or os.name != "nt")
+        on_platform = bool(getattr(mod, "TURNS_ON_WINDOWS", True) or not is_windows())   # as supports_turns()
         launcher = mod.launcher() if on_platform else None     # what a turn would actually run
         out["harnesses"][source] = {"binary": binary, "path": shutil.which(binary),
                                     "supported_here": on_platform, "launcher": launcher}
