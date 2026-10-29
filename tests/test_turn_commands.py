@@ -63,6 +63,19 @@ def test_claude_windows_npm_shim_is_bypassed_for_node(monkeypatch, tmp_path):
     assert not any(a.lower().endswith(".cmd") for a in cmd.argv)
 
 
+def test_claude_windows_npm6_shim_is_bypassed_for_node(monkeypatch, tmp_path):
+    shim = tmp_path / "claude.cmd"
+    script = tmp_path / "node_modules" / "@anthropic-ai" / "claude-code" / "cli.js"
+    script.parent.mkdir(parents=True)
+    script.write_text("// entry")
+    shim.write_text('@IF EXIST "%~dp0\\node.exe" (\r\n  "%~dp0\\node.exe"  '
+                    '"%~dp0\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n) ELSE (\r\n'
+                    '  node  "%~dp0\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n)\r\n')
+    monkeypatch.setattr(base, "is_windows", lambda: True)
+    monkeypatch.setattr(cc.shutil, "which", lambda name: {"claude": str(shim), "node": "C:\\node\\node.exe"}.get(name))
+    assert cc.turn_command("abc", "x", "C:\\proj").argv[:2] == ["C:\\node\\node.exe", str(script)]
+
+
 def test_claude_windows_shim_without_a_script_is_refused(monkeypatch, tmp_path):
     shim = tmp_path / "claude.cmd"
     shim.write_text("@ECHO off\r\nsomething else\r\n")

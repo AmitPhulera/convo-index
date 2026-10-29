@@ -394,12 +394,13 @@ TURN_TEXT_LIMIT = 400         # chars of a tool input/result shown in a turn eve
 
 
 def _script_from_shim(shim):
-    """The JavaScript entry an npm `.cmd` shim runs ("%dp0%\\node_modules\\...\\cli.js")."""
+    """The JavaScript entry an npm `.cmd` shim runs: "%dp0%\\node_modules\\...\\cli.js" (npm 7+,
+    which sets dp0 from %~dp0 first) or "%~dp0\\node_modules\\...\\cli.js" (npm 6)."""
     try:
         text = Path(shim).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    m = re.search(r'"%(?:~)?dp0%\\?([^"]+?\.c?js)"', text)
+    m = re.search(r'"%(?:~dp0|dp0%)\\?([^"]+?\.c?js)"', text)
     return str(Path(shim).parent.joinpath(*m.group(1).replace("\\", "/").strip("/").split("/"))) if m else None
 
 
