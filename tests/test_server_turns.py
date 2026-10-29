@@ -303,6 +303,10 @@ def test_main_writes_the_token_after_binding_and_prints_it_only_to_a_terminal(tm
 
         def serve_forever(self):
             raise KeyboardInterrupt
+
+        def server_close(self):
+            closed.append(1)
+    closed = []
     monkeypatch.setattr(server, "make_server", lambda host, port, extra_hosts=(): Fake())
     monkeypatch.setattr(server.signal, "signal", lambda *a: None)
     for tty, expect in ((True, f"#turns={server.turn_token()}"), (False, f"(turn token in {token_file})")):
@@ -311,7 +315,8 @@ def test_main_writes_the_token_after_binding_and_prints_it_only_to_a_terminal(tm
         assert server.main() == 0
         out = capsys.readouterr().out
         assert expect in out and token_file.read_text() == server.turn_token()
-        assert (server.turn_token() in out) is tty
+        assert (server.turn_token() in out) is tty and "server stopped" in out
+    assert closed == [1, 1]                                            # the port is released on the way out
 
 
 def test_the_turn_token_is_written_for_the_cli_only(site):
@@ -533,3 +538,49 @@ def test_a_runner_created_after_stop_is_born_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_stopping", False)
     assert server.stop_turns() == 0
     assert server._runner().closed is True
+
+
+def shutdown(site, port=None, headers=None, csrf=True, token=True):
+    conn = http.client.HTTPConnection("127.0.0.1", port or site.port, timeout=10)
+    h = {"Host": f"127.0.0.1:{port or site.port}", **(headers or {})}
+    if csrf:
+        h[server.CSRF_HEADER] = "1"
+    if token:
+        h[server.TURN_TOKEN_HEADER] = server.turn_token()
+    conn.request("POST", "/api/shutdown", body="{}", headers=h)
+    res = conn.getresponse(); body = json.loads(res.read()); conn.close()
+    return res.status, body
+
+
+@pytest.mark.parametrize("kw, needle", [
+    ({"token": False}, "turn token"),
+    ({"csrf": False}, ""),
+    ({"headers": {"X-Forwarded-For": "10.0.0.1"}}, "proxy"),
+])
+def test_shutdown_is_refused_without_the_token_csrf_or_through_a_proxy(site, kw, needle):
+    status, body = shutdown(site, **kw)
+    assert status == 403 and needle in body["error"]
+    assert request(site, "GET", "/api/config")[0] == 200            # still serving
+
+
+def test_shutdown_from_a_remote_peer_is_refused():
+    assert "only from this machine" in server.shutdown_refusal(("192.168.1.5", 4000), {})
+    assert server.shutdown_refusal(("127.0.0.1", 4000), {server.TURN_TOKEN_HEADER: server.turn_token()}) is None
+
+
+def test_shutdown_ends_running_turns_then_the_serve_loop(site, monkeypatch):
+    monkeypatch.setattr(server, "_stopping", False)                 # restored for the tests after this one
+    status, body = start(site, claude_lines("one")[:2] + [{"sleep": 30}])
+    assert status == 200
+    turn = site.runner.get(body["turn_id"])
+    srv = server.make_server("127.0.0.1", 0)
+    loop = threading.Thread(target=srv.serve_forever, daemon=True)
+    loop.start()
+    assert shutdown(site, port=srv.server_address[1]) == (202, {"ok": True, "stopping": True})
+    loop.join(20)
+    assert not loop.is_alive()
+    deadline = time.time() + 20
+    while not turn.done and time.time() < deadline:
+        time.sleep(0.05)
+    assert turn.done and site.runner.closed
+    srv.server_close()
