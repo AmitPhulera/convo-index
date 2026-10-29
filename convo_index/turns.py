@@ -384,6 +384,10 @@ class TurnRunner:
             winjob.close(turn.job)
 
     def _outcome(self, turn, unread):
+        if turn.kill_reason == "stopped" and turn.exit_code == 0:
+            # stop() saw the harness running, but it finished on its own before the signal (a
+            # signalled harness never exits 0: POSIX reports the signal, the job exits with 1)
+            turn.kill_reason = None
         ok = turn.exit_code == 0 and turn.harness_error is None and turn.kill_reason is None and not unread
         if ok:
             return True, None

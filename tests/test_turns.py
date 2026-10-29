@@ -539,3 +539,12 @@ def test_activity_is_sampled_before_the_output_drains():
     release.set()
     wait_done(t)
     assert t.activity_after == 1.0 and r.last_own_activity("claude_code:s1") == 1.0
+
+
+def test_a_stop_that_loses_the_race_to_a_clean_exit_is_not_an_error():
+    r = turns.TurnRunner()
+    t = turns.Turn("claude_code:s1", False)
+    t.kill_reason, t.exit_code = "stopped", 0
+    assert r._outcome(t, False) == (True, None)
+    t.kill_reason, t.exit_code = "stopped", -15
+    assert r._outcome(t, False) == (False, "stopped")
