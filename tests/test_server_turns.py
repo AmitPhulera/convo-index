@@ -315,6 +315,33 @@ def test_the_turn_token_is_written_for_the_cli_only(site):
     assert server.read_turn_token(make_settings(site.tmp / "elsewhere")) is None
 
 
+def test_a_restarted_server_keeps_a_private_well_formed_token(site, monkeypatch):
+    path = site.settings.db_path().with_name("turn-token")
+    saved = "A" * 32
+    path.write_text(saved)
+    os.chmod(path, 0o600)
+    monkeypatch.setattr(server, "_turn_token", None)
+    assert server.adopt_turn_token(site.settings) == saved and server.turn_token() == saved
+    for content, mode in (("short", 0o600), ("B" * 32, 0o644)):
+        if os.name == "nt" and mode == 0o644:
+            continue
+        path.write_text(content)
+        os.chmod(path, mode)
+        monkeypatch.setattr(server, "_turn_token", None)
+        assert server.adopt_turn_token(site.settings) is None and server.turn_token() not in (content, saved)
+    path.unlink()
+    assert server.adopt_turn_token(site.settings) is None
+
+
+def test_up_waits_briefly_for_the_token_file(monkeypatch):
+    from convo_index import cli
+    reads = iter([None, None, "tok"])
+    fake = type("S", (), {"read_turn_token": staticmethod(lambda settings: next(reads))})
+    assert cli._turn_token_of_running_server(fake, None, seconds=5) == "tok"
+    fake.read_turn_token = staticmethod(lambda settings: None)
+    assert cli._turn_token_of_running_server(fake, None, seconds=0.2) is None
+
+
 @pytest.mark.parametrize("body, status, needle", [
     ({"prompt": ""}, 400, "prompt is required"),
     ({"prompt": "x", "edits": "yes"}, 400, "edits must be a JSON boolean"),

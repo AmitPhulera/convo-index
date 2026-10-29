@@ -2,6 +2,7 @@ import errno
 import ipaddress
 import os
 import json
+import re
 import secrets
 import signal
 import socket
@@ -325,12 +326,13 @@ def stop_turns():
 
 
 def turn_token():
-    """The secret a turn request must carry. It is generated once per server process and
-    written, once the port is bound, to a file only this user can read, next to the database;
-    `serve` on a terminal and `up` put it in the fragment of the URL they print and open, so a
-    page reached through that URL has it and nothing served over HTTP ever does. That is what
-    keeps a reverse proxy on this machine out: it can forward requests, but not read the file
-    or the terminal."""
+    """The secret a turn request must carry. It lives in a file only this user can read, next
+    to the database, and is kept across restarts (see adopt_turn_token): a tab that already
+    holds it, and `up` reading the file while a restarted server binds, stay valid. `serve` on
+    a terminal and `up` put it in the fragment of the URL they print and open, so a page
+    reached through that URL has it and nothing served over HTTP ever does. That is what keeps
+    a reverse proxy on this machine out: it can forward requests, but not read the file or the
+    terminal."""
     global _turn_token
     with _runner_lock:
         if _turn_token is None:
@@ -340,6 +342,28 @@ def turn_token():
 
 def turn_token_path(settings=None):
     return (settings or CFG.load()).db_path().with_name("turn-token")
+
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
+
+
+def adopt_turn_token(settings=None):
+    """Take over the token the previous server wrote, when the file is well-formed and (on
+    POSIX) private to this user; otherwise turn_token() makes a new one. Returns the token
+    adopted, or None."""
+    global _turn_token
+    path = turn_token_path(settings)
+    try:
+        if os.name != "nt" and path.stat().st_mode & 0o077:
+            return None                   # readable by others: the old secret is not one any more
+    except OSError:
+        return None
+    saved = read_turn_token(settings)
+    if not saved or not TOKEN_RE.fullmatch(saved):
+        return None
+    with _runner_lock:
+        _turn_token = saved
+    return saved
 
 
 def write_turn_token(settings=None):
@@ -781,6 +805,7 @@ def main():
         # so a service manager does not restart this one in a loop
         print(f"{advertised_url(host, port)} is already served by another process; nothing to do")
         return 0
+    adopt_turn_token(cfg)                     # the same secret across restarts
     token_file = write_turn_token(cfg)        # only once the port is ours: a stepped-aside serve must not replace it
     if sys.stdout.isatty():                   # a person at a terminal gets the one-click URL; a service log never holds the secret
         print(f"serving on {advertised_url(host, srv.server_address[1], turn_token())}")
