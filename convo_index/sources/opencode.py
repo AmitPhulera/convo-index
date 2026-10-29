@@ -570,6 +570,18 @@ def _clip(value, limit=TOOL_TEXT_LIMIT // 10):
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+def _error_message(err):
+    """The readable part of an opencode error object (or the string it already is)."""
+    if isinstance(err, str) and err:
+        return err
+    if isinstance(err, dict):
+        data = err.get("data") if isinstance(err.get("data"), dict) else {}
+        for value in (data.get("message"), err.get("message"), err.get("name")):
+            if isinstance(value, str) and value:
+                return value
+    return "turn failed"
+
+
 def turn_events(line):
     """Events for one `--format json` line of `opencode run`: text parts, tool parts (one event
     per status update) and an error event for a failed step. step markers and anything
@@ -578,7 +590,12 @@ def turn_events(line):
         d = json.loads(line)
     except (json.JSONDecodeError, TypeError):
         return []
-    if not isinstance(d, dict) or not isinstance(d.get("part"), dict):
+    if not isinstance(d, dict):
+        return []
+    if d.get("type") == "error" and not isinstance(d.get("part"), dict):
+        # a failed step: {"type": "error", "error": {"name", "data": {"message"}}}, no part
+        return [{"kind": "error", "message": _clip(_error_message(d.get("error")), 2000)}]
+    if not isinstance(d.get("part"), dict):
         return []
     part, kind = d["part"], d.get("type")
     if kind == "text" and isinstance(part.get("text"), str) and part["text"]:

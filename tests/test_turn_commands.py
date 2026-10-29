@@ -228,6 +228,16 @@ def test_opencode_stream_is_translated():
         {"kind": "error", "message": "no provider"}]
 
 
+def test_opencode_step_failure_without_a_part_keeps_its_message():
+    """`opencode run --format json` reports a failed step at the top level, with no part."""
+    line = {"type": "error", "timestamp": 1, "sessionID": "ses_1",
+            "error": {"name": "APIError", "data": {"message": "rate limited", "statusCode": 429}}}
+    assert oc.turn_events(json.dumps(line)) == [{"kind": "error", "message": "rate limited"}]
+    assert oc.turn_events(json.dumps({"type": "error", "error": {"name": "ProviderAuthError"}})) == [
+        {"kind": "error", "message": "ProviderAuthError"}]
+    assert oc.turn_events(json.dumps({"type": "error"})) == [{"kind": "error", "message": "turn failed"}]
+
+
 def test_opencode_last_activity_is_the_session_row_not_the_file(tmp_path):
     db = tmp_path / "opencode.db"
     make_opencode_v2_db(db)
