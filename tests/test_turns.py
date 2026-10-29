@@ -518,6 +518,30 @@ def test_refresh_runs_even_when_the_turn_was_stopped():
     assert calls == [1] and last["kind"] == "error" and last["indexed"] is True
 
 
+def test_scratch_directories_are_removed_when_the_turn_ends(tmp_path):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "opencode").mkdir()
+    r = turns.TurnRunner(refresh=ok_refresh)
+    cmd = command([{"line": '{"kind": "text", "text": "hi"}'}])
+    t = r.start("claude_code:s1", TurnCommand(argv=cmd.argv, cwd=cmd.cwd, env=cmd.env, scratch=(str(scratch),)), translate)
+    wait_done(t)
+    assert not scratch.exists()
+
+
+def test_scratch_directories_are_removed_when_the_turn_is_refused(tmp_path):
+    r = turns.TurnRunner(refresh=ok_refresh)
+    running = r.start("claude_code:s1", command([{"sleep": 5}]), translate)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    cmd = command([])
+    with pytest.raises(turns.TurnRefused) as e:
+        r.start("claude_code:s1", TurnCommand(argv=cmd.argv, cwd=cmd.cwd, env=cmd.env, scratch=(str(scratch),)), translate)
+    assert e.value.status == 409 and not scratch.exists()
+    r.stop(running.id)
+    wait_done(running)
+
+
 def test_activity_is_sampled_before_the_output_drains():
     """A terminal write while the readers are still draining is not the browser's own."""
     marker, calls, release = [1.0], [], threading.Event()

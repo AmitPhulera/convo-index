@@ -17,6 +17,7 @@ from __future__ import annotations
 import collections
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -69,6 +70,7 @@ class Turn:
         self.readers = []                # stdout/stderr threads, joined before the terminal event
         self.waiter = None
         self.job = None                  # Windows: the job object that owns the harness's process tree
+        self.scratch = ()                # the command's per-turn directories, removed once the harness is gone
 
     @property
     def next_index(self):
@@ -115,6 +117,11 @@ def _child_env(command):
     env = {k: v for k, v in os.environ.items() if k not in command.unset}
     env.update(command.env)
     return env
+
+
+def _remove_scratch(paths):
+    for path in paths:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def _adopt_into_job(proc, api=None):
@@ -225,7 +232,15 @@ class TurnRunner:
     def start(self, conversation_id, command: TurnCommand, translate, *, edits=False, activity=None):
         """Spawn the harness. `translate(line) -> list[dict]` turns one stdout line into events;
         `activity() -> float | None` reads the source's activity marker (sampled right after
-        the harness is gone, see last_own_activity)."""
+        the harness is gone, see last_own_activity). The command's scratch directories are
+        removed when the turn ends, or here when it is refused."""
+        try:
+            return self._start(conversation_id, command, translate, edits=edits, activity=activity)
+        except TurnRefused:
+            _remove_scratch(command.scratch)
+            raise
+
+    def _start(self, conversation_id, command, translate, *, edits, activity):
         with self._lock:
             self._prune()
             if self.closed:
@@ -236,6 +251,7 @@ class TurnRunner:
                 raise TurnRefused(429, f"{self.max_concurrent} turns are already running; try again when one finishes")
             turn = Turn(conversation_id, edits)
             turn.activity = activity
+            turn.scratch = command.scratch
             popen_kw = {"cwd": command.cwd, "env": _child_env(command),
                         "stdin": subprocess.PIPE if command.stdin is not None else subprocess.DEVNULL,
                         "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
@@ -379,6 +395,7 @@ class TurnRunner:
             t.join(GRACE)
         unread = any(t.is_alive() for t in turn.readers)
         turn.outcome = self._outcome(turn, unread)   # latched now: a late stop() changes nothing
+        _remove_scratch(turn.scratch)                # the whole group is gone: nothing reads them any more
         self._finish(turn)
         if turn.job is not None:
             winjob.close(turn.job)

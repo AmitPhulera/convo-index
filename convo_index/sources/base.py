@@ -136,6 +136,7 @@ class TurnCommand:
     env: dict[str, str] = field(default_factory=dict)   # added to the inherited environment
     unset: tuple[str, ...] = ()              # removed from it (a user's own overrides must not reach a turn)
     stdin: str | None = None                 # the prompt when the harness reads it from stdin
+    scratch: tuple[str, ...] = ()            # directories made for this turn; the runner removes them when it ends
 
 
 def _turn_module(conversation_id):

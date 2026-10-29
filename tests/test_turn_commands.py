@@ -143,7 +143,7 @@ from tests.test_opencode_v2 import make_opencode_v2_db, T0   # noqa: E402
 def opencode_on_path(monkeypatch, tmp_path):
     monkeypatch.setattr(oc.shutil, "which", lambda name: "/opt/bin/opencode" if name == "opencode" else None)
     monkeypatch.setattr(base, "is_windows", lambda: False)
-    monkeypatch.setattr(oc.C, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(oc.tempfile, "tempdir", str(tmp_path))
     return tmp_path
 
 
@@ -154,8 +154,10 @@ def test_opencode_read_only_turn(opencode_on_path):
     assert cmd.stdin is None and cmd.cwd == "/proj"
     assert cmd.env["OPENCODE_CONFIG_PROJECT_DISABLE"] == "1" and cmd.env["OPENCODE_DISABLE_CLAUDE_CODE"] == "1"
     home = cmd.env["XDG_CONFIG_HOME"]
-    assert home == str(opencode_on_path / "data" / "opencode-turns" / "config") and os.path.isdir(home)
+    assert os.path.dirname(home) == str(opencode_on_path) and os.path.isdir(home)
     assert os.listdir(home) == []                                   # nothing of the user's configuration is in it
+    assert cmd.scratch == (home,)                                   # the runner removes it when the turn ends
+    assert base.turn_command("opencode:ses_abc", "again", "/proj").env["XDG_CONFIG_HOME"] != home   # never reused
     assert cmd.unset == ("OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CLI_CONFIG_CONTENT")
     rules = json.loads(cmd.env["OPENCODE_CONFIG_CONTENT"])["permissions"]
     assert rules[0] == {"action": "*", "resource": "*", "effect": "deny"}

@@ -137,7 +137,7 @@ reported finished (ingest only: its summary and tags come with the next full ref
 
 Every turn runs with the tool's customisation surface closed: no MCP servers, hooks, plugins,
 project settings or slash commands (Claude Code's `--safe-mode --restricted --strict-mcp-config`;
-for Opencode an empty configuration home, the project configuration switched off, its
+for Opencode a fresh, empty configuration home per turn, the project configuration switched off, its
 configuration-path variables unset and a deny-all permission ruleset; administrator-managed
 settings of either tool stay in force), and no shell in either position. The default position
 is read-only (`Read`/`Glob`/`Grep` for Claude Code; the `plan` agent plus a deny-all

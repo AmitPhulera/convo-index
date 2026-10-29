@@ -30,6 +30,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +39,6 @@ from convo_index.config import CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX
 from convo_index.model import (Conversation, Message, ToolCall, UsageRecord,
                                KIND_TEXT, KIND_THINKING, KIND_TOOL_CALL, FIDELITY_FULL,
                                FIDELITY_PARTIAL, make_id, split_id)
-from convo_index import config as C
 from convo_index.sources import base as sources
 from convo_index.sources.base import SourceRef, TurnCommand, UnreadableSource, shell_quote
 
@@ -502,8 +502,11 @@ def resume_command(conversation_id, cwd):
 # `--standalone` runs a private server for this process; the background service would keep
 # whatever configuration it started with and ignore the environment set here. Opencode has no
 # switch for its global configuration (`~/.config/opencode`: plugins, MCP servers, agents),
-# so the turn gets an empty XDG_CONFIG_HOME of its own; credentials and the session database
-# live under the data directory, which stays where it is (verified: the turn still answers).
+# so the turn gets an empty XDG_CONFIG_HOME of its own, made fresh for the turn and removed
+# after it: a reused one could be given a plugin by an edits turn (it may sit inside the
+# project, as convo-index's data directory does in a checkout) that the next turn would run.
+# Credentials and the session database live under the data directory, which stays where it
+# is (verified: the turn still answers).
 # The variables through which a shell could point opencode at other configuration are
 # dropped from the turn's environment. The system directory (/etc/opencode, /Library/
 # Application Support/opencode, %ProgramData%\opencode) is administrator-managed and stays in
@@ -543,10 +546,8 @@ def launcher():
 
 
 def turn_config_home():
-    """An empty configuration home for turns, under convo-index's own data directory."""
-    path = C.DATA_DIR / "opencode-turns" / "config"
-    path.mkdir(parents=True, exist_ok=True)
-    return str(path)
+    """A new, empty, owner-only configuration home for one turn (the runner removes it)."""
+    return tempfile.mkdtemp(prefix="convo-index-opencode-")
 
 
 def turn_command(native_id, prompt, cwd, *, edits=False):
@@ -556,11 +557,12 @@ def turn_command(native_id, prompt, cwd, *, edits=False):
     if prompt.startswith("-"):
         prompt = " " + prompt
     argv = prefix + RUN_FLAGS + ["--session", native_id] + ([] if edits else ["--agent", "plan"]) + [prompt]
-    env = {"XDG_CONFIG_HOME": turn_config_home(),     # no global opencode.json, plugins, agents, commands
+    home = turn_config_home()
+    env = {"XDG_CONFIG_HOME": home,                   # no global opencode.json, plugins, agents, commands
            "OPENCODE_DISABLE_CLAUDE_CODE": "1",       # nor ~/.claude and project .claude instructions
            "OPENCODE_CONFIG_PROJECT_DISABLE": "1",    # nor the project's opencode.json and .opencode directory
            "OPENCODE_CONFIG_CONTENT": json.dumps({"permissions": _permission_rules(edits)})}
-    return TurnCommand(argv=argv, cwd=cwd, env=env, unset=CONFIG_OVERRIDES, stdin=None)
+    return TurnCommand(argv=argv, cwd=cwd, env=env, unset=CONFIG_OVERRIDES, stdin=None, scratch=(home,))
 
 
 def _clip(value, limit=TOOL_TEXT_LIMIT // 10):

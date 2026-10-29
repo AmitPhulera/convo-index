@@ -490,8 +490,10 @@ tool reads it), `turn_events(line)` (its stream translated to `text`, `tool`, `t
 `denied`, `done`, `error`) and `last_activity(native_id, locator)`. `turns.TurnRunner` owns the
 process: one per conversation, a global cap, its own process group (ended on timeout, stop,
 server exit and after the harness returns), stdout and stderr drained concurrently into
-buffers bounded by count and bytes, a watchdog, and a terminal event appended only after the
-same refresh the UI's button runs, so the new turn is indexed when the client reloads. The
+buffers bounded by count and bytes, a watchdog, per-turn scratch directories removed when the
+turn ends, and a terminal event appended only after an ingest-only refresh (`indexer
+--no-jobs`: derived LLM jobs wait for the next full run), so the new turn is indexed when the
+client reloads without the turn waiting on a summary queue. The
 server exposes `POST /api/conversation/<id>/turn`, `GET /api/turn/<id>` (server-sent events,
 resumable with `after`) and `DELETE /api/turn/<id>`, only on a loopback listener and from a
 loopback peer, behind the Host/Origin/CSRF checks, and refuses disabled or excluded sources,
