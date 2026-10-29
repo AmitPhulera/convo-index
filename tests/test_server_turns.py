@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -584,3 +585,39 @@ def test_shutdown_ends_running_turns_then_the_serve_loop(site, monkeypatch):
         time.sleep(0.05)
     assert turn.done and site.runner.closed
     srv.server_close()
+
+
+def stop_cli(site, port, monkeypatch):
+    from convo_index import cli
+    from convo_index import settings as S
+    st = make_settings(site.tmp, server={"host": "127.0.0.1", "port": port})
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    return cli.main(["stop", "--timeout", "10"]), st
+
+
+def test_stop_when_nothing_is_listening(site, monkeypatch, capsys):
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    assert stop_cli(site, port, monkeypatch)[0] == 0
+    assert "no server is running" in capsys.readouterr().out
+
+
+def test_stop_with_a_stale_token_is_refused(site, monkeypatch, capsys):
+    site.settings.db_path().with_name("turn-token").write_text("stale" * 8)
+    assert stop_cli(site, site.port, monkeypatch)[0] == 1
+    assert "refused to stop (403)" in capsys.readouterr().err
+    assert request(site, "GET", "/api/config")[0] == 200            # still serving
+
+
+def test_stop_ends_a_live_server(site, monkeypatch, capsys):
+    monkeypatch.setattr(server, "_stopping", False)
+    server.write_turn_token(site.settings)
+    srv = server.make_server("127.0.0.1", 0)
+
+    def serve():                     # what main() does: serve, then release the port
+        srv.serve_forever()
+        srv.server_close()
+    loop = threading.Thread(target=serve, daemon=True)
+    loop.start()
+    assert stop_cli(site, srv.server_address[1], monkeypatch)[0] == 0
+    loop.join(10)
+    assert not loop.is_alive() and "server stopped" in capsys.readouterr().out

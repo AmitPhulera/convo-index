@@ -498,6 +498,59 @@ def cmd_up(args):
     return rc
 
 
+def cmd_stop(args):
+    """Stop the running UI server through its shutdown endpoint (running turns end first). The
+    login service stays installed: it starts the server again at the next login, as do
+    `convo-index serve` and `up`. Exit 0 when it stopped or was not running."""
+    import http.client
+    import socket
+    import time
+    from urllib.parse import urlsplit
+    from convo_index import server
+    from convo_index import settings as S
+    settings = S.load()
+    host, port = settings["server"]["host"], int(settings["server"]["port"])
+    netloc = urlsplit(server.advertised_url(host, port)).netloc     # loopback, bracketed for IPv6
+    target = urlsplit(f"http://{netloc}").hostname
+    token = server.read_turn_token(settings)
+    conn = http.client.HTTPConnection(target, port, timeout=10)
+    try:
+        conn.request("POST", "/api/shutdown", body="{}",
+                     headers={"Host": netloc, "Content-Type": "application/json", server.CSRF_HEADER: "1",
+                              server.TURN_TOKEN_HEADER: token or ""})
+        res = conn.getresponse()
+        body = res.read().decode("utf-8", "replace")
+    except ConnectionRefusedError:
+        print(f"no server is running at http://{netloc}")
+        return 0
+    except OSError as e:
+        print(f"could not reach the server at http://{netloc}: {e}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    if res.status != 202:
+        try:
+            reason = json.loads(body).get("error") or body
+        except ValueError:
+            reason = body
+        print(f"the server at http://{netloc} refused to stop ({res.status}): {reason}", file=sys.stderr)
+        if not token:
+            print(f"no turn token at {server.turn_token_path(settings)}; is the server running as this user "
+                  "with this configuration?", file=sys.stderr)
+        return 1
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((target, port), timeout=1):
+                pass
+        except OSError:
+            print("server stopped; start it again with `convo-index serve` (or at the next login, if the service is installed)")
+            return 0
+        time.sleep(0.2)
+    print(f"the server accepted the request but is still listening after {args.timeout:g} s", file=sys.stderr)
+    return 1
+
+
 def cmd_resummarize(args):
     from convo_index import settings as S
     from convo_index import db as dbm
@@ -582,6 +635,8 @@ def main(argv=None):
     p_up.add_argument("--no-schedule", action="store_true", help="do not install the daily refresh")
     p_up.add_argument("--no-open", action="store_true", help="do not open the UI in a browser")
     p_up.add_argument("--wait", action="store_true", help="build the index in the foreground instead of the background")
+    p_stop = sub.add_parser("stop", help="stop the running UI server (running turns end first; the login service stays installed)")
+    p_stop.add_argument("--timeout", type=float, default=15, help="seconds to wait for the port to close")
     sub.add_parser("mcp", help="MCP server over stdio (search_conversations, get_conversation, get_related)")
     p_jobs = sub.add_parser("jobs", help="derived-job maintenance")
     p_jobs.add_argument("action", choices=["unblock"], help="unblock: re-queue jobs blocked on auth/config now")
@@ -605,6 +660,8 @@ def main(argv=None):
         from convo_index import server
         server.main()
         return 0
+    if args.cmd == "stop":
+        return cmd_stop(args)
     if args.cmd == "doctor":
         return cmd_doctor(args)
     if args.cmd == "reembed":
