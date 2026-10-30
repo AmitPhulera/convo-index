@@ -581,10 +581,10 @@ async function openDetail(id, cardEl) {
   detail.querySelectorAll(".tag-clear").forEach(b => b.addEventListener("click", () =>
     sendTag(c.id, b.dataset.group, null, "clear")));               // tag null = clear the whole group, one request
   if (c.turns_supported) wireComposer(c);
+  $("detail-pane").scrollTop = 0;
   // a turn still running (sent before a reload, from another tab, or before navigating away)
   // is followed again from its first event
   if (c.turns_supported && c.active_turn) followTurn(c.id, c.active_turn.turn_id, c.active_turn.edits);
-  $("detail-pane").scrollTop = 0;
 }
 
 // Linkable references as badges with links; non-linkable ones (bare "PR 123", commits, urls)
@@ -782,6 +782,13 @@ function showEdits(on) {
   edits.closest(".chip").classList.toggle("on", on);
 }
 
+// The live output sits just above the pinned message box: keep it in view while the reader is
+// already at the bottom, without pulling them down while they read further up.
+function followLive(force) {
+  const pane = $("detail-pane");
+  if (force || pane.scrollHeight - pane.scrollTop - pane.clientHeight < 160) pane.scrollTop = pane.scrollHeight;
+}
+
 async function activeTurn(convId) {
   try {
     const res = await fetch("/api/conversation/" + encodeURIComponent(convId));
@@ -856,6 +863,7 @@ async function followTurn(convId, turnId, edits) {
   if (edits !== undefined) showEdits(!!edits);
   turnStatus("Running…", "busy");
   if (turnPrompts.has(turnId)) liveAppend(liveMsg("user", "You", renderMessageBody(turnPrompts.get(turnId))));
+  followLive(true);
   let failures = 0;
   while (!s.finished && turnStream === s) {
     const before = s.seen;
@@ -916,7 +924,9 @@ function liveMsg(cls, role, bodyHTML, kind) {
 }
 function liveAppend(el) {
   const live = $("turn-live");
-  if (live) live.appendChild(el);
+  if (!live) return;
+  live.appendChild(el);
+  followLive();
 }
 // Tool activity is one collapsed line, like in the transcript; the next text starts a new bubble.
 function liveStep(s, cls, role, summary, detail, kind) {
@@ -932,6 +942,7 @@ function turnEvent(s, ev) {
       if (!s.bubble) { s.bubble = liveMsg("assistant", "Assistant", ""); s.text = ""; liveAppend(s.bubble); }
       s.text += (s.text ? "\n\n" : "") + ev.text;
       s.bubble.querySelector(".msg-body").innerHTML = renderMessageBody(s.text);
+      followLive();
       return;
     case "tool":
       return liveStep(s, "assistant tool_call", "Assistant", ev.name || "tool", show(ev.input));
@@ -972,12 +983,11 @@ async function finishTurn(s, ev) {
   if (turnStream !== s) return;                // the user moved on
   const draft = $("turn-prompt") ? $("turn-prompt").value : "";
   await openDetail(s.convId);                  // the new messages are indexed by now
-  const box = $("composer");
-  if (!box || selectedId !== s.convId) return;
+  if (selectedId !== s.convId || !$("composer")) return;
   if (draft && !$("turn-prompt").value) $("turn-prompt").value = draft;
   stderr();
   turnStatus(status, kind);
-  box.scrollIntoView({ block: "end" });
+  followLive(true);
   $("turn-prompt").focus();
 }
 
