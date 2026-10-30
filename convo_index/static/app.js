@@ -436,15 +436,15 @@ function stepsLabel(c) {
   return `${c.n} step${c.n === 1 ? "" : "s"}` + (h.length ? ` · <span class="harness-kind">${escape(h.join(", "))}</span>` : "");
 }
 
-// Transcript view: "all", "no-tools" (hide thinking and tool activity) or "replies" (only what
-// the user typed and each final reply). Falls back to the older hideTools preference.
-const TRANSCRIPT_VIEWS = ["all", "no-tools", "replies"];
+// Transcript view: "replies" (the default: only what the user typed and each final reply, the
+// steps between folded into a counter) or "all". The retired "no-tools" view reads as "all".
+const TRANSCRIPT_VIEWS = ["replies", "all"];
 function transcriptViewPref() {
   try {
     const v = localStorage.getItem("transcriptView");
     if (TRANSCRIPT_VIEWS.includes(v)) return v;
-    return localStorage.getItem("hideTools") === "1" ? "no-tools" : "all";
-  } catch (e) { return "all"; }
+    return v === "no-tools" ? "all" : "replies";
+  } catch (e) { return "replies"; }
 }
 function applyTranscriptView(view) {
   document.body.classList.toggle("hide-tools", view !== "all");
@@ -514,7 +514,6 @@ async function openDetail(id, cardEl) {
     prevDate = (m.ts || "").slice(0, 10) || prevDate;
     return h;
   }).join("");
-  const toolish = c.messages.filter(m => ["tool_call", "tool_result", "thinking"].includes(m.kind || "text")).length;
   const stepCount = turns.counts.reduce((a, c) => a + c.n, 0);
 
   const cwd = c.cwd || ".";
@@ -559,9 +558,8 @@ async function openDetail(id, cardEl) {
       </div>
       <div class="toolbar">
         ${stepCount ? `<div class="segmented small" id="transcript-view" role="group" aria-label="Transcript view">
+          ${viewBtn("replies", "Replies", "Only your messages and each final reply; the steps in between fold into a counter")}
           ${viewBtn("all", "Everything", "Every message, with tool activity and thinking collapsed")}
-          ${toolish ? viewBtn("no-tools", "No tools", "Hide thinking, tool calls and tool results") : ""}
-          ${viewBtn("replies", "Replies only", "Only your messages and each final reply; the steps in between fold into a counter")}
         </div>` : ""}
         <button class="btn" id="details-toggle" type="button" aria-expanded="${open}" aria-controls="details-panel" title="Summary, tags, references and how to resume">${ICON.panel}<span class="label">Details</span></button>
       </div>
