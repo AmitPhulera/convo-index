@@ -450,3 +450,7 @@ a.bar-label:hover { text-decoration: underline; }
   .sum-row { grid-template-columns: 1fr; gap: 2px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+/* Shown in place of the page once the server has been stopped from the UI. */
+.server-stopped { max-width: 560px; margin: 18vh auto 0; padding: 0 16px; text-align: center; color: var(--text-2); }
+.server-stopped h1 { color: var(--text); font-size: 1.4rem; margin-bottom: .5rem; }
