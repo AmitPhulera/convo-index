@@ -891,13 +891,17 @@ async function followTurn(convId, turnId, edits) {
   }
 }
 
+// Server-sent events, framed by a blank line; LF, CRLF and CR line ends are all accepted.
 async function readTurnEvents(reader, s) {
   const decoder = new TextDecoder();
-  let buf = "";
+  let buf = "", cr = false;
   for (;;) {
     const { value, done } = await reader.read();
     if (done || turnStream !== s) return;
-    buf += decoder.decode(value, { stream: true });
+    let chunk = decoder.decode(value, { stream: true });
+    if (cr && chunk.startsWith("\n")) chunk = chunk.slice(1);    // the CRLF was split across chunks
+    cr = chunk.endsWith("\r");
+    buf += chunk.replace(/\r\n?/g, "\n");
     let cut;
     while ((cut = buf.indexOf("\n\n")) >= 0) {
       const block = buf.slice(0, cut);
