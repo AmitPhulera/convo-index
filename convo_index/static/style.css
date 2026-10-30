@@ -367,10 +367,13 @@ body.hide-steps .steps-toggle:hover { color: var(--text); }
 body.hide-steps .steps-toggle + .msg { border-top: 0; }
 
 /* Message box: one more turn of the conversation, streamed in as it runs */
-.composer { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
-#turn-live:not(:empty) { margin-bottom: 12px; }
+/* pinned to the bottom of the pane, so it is visible that the conversation can go on */
+.composer {
+  position: sticky; bottom: 0; z-index: 5; margin: 12px 0 -40px; padding: 12px 0 16px;
+  background: var(--surface); border-top: 1px solid var(--border); box-shadow: 0 -10px 16px -12px rgba(20, 24, 40, .18);
+}
 .composer textarea {
-  display: block; width: 100%; box-sizing: border-box; min-height: 76px; resize: vertical; padding: 10px 12px;
+  display: block; width: 100%; box-sizing: border-box; min-height: 56px; max-height: 40vh; resize: vertical; padding: 10px 12px;
   font: 14px/1.5 var(--font); color: var(--text); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius);
 }
 .composer textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }

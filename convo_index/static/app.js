@@ -726,9 +726,9 @@ function composerHTML() {
   const send = /Mac/.test(navigator.platform) ? "⌘" : "Ctrl";
   const hint = turnToken ? `<kbd>${send}</kbd><kbd>Enter</kbd> to send`
     : "To send messages here, open the UI through the URL <code>convo-index serve</code> or <code>up</code> prints.";
-  return `<div class="composer" id="composer">
-      <div id="turn-live"></div>
-      <textarea id="turn-prompt" rows="3" placeholder="Continue this conversation…"${turnToken ? "" : " disabled"}></textarea>
+  return `<div id="turn-live"></div>
+    <div class="composer" id="composer">
+      <textarea id="turn-prompt" rows="2" placeholder="Continue this conversation…"${turnToken ? "" : " disabled"}></textarea>
       <div class="composer-row">
         <label class="chip" title="Let the tool edit files in the conversation's directory. Shell commands are never allowed."><input type="checkbox" id="turn-edits"> Allow edits</label>
         <span class="turn-status" id="turn-status">${hint}</span>
@@ -899,7 +899,8 @@ function turnEvent(s, ev) {
 async function finishTurn(s, ev) {
   s.finished = true;
   setComposerBusy(false);
-  const cost = ev.cost_usd != null ? ` · ${fmtUsd(ev.cost_usd)}` : "";
+  // what the tool reports is priced at API rates; on a subscription nothing is charged per turn
+  const cost = ev.cost_usd != null ? ` · ≈ ${fmtUsd(ev.cost_usd)} API-equivalent` : "";
   if (ev.kind === "error") {
     if (ev.stderr) liveStep(s, "harness", "Harness", firstLine(ev.stderr), ev.stderr, "stderr");
     turnStatus(`${ev.message === "stopped" ? "Stopped." : ev.message || "The turn failed."}${cost}`, "error");
