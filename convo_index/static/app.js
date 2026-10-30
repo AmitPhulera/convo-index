@@ -212,17 +212,15 @@ function render(items, srcs, q) {
     li.tabIndex = 0;
     li.onclick = () => openDetail(it.id, li);
     li.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); openDetail(it.id, li); } };
-    const tickets = it.tickets.map(ticketLink).join("");
-    const hiddenBadge = it.hidden ? `<span class="badge hidden-tag">hidden</span>` : "";
-    const childBadge = it.parent_id ? `<span class="badge child">sub-session</span>` : "";
-    const fidelity = it.fidelity && it.fidelity !== "full" ? `<span class="badge fidelity">${escape(it.fidelity)}</span>` : "";
+    // One line of where it ran; tags and tickets live in the conversation's details. The
+    // snippet only says something when there is a query to match.
     const proj = it.project_root || it.cwd || "";
+    const flags = [it.hidden && "hidden", it.parent_id && "sub-session", it.fidelity && it.fidelity !== "full" && it.fidelity].filter(Boolean);
     const msgs = it.message_count ? `<span class="sep">·</span><span>${it.message_count} msg${it.message_count === 1 ? "" : "s"}</span>` : "";
     li.innerHTML = `<div class="card-top"><div class="title" title="${escape(it.title)}">${escape(it.title)}</div>
         <time datetime="${escape(it.start_ts || "")}" title="${escape(fullTime(it.start_ts))}">${escape(relTime(it.start_ts))}</time></div>
-      <div class="card-meta">${sourceBadge(it.source)}${proj ? `<span class="sep">·</span><span class="proj" title="${escape(proj)}">${escape(shortPath(proj))}</span>` : ""}${msgs}</div>
-      <div class="card-tags">${hiddenBadge}${childBadge}${fidelity}${tagBadges(it.tags)}${tickets}</div>
-      <div class="snippet">${snippetHTML(it.snippet)}</div>`;
+      <div class="card-meta"><span class="src-dot ${escape(it.source || "")}" aria-hidden="true"></span><span>${escape(sourceLabel(it.source))}</span>${proj ? `<span class="sep">·</span><span class="proj" title="${escape(proj)}">${escape(baseName(proj))}</span>` : ""}${msgs}${flags.map(f => `<span class="badge hidden-tag">${escape(f)}</span>`).join("")}</div>
+      ${q ? `<div class="snippet">${snippetHTML(it.snippet)}</div>` : ""}`;
     ul.appendChild(li);
   }
 }
