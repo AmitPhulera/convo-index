@@ -775,6 +775,13 @@ function setComposerBusy(busy) {
   $("turn-stop").disabled = false;
 }
 
+async function activeTurn(convId) {
+  try {
+    const res = await fetch("/api/conversation/" + encodeURIComponent(convId));
+    return res.ok ? (await res.json()).active_turn : null;
+  } catch (e) { return null; }
+}
+
 async function stopTurn() {
   const s = turnStream;
   if (!s || s.finished) return;
@@ -805,21 +812,27 @@ async function sendTurn(convId) {
     setComposerBusy(false);
     turnStatus(message, "error");
   };
-  let res, body;
+  let res = null, body = null;
   try {
     res = await fetch(`/api/conversation/${encodeURIComponent(convId)}/turn`, {
       method: "POST", headers: turnHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ prompt, edits: $("turn-edits").checked }),
     });
-    body = await res.json().catch(() => ({}));
-  } catch (e) {
-    if (view === detailView) restore(`The server did not answer: ${e}`);
-    return;
-  }
+    body = await res.json().catch(() => null);
+  } catch (e) { /* no answer: the turn may have started anyway */ }
   if (view !== detailView) return;             // reopening the conversation picks the turn up
-  if (!res.ok) { restore(body.error || `The server returned ${res.status}.`); return; }
-  turnPrompts.set(body.turn_id, prompt);
-  followTurn(convId, body.turn_id);
+  if (res && res.ok && body && body.turn_id) {
+    turnPrompts.set(body.turn_id, prompt);
+    return followTurn(convId, body.turn_id);
+  }
+  if (res && !res.ok) return restore((body && body.error) || `The server returned ${res.status}.`);
+  const active = await activeTurn(convId);     // the answer was lost: did the turn start?
+  if (view !== detailView) return;
+  if (active) {
+    turnPrompts.set(active.turn_id, prompt);
+    return followTurn(convId, active.turn_id);
+  }
+  restore("The server did not answer, and no turn is running. Send again to retry.");
 }
 
 // Reads the turn's server-sent events. A dropped connection resumes from the last event seen
