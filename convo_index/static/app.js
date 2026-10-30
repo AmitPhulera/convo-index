@@ -24,6 +24,7 @@ const ICON = {
   inbox: '<svg class="icon" viewBox="0 0 24 24"><path d="M3 13h5l2 3h4l2-3h5M5 4h14l2 9v7H3v-7z"/></svg>',
   close: '<svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
   stop: '<svg class="icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
+  panel: '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>',
   send: '<svg class="icon" viewBox="0 0 24 24"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4z"/></svg>',
 };
 function sourceLabel(s) { return SOURCE_LABELS[s] || s || "unknown"; }
@@ -453,6 +454,28 @@ function applyTranscriptView(view) {
   try { localStorage.setItem("transcriptView", view); } catch (e) { /* ignore */ }
 }
 
+// The details panel (summary, tags, references, resume) sits beside the transcript and is
+// open by default; closing it is remembered in this browser.
+let tagEditOpen = false;
+function detailsPanelOpen() {
+  try { return localStorage.getItem("detailsPanel") !== "closed"; } catch (e) { return true; }
+}
+function toggleDetailsPanel(open) {
+  const detail = $("detail"), btn = $("details-toggle");
+  if (!btn) return;
+  open = open === undefined ? !detail.classList.contains("details-open") : open;
+  detail.classList.toggle("details-open", open);
+  btn.setAttribute("aria-expanded", String(open));
+  try { localStorage.setItem("detailsPanel", open ? "open" : "closed"); } catch (e) { /* not remembered */ }
+}
+
+// "≈ $1.23" for the header: the API-equivalent estimate, when there is one.
+function costShort(u) {
+  if (!u || !u.requests || !u.coverage) return "";     // nothing priced: say nothing rather than "$0"
+  const x = u.estimated_cost || 0;
+  return `<span title="API-equivalent estimate">${u.coverage < 1 ? "≥ " : "≈ "}${x >= 1 ? "$" + x.toFixed(2) : "$" + x.toFixed(4)}</span>`;
+}
+
 async function openDetail(id, cardEl) {
   detachTurn();
   const gen = ++detailView;
@@ -481,7 +504,6 @@ async function openDetail(id, cardEl) {
   if (gen !== detailView) return;
   selectedId = c.id;  // legacy ids resolve server-side to the namespaced id
 
-  const tickets = (c.tickets || []).map(ticketLink).join("");
   let prevDate = "";
   const turns = transcriptTurns(c.messages);
   const msgs = c.messages.map((m, i) => {
@@ -499,56 +521,77 @@ async function openDetail(id, cardEl) {
   const resume = !c.resume_cmd ? null
     : WINDOWS ? `Set-Location -LiteralPath ${shellQuote(cwd)} -ErrorAction Stop; ${c.resume_cmd}`   // a missing dir stops the line
     : `cd ${shellQuote(cwd)} && ${c.resume_cmd}`;
-  const resumeHTML = resume ? `<div class="dsec"><div class="dsec-label">Continue in ${WINDOWS ? "PowerShell" : "the terminal"}</div><div class="resume">
-        <code class="resume-cmd">${escape(resume)}</code>
-        <button class="btn copy-btn" data-cmd="${escape(resume)}" onclick="copyCmd(this)">${ICON.copy}<span class="label">Copy</span></button>
-      </div></div>` : "";
   // Links carry the target id in a data attribute; a delegated click handler opens it.
   const convLink = (id, label) => `<a href="#${encodeURIComponent(id)}" class="conv-link" data-id="${escape(id)}">${escape(label)}</a>`;
-  const parent = c.parent_id
-    ? `<div class="children">${escape(c.relation || "child")} of ${convLink(c.parent_id, c.parent_id)}</div>` : "";
-  const children = (c.children || []).length
-    ? `<div class="children">Sub-sessions: ${c.children.map(k => convLink(k, k.split(":")[1] || k)).join(" · ")}</div>` : "";
-  const fidelity = c.fidelity && c.fidelity !== "full"
-    ? `<span class="badge fidelity">${escape(c.fidelity)} transcript</span>` : "";
-  const warn = (c.warnings || []).length
-    ? `<span class="badge fidelity" title="${escape(c.warnings.join("; "))}">⚠ ${c.warnings.length} warning${c.warnings.length > 1 ? "s" : ""}</span>` : "";
-  const models = (c.models || []).length ? `<span class="sep">·</span><span title="Models used">${escape(c.models.join(", "))}</span>` : "";
-  const branch = c.git_branch && c.git_branch !== "HEAD" ? `<span class="sep">·</span><span class="path" title="Git branch">⎇ ${escape(c.git_branch)}</span>` : "";
-  const hidden = c.hidden ? `<span class="badge hidden-tag">hidden</span>` : "";
-  const tagsHTML = tagEditorHTML(c);
-  const refsHTML = referencesHTML(c);
+  const flags = [
+    c.hidden ? `<span class="badge hidden-tag">hidden</span>` : "",
+    c.fidelity && c.fidelity !== "full" ? `<span class="badge fidelity">${escape(c.fidelity)} transcript</span>` : "",
+    (c.warnings || []).length ? `<span class="badge fidelity" title="${escape(c.warnings.join("; "))}">⚠ ${c.warnings.length} warning${c.warnings.length > 1 ? "s" : ""}</span>` : "",
+  ].join("");
+  const sep = `<span class="sep" aria-hidden="true">·</span>`;
+  const meta = [
+    `<span class="src-dot ${escape(c.source || "")}" aria-hidden="true"></span>${escape(sourceLabel(c.source))}`,
+    c.cwd ? `<span class="path" title="${escape(c.cwd)}">${escape(shortPath(c.cwd))}</span>` : "",
+    c.git_branch && c.git_branch !== "HEAD" ? `<span class="path" title="Git branch">⎇ ${escape(c.git_branch)}</span>` : "",
+    `${c.messages.length} message${c.messages.length === 1 ? "" : "s"}`,
+    costShort(c.usage),
+  ].filter(Boolean).join(sep);
   const view = transcriptViewPref();
   const viewBtn = (v, label, title) => `<button type="button" data-view="${v}" aria-pressed="${view === v}" title="${title}">${label}</button>`;
+  const open = detailsPanelOpen();
+  const section = (label, body) => body ? `<section class="dsec"><h3 class="dsec-label">${label}</h3>${body}</section>` : "";
+  const assigned = tagBadges((c.tags || {}).assignments);
+  const tagsHTML = tagEditorHTML(c);
+  const refs = (c.tickets || []).map(ticketLink).join("") + referencesHTML(c);
+  const session = [
+    `<div>Started <span title="${escape(fullTime(c.start_ts))}">${escape(fullTime(c.start_ts))}</span></div>`,
+    (c.models || []).length ? `<div title="Models used">${escape(c.models.join(", "))}</div>` : "",
+    c.parent_id ? `<div>${escape(c.relation || "child")} of ${convLink(c.parent_id, c.parent_id)}</div>` : "",
+    (c.children || []).length ? `<div>Sub-sessions: ${c.children.map(k => convLink(k, k.split(":")[1] || k)).join(" · ")}</div>` : "",
+    usageLine(c.usage),
+  ].join("");
+  detail.className = open ? "details-open" : "";
   detail.innerHTML = `<div class="detail-bar">
       <button class="btn ghost icon-only" id="detail-back" aria-label="Back to results">${ICON.back}</button>
-      <h2 title="${escape(c.title)}">${escape(c.title)}</h2>
-      <div class="toolbar">
-        ${resume ? `<button class="btn primary copy-btn" data-cmd="${escape(resume)}" onclick="copyCmd(this)" title="Copy the command that resumes this conversation">${ICON.copy}<span class="label">Copy resume command</span></button>` : ""}
-        <button class="btn" id="btn-hide" title="${c.hidden ? "Show this conversation in results again" : "Keep this conversation out of results (reversible)"}">${c.hidden ? ICON.eye : ICON.eyeOff}<span class="label">${c.hidden ? "Unhide" : "Hide"}</span></button>
-        <button class="btn danger" id="btn-delete" title="Remove permanently; it will not come back on reindex">${ICON.trash}<span class="label">Delete</span></button>
-        <span id="confirm-slot"></span>
+      <div class="detail-head">
+        <h2 class="detail-title" title="${escape(c.title)}">${escape(c.title)}</h2>
+        <div class="meta-line">${meta}${flags}</div>
       </div>
-    </div>
-    <div class="detail-body">
-      <h1 class="detail-title">${escape(c.title)}</h1>
-      <div class="meta-row">${hidden}${sourceBadge(c.source)}${fidelity}${warn}${tickets}
-        <span title="${escape(fullTime(c.start_ts))}">${escape(fullTime(c.start_ts))}</span>
-        ${c.cwd ? `<span class="sep">·</span><span class="path" title="${escape(c.cwd)}">${escape(shortPath(c.cwd))}</span>` : ""}${branch}${models}</div>
-      ${usageLine(c.usage)}${parent}${children}
-      ${tagsHTML ? `<div class="dsec"><div class="dsec-label">Tags</div>${tagsHTML}</div>` : ""}
-      ${refsHTML ? `<div class="dsec"><div class="dsec-label">References</div>${refsHTML}</div>` : ""}
-      ${resumeHTML}
-      ${summaryHTML(c.summary)}${relatedHTML(c)}
-      <div class="transcript-head"><h3>Transcript</h3><span>${c.messages.length} message${c.messages.length === 1 ? "" : "s"}${toolish ? ` · ${toolish} tool / thinking` : ""}</span>
+      <div class="toolbar">
         ${stepCount ? `<div class="segmented small" id="transcript-view" role="group" aria-label="Transcript view">
           ${viewBtn("all", "Everything", "Every message, with tool activity and thinking collapsed")}
           ${toolish ? viewBtn("no-tools", "No tools", "Hide thinking, tool calls and tool results") : ""}
           ${viewBtn("replies", "Replies only", "Only your messages and each final reply; the steps in between fold into a counter")}
-        </div>` : ""}</div>
-      ${msgs}
-      ${c.turns_supported ? composerHTML() : ""}
+        </div>` : ""}
+        <button class="btn" id="details-toggle" type="button" aria-expanded="${open}" aria-controls="details-panel" title="Summary, tags, references and how to resume">${ICON.panel}<span class="label">Details</span></button>
+      </div>
+    </div>
+    <div class="detail-grid">
+      <div class="conversation">
+        ${msgs}
+        ${c.turns_supported ? composerHTML() : ""}
+      </div>
+      <aside class="details-panel" id="details-panel" aria-label="Conversation details">
+        ${section(`Continue in ${WINDOWS ? "PowerShell" : "the terminal"}`, resume ? `<div class="resume">
+          <code class="resume-cmd" title="${escape(resume)}">${escape(resume)}</code>
+          <button class="btn copy-btn" data-cmd="${escape(resume)}" onclick="copyCmd(this)">${ICON.copy}<span class="label">Copy</span></button>
+        </div>` : "")}
+        ${section("Summary", summaryHTML(c.summary))}
+        ${tagsHTML ? section("Tags", `<div class="tag-list">${assigned || `<span class="hint">None yet</span>`}</div>
+          <details class="tag-edit"${tagEditOpen ? " open" : ""}><summary>Edit tags</summary>${tagsHTML}</details>`) : ""}
+        ${section("References", refs ? `<div class="refs">${refs}</div>` : "")}
+        ${section("Related", relatedHTML(c))}
+        ${section("Session", session)}
+        <div class="detail-actions">
+          <button class="btn" id="btn-hide" title="${c.hidden ? "Show this conversation in results again" : "Keep this conversation out of results (reversible)"}">${c.hidden ? ICON.eye : ICON.eyeOff}<span class="label">${c.hidden ? "Unhide" : "Hide"}</span></button>
+          <button class="btn danger" id="btn-delete" title="Remove permanently; it will not come back on reindex">${ICON.trash}<span class="label">Delete</span></button>
+          <span id="confirm-slot"></span>
+        </div>
+      </aside>
     </div>`;
+  $("details-toggle").addEventListener("click", () => toggleDetailsPanel());
+  const tagEdit = detail.querySelector(".tag-edit");
+  if (tagEdit) tagEdit.addEventListener("toggle", () => { tagEditOpen = tagEdit.open; });
   $("detail-back").addEventListener("click", closeDetail);
   $("btn-hide").addEventListener("click", () => toggleHide(c.id, c.hidden ? 0 : 1));
   $("btn-delete").addEventListener("click", () => askDelete(c.id));
@@ -632,7 +675,7 @@ function relatedHTML(c) {
     return `<div class="rel-group"><div class="rel-head"><span class="tg-name">${escape(g.kind)}</span> ${head}
       <span class="rel-meta">${g.count} other conversation${g.count > 1 ? "s" : ""}</span></div>${items}</div>`;
   }).join("");
-  return `<div class="related"><h3>Related work</h3>${rows}</div>`;
+  return `<div class="related">${rows}</div>`;
 }
 
 // Per group: every tag as a toggle chip (click = accept; for exclusive groups this replaces
@@ -1056,8 +1099,6 @@ $("refresh").addEventListener("click", async () => {
   await loadSources();
   runSearch();
 });
-// The compact title in the sticky bar only shows once the big one has scrolled away.
-$("detail-pane").addEventListener("scroll", () => $("detail-pane").classList.toggle("scrolled", $("detail-pane").scrollTop > 60));
 
 // The turn token arrives in the fragment of the URL `serve` and `up` print (#turns=<token>).
 // It is kept for this tab (sessionStorage outlives a reload, never leaves the browser) and
