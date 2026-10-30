@@ -784,7 +784,8 @@ async function stopTurn() {
 async function sendTurn(convId) {
   const prompt = $("turn-prompt").value;
   if (!prompt.trim() || $("turn-send").disabled) return;
-  setComposerBusy(true);
+  $("turn-send").disabled = true;              // Stop appears once the turn has an id to stop
+  $("turn-edits").disabled = true;
   turnStatus("Starting…", "busy");
   let res, body;
   try {
