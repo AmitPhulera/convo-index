@@ -489,6 +489,7 @@ async function openDetail(id, cardEl) {
   // re-rendering the conversation on show (after a tag, reference or hide change) keeps the
   // details panel as it was, drawer included
   const keepPanel = id === selectedId && $("detail").classList.contains("details-open");
+  if (id !== selectedId) tagEditOpen = false;    // the tag editor stays open only for re-renders
   detachTurn();
   const gen = ++detailView;
   selectedId = id;
