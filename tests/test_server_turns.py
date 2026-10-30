@@ -621,3 +621,64 @@ def test_stop_ends_a_live_server(site, monkeypatch, capsys):
     assert stop_cli(site, srv.server_address[1], monkeypatch)[0] == 0
     loop.join(10)
     assert not loop.is_alive() and "server stopped" in capsys.readouterr().out
+
+
+# ---- the MCP tool allowlist for Edit-mode turns --------------------------------------------------
+
+@pytest.fixture
+def mcp_home(site, monkeypatch):
+    home = site.tmp / "claude-home"
+    home.mkdir()
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {
+        "atlassian": {"type": "http", "url": "https://mcp.example/secret-path", "headers": {"Authorization": "Bearer t"}},
+        "local": {"command": "local-mcp"}}}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+    conn = dbm.connect(server.DB_PATH)
+    conv = Conversation(source="claude_code", native_id="11111111-2222-4333-8444-555555555555", title="Jira", first_prompt="j",
+                        source_ref="/x", cwd=str(site.proj), start_ts="2026-06-16T00:00:00Z",
+                        messages=[Message(seq=0, role="user", text="j", ts="2026-06-16T00:00:00Z"),
+                                  Message(seq=1, role="assistant", kind="tool_call", text='[mcp__atlassian__getJiraIssue] {"key": "X-1"}', ts="2026-06-16T00:00:01Z"),
+                                  Message(seq=2, role="assistant", kind="tool_call", text="[mcp__claude_ai_Slack__post] {}", ts="2026-06-16T00:00:02Z")])
+    dbm.upsert_conversation(conn, conv, "globex", "path", [], None, "1", lambda t: [[0.0] * EMBED_DIM for _ in t])
+    conn.close()
+    return home
+
+
+def test_tools_endpoint_lists_servers_without_their_secrets(site, mcp_home):
+    status, body = request(site, "GET", "/api/turns/tools")
+    assert status == 200
+    assert body["servers"] == [{"name": "atlassian", "type": "http"}, {"name": "local", "type": "stdio"}]
+    assert body["allowed"] == []
+    assert body["seen"] == {"atlassian": ["getJiraIssue"]}          # an account connector's call is not a configured server
+    status, raw = request(site, "GET", "/api/turns/tools", token=False)
+    assert status == 403
+    _, text = request(site, "GET", "/api/turns/tools")
+    assert "secret-path" not in json.dumps(text) and "Bearer" not in json.dumps(text)
+
+
+def test_tools_endpoint_validates_and_saves(site, mcp_home):
+    status, body = request(site, "POST", "/api/turns/tools", {"mcp_tools": ["mcp__atlassian__*", "mcp__slack__post"]})
+    assert status == 400 and "mcp__slack__post" in body["error"]
+    status, body = request(site, "POST", "/api/turns/tools", {"mcp_tools": ["mcp__atlassian__getJiraIssue"]}, csrf=False)
+    assert status == 403
+    status, body = request(site, "POST", "/api/turns/tools", {"mcp_tools": ["mcp__atlassian__getJiraIssue"]}, token=False)
+    assert status == 403
+    status, body = request(site, "POST", "/api/turns/tools", {"mcp_tools": ["mcp__atlassian__getJiraIssue"]})
+    assert status == 200 and body["allowed"] == ["mcp__atlassian__getJiraIssue"]
+    assert request(site, "GET", "/api/turns/tools")[1]["allowed"] == ["mcp__atlassian__getJiraIssue"]
+
+
+def test_an_edit_turn_gets_the_allowlist_and_a_read_only_turn_does_not(site, mcp_home):
+    request(site, "POST", "/api/turns/tools", {"mcp_tools": ["mcp__atlassian__*"]})
+    captured = site.tmp / "argv.txt"
+    status, body = start(site, [{"argv_to": str(captured)}] + claude_lines()[1:], edits=True)
+    assert status == 200
+    sse_events(site, body["turn_id"])
+    argv = captured.read_text(encoding="utf-8").splitlines()
+    assert argv[argv.index("--allowedTools") + 1] == "Bash,mcp__atlassian" and "--mcp-config" in argv
+    os.utime(site.transcript, (time.time() - 3600, time.time() - 3600))   # not "recent activity" for the next turn
+    status, body = start(site, [{"argv_to": str(captured)}] + claude_lines()[1:], edits=False)
+    assert status == 200
+    sse_events(site, body["turn_id"])
+    argv = captured.read_text(encoding="utf-8").splitlines()
+    assert "--mcp-config" not in argv and "--allowedTools" not in argv and "--safe-mode" in argv

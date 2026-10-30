@@ -25,6 +25,8 @@ from convo_index import db as dbm
 from convo_index import search as S
 from convo_index import analytics as A
 from convo_index import settings as CFG
+from convo_index import turn_tools as TT
+from convo_index.sources import claude_code as CC
 from convo_index import tags as T
 from convo_index import references as REF
 from convo_index import cost as K
@@ -508,7 +510,7 @@ def turn_preconditions(conversation_id, prompt, edits, cfg=None):
     if changed is not None and 0 <= time.time() - changed < RECENT_ACTIVITY and not (own is not None and changed <= own):
         raise TURNS.TurnRefused(423, f"the session changed {int(time.time() - changed)} s ago; "
                                      "if it is open in a terminal, continue it there")
-    command = turn_command(conversation_id, prompt, cwd, edits=edits)
+    command = turn_command(conversation_id, prompt, cwd, edits=edits, mcp_tools=tuple(TT.load(cfg)) if edits else ())
     if command is None:
         raise TURNS.TurnRefused(424, f"the {source} command is not installed on this machine (not on PATH)")
     return conversation_id, command, locator
@@ -526,6 +528,48 @@ def handle_turn_start(conversation_id, body):
     except TURNS.TurnRefused as e:
         return e.status, json.dumps({"error": str(e)})
     return 200, json.dumps(turn.snapshot())
+
+
+MCP_CALL_RE = re.compile(r"\[(mcp__[A-Za-z0-9_-]+)\]")
+
+
+def seen_mcp_tools(servers):
+    """{server: [tool, ...]} of the configured servers' tools that indexed conversations called,
+    as suggestions for the allowlist (the harness lists no tools without starting the servers)."""
+    if not servers:
+        return {}
+    seen = {}
+    conn = dbm.connect(_db())
+    try:
+        rows = conn.execute(r"""SELECT DISTINCT substr(text, 1, 200) FROM messages
+                                WHERE kind = 'tool_call' AND text LIKE '[mcp\_\_%' ESCAPE '\'""").fetchall()
+    finally:
+        conn.close()
+    for (text,) in rows:
+        m = MCP_CALL_RE.match(text or "")
+        part = TT.split(m.group(1), servers) if m else None
+        if part and part[1] != "*" and part[1] not in seen.setdefault(part[0], []):
+            seen[part[0]].append(part[1])
+    return {k: sorted(v) for k, v in seen.items()}
+
+
+def handle_turn_tools():
+    """GET /api/turns/tools: the user's MCP servers (names and transport only; their URLs and
+    headers never leave this machine's config), the allowlist, and tools seen in transcripts."""
+    servers = CC.mcp_servers()
+    return 200, json.dumps({"servers": [{"name": k, "type": str(v.get("type") or "stdio")} for k, v in sorted(servers.items())],
+                            "allowed": TT.load(), "seen": seen_mcp_tools(servers)})
+
+
+def handle_turn_tools_save(body):
+    """POST /api/turns/tools {mcp_tools: [...]}: validate against the configured servers and store."""
+    if not isinstance(body, dict):
+        return 400, json.dumps({"error": "body must be a JSON object"})
+    try:
+        saved = TT.save(body.get("mcp_tools"), CC.mcp_servers())
+    except ValueError as e:
+        return 400, json.dumps({"error": str(e)})
+    return 200, json.dumps({"ok": True, "allowed": saved})
 
 
 def handle_turn_stop(turn_id):
@@ -659,6 +703,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, handle_related(_segment(path, "/api/related/")))
         if path.startswith("/api/turn/"):
             return self._stream_turn(_segment(path, "/api/turn/"), qs)
+        if path == "/api/turns/tools":       # what Edit-mode turns may run: guarded like a turn
+            if self._turns_refused():
+                return
+            return self._send(*handle_turn_tools())
         if path.startswith("/api/conversation/"):
             body = handle_conversation(_segment(path, "/api/conversation/"))
             return self._send(404, "not found", "text/plain") if body is None else self._send(200, body)
@@ -736,6 +784,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(403, json.dumps({"error": err}))
                 self._send(202, json.dumps({"ok": True, "stopping": True}))
                 return request_shutdown(self.server)
+            if path == "/api/turns/tools":
+                if self._turns_refused():
+                    return
+                try:
+                    body = self._json_body()
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return self._send(400, json.dumps({"error": "invalid json"}))
+                except BodyTooLarge as e:
+                    return self._send(413, json.dumps({"error": str(e)}))
+                return self._send(*handle_turn_tools_save(body))
             if path.startswith("/api/conversation/") and path.endswith("/turn"):
                 if self._turns_refused():
                     return
