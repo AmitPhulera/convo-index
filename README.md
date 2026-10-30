@@ -132,6 +132,12 @@ transcript, so `claude --resume <id>` or `opencode --session <id>` in a terminal
 sees exactly what happened in the browser, and the index is refreshed before the turn is
 reported finished (ingest only: its summary and tags come with the next full refresh). Claude Code and Opencode are supported today; the other sources will follow.
 
+In the UI, such a conversation has a message box under its transcript. Type, press Send (or
+Cmd/Ctrl+Enter), and the tool's replies, tool calls and results stream in as it works; "Allow
+edits" switches to the edits position described below, and Stop ends the turn. When the turn
+finishes the transcript reloads with it; tools that were denied stay named in the status line.
+The same endpoints serve any other client:
+
     POST   /api/conversation/<id>/turn   {"prompt": "...", "edits": false}   -> {"turn_id": ...}
     GET    /api/turn/<turn_id>?after=<n>  server-sent events: text, tool, tool_result, denied, done | error
     DELETE /api/turn/<turn_id>            stop it
