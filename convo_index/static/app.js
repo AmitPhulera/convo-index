@@ -782,11 +782,17 @@ async function stopTurn() {
 }
 
 async function sendTurn(convId) {
-  const prompt = $("turn-prompt").value;
+  const box = $("turn-prompt"), prompt = box.value;
   if (!prompt.trim() || $("turn-send").disabled) return;
+  box.value = "";                              // what is typed from here on is the next message
   $("turn-send").disabled = true;              // Stop appears once the turn has an id to stop
   $("turn-edits").disabled = true;
   turnStatus("Starting…", "busy");
+  const restore = (message) => {
+    if (!box.value) box.value = prompt;
+    setComposerBusy(false);
+    turnStatus(message, "error");
+  };
   let res, body;
   try {
     res = await fetch(`/api/conversation/${encodeURIComponent(convId)}/turn`, {
@@ -795,12 +801,11 @@ async function sendTurn(convId) {
     });
     body = await res.json().catch(() => ({}));
   } catch (e) {
-    if (selectedId === convId) { setComposerBusy(false); turnStatus(`The server did not answer: ${e}`, "error"); }
+    if (selectedId === convId) restore(`The server did not answer: ${e}`);
     return;
   }
   if (selectedId !== convId) return;           // the user moved on; the turn (if any) runs anyway
-  if (!res.ok) { setComposerBusy(false); turnStatus(body.error || `The server returned ${res.status}.`, "error"); return; }
-  $("turn-prompt").value = "";
+  if (!res.ok) { restore(body.error || `The server returned ${res.status}.`); return; }
   turnPrompts.set(body.turn_id, prompt);
   followTurn(convId, body.turn_id);
 }
@@ -911,9 +916,11 @@ async function finishTurn(s, ev) {
   toast(`Turn finished${cost}.`, "success");
   runSearch();
   if (selectedId !== s.convId) return;
+  const draft = $("turn-prompt") ? $("turn-prompt").value : "";
   await openDetail(s.convId);                  // the new messages are indexed by now
   const box = $("composer");
   if (!box || selectedId !== s.convId) return;
+  if (draft && !$("turn-prompt").value) $("turn-prompt").value = draft;
   // the transcript does not record what was denied, so the status line keeps saying it
   if (s.denied.length) turnStatus(`Done${cost}. Not allowed here: ${[...new Set(s.denied)].join(", ")}; finish that step in the terminal.`, "warn");
   else turnStatus(`Done${cost}.`);
