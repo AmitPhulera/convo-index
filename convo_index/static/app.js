@@ -721,7 +721,7 @@ function closeDetail() {
 // in the tool that owns it (server.py, turns.py) and streams what the tool does. There is one
 // stream per page, owned by the detail view: opening another conversation or closing this one
 // aborts the fetch, never the turn.
-let turnStream = null;        // {convId, turnId, controller, seen, bubble, text, denied, finished}
+let turnStream = null;        // {convId, turnId, controller, seen, bubble, text, denied, finished, lost}
 let detailView = 0;           // bumped whenever the detail pane is replaced: late responses check it
 const turnPrompts = new Map();    // turn id -> what was typed, so a re-render can show it again
 
@@ -793,10 +793,13 @@ async function stopTurn() {
     if (!res.ok) body = await res.json().catch(() => ({}));
   } catch (e) { /* reported below */ }
   if (turnStream !== s || s.finished) return;  // the terminal event says how it ended
-  if (!res || !res.ok) {
-    $("turn-stop").disabled = false;
-    turnStatus(`Could not stop the turn: ${body.error || (res ? res.status : "the server did not answer")}`, "error");
+  if (res && res.ok) {
+    // with the stream lost no terminal event will arrive: the stop is the end
+    if (s.lost) finishTurn(s, { kind: "error", message: "stopped" });
+    return;
   }
+  $("turn-stop").disabled = false;
+  turnStatus(`Could not stop the turn: ${body.error || (res ? res.status : "the server did not answer")}`, "error");
 }
 
 async function sendTurn(convId) {
@@ -836,16 +839,18 @@ async function sendTurn(convId) {
 }
 
 // Reads the turn's server-sent events. A dropped connection resumes from the last event seen
-// (`after`), so nothing is shown twice.
+// (`after`), so nothing is shown twice; retries back off and start over once events flow again.
 async function followTurn(convId, turnId) {
   if (turnStream && turnStream.turnId === turnId && !turnStream.finished) return;   // already following it
   detachTurn();
-  const s = { convId, turnId, controller: new AbortController(), seen: 0, bubble: null, text: "", denied: [], finished: false };
+  const s = { convId, turnId, controller: new AbortController(), seen: 0, bubble: null, text: "", denied: [], finished: false, lost: false };
   turnStream = s;
   setComposerBusy(true);
   turnStatus("Running…", "busy");
   if (turnPrompts.has(turnId)) liveAppend(liveMsg("user", "You", renderMessageBody(turnPrompts.get(turnId))));
-  for (let attempt = 0; attempt < 3 && !s.finished; attempt++) {
+  let failures = 0;
+  while (!s.finished && turnStream === s) {
+    const before = s.seen;
     try {
       const res = await fetch(`/api/turn/${encodeURIComponent(turnId)}?after=${s.seen}`,
                               { headers: turnHeaders(), signal: s.controller.signal });
@@ -859,9 +864,15 @@ async function followTurn(convId, turnId) {
     } catch (e) {
       if (s.controller.signal.aborted) return;
     }
-    if (turnStream !== s) return;
+    if (turnStream !== s || s.finished) return;
+    failures = s.seen > before ? 0 : failures + 1;
+    if (failures > 5) {
+      s.lost = true;                           // Stop still works; the turn keeps running
+      turnStatus("Lost the connection to the turn. It keeps running on the server; reopen the conversation to follow it.", "error");
+      return;
+    }
+    if (failures) await new Promise(r => setTimeout(r, 250 * 2 ** failures));
   }
-  if (!s.finished) finishTurn(s, { kind: "error", message: "Lost the connection. The turn keeps running on the server; reopen the conversation to follow it." });
 }
 
 async function readTurnEvents(reader, s) {
