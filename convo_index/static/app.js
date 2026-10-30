@@ -556,6 +556,9 @@ async function openDetail(id, cardEl) {
   const refs = (c.tickets || []).map(ticketLink).join("") + referencesHTML(c);
   const session = [
     `<div>Started <span title="${escape(fullTime(c.start_ts))}">${escape(fullTime(c.start_ts))}</span></div>`,
+    // the title bar drops these on small phones, so the details always carry them
+    c.cwd ? `<div>Directory <span class="path" title="${escape(c.cwd)}">${escape(shortPath(c.cwd))}</span></div>` : "",
+    c.git_branch && c.git_branch !== "HEAD" ? `<div>Branch <span class="path">${escape(c.git_branch)}</span></div>` : "",
     (c.models || []).length ? `<div title="Models used">${escape(c.models.join(", "))}</div>` : "",
     c.parent_id ? `<div>${escape(c.relation || "child")} of ${convLink(c.parent_id, c.parent_id)}</div>` : "",
     (c.children || []).length ? `<div>Sub-sessions: ${c.children.map(k => convLink(k, k.split(":")[1] || k)).join(" · ")}</div>` : "",
