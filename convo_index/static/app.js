@@ -23,6 +23,7 @@ const ICON = {
   search: '<svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
   inbox: '<svg class="icon" viewBox="0 0 24 24"><path d="M3 13h5l2 3h4l2-3h5M5 4h14l2 9v7H3v-7z"/></svg>',
   close: '<svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
+  stop: '<svg class="icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
   send: '<svg class="icon" viewBox="0 0 24 24"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4z"/></svg>',
 };
 function sourceLabel(s) { return SOURCE_LABELS[s] || s || "unknown"; }
@@ -571,6 +572,9 @@ async function openDetail(id, cardEl) {
   detail.querySelectorAll(".tag-clear").forEach(b => b.addEventListener("click", () =>
     sendTag(c.id, b.dataset.group, null, "clear")));               // tag null = clear the whole group, one request
   if (c.turns_supported) wireComposer(c);
+  // a turn still running (sent before a reload, from another tab, or before navigating away)
+  // is followed again from its first event
+  if (c.turns_supported && c.active_turn) followTurn(c.id, c.active_turn.turn_id);
   $("detail-pane").scrollTop = 0;
 }
 
@@ -728,6 +732,7 @@ function composerHTML() {
       <div class="composer-row">
         <label class="chip" title="Let the tool edit files in the conversation's directory. Shell commands are never allowed."><input type="checkbox" id="turn-edits"> Allow edits</label>
         <span class="turn-status" id="turn-status">${hint}</span>
+        <button class="btn danger" id="turn-stop" hidden title="Stop the tool. What it already wrote stays in the transcript.">${ICON.stop}<span class="label">Stop</span></button>
         <button class="btn primary" id="turn-send"${turnToken ? "" : " disabled"}>${ICON.send}<span class="label">Send</span></button>
       </div>
     </div>`;
@@ -737,6 +742,7 @@ function wireComposer(c) {
   const edits = $("turn-edits");
   edits.addEventListener("change", () => edits.closest(".chip").classList.toggle("on", edits.checked));
   $("turn-send").addEventListener("click", () => sendTurn(c.id));
+  $("turn-stop").addEventListener("click", stopTurn);
   $("turn-prompt").addEventListener("keydown", e => {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendTurn(c.id); }
   });
@@ -754,6 +760,25 @@ function setComposerBusy(busy) {
   if (!$("turn-send")) return;
   $("turn-send").disabled = busy || !turnToken;
   $("turn-edits").disabled = busy;
+  $("turn-stop").hidden = !busy;
+  $("turn-stop").disabled = false;
+}
+
+async function stopTurn() {
+  const s = turnStream;
+  if (!s || s.finished) return;
+  $("turn-stop").disabled = true;
+  turnStatus("Stopping…", "busy");
+  let res;
+  try {
+    res = await fetch(`/api/turn/${encodeURIComponent(s.turnId)}`, { method: "DELETE", headers: turnHeaders() });
+  } catch (e) { res = null; }
+  if (turnStream !== s || s.finished) return;  // the terminal event says how it ended
+  if (!res || !res.ok) {
+    const body = res ? await res.json().catch(() => ({})) : {};
+    $("turn-stop").disabled = false;
+    turnStatus(`Could not stop the turn: ${body.error || (res ? res.status : "the server did not answer")}`, "error");
+  }
 }
 
 async function sendTurn(convId) {
@@ -877,7 +902,7 @@ async function finishTurn(s, ev) {
   const cost = ev.cost_usd != null ? ` · ${fmtUsd(ev.cost_usd)}` : "";
   if (ev.kind === "error") {
     if (ev.stderr) liveStep(s, "harness", "Harness", firstLine(ev.stderr), ev.stderr, "stderr");
-    turnStatus(`${ev.message || "The turn failed."}${cost}`, "error");
+    turnStatus(`${ev.message === "stopped" ? "Stopped." : ev.message || "The turn failed."}${cost}`, "error");
     return;
   }
   if (!ev.indexed) { turnStatus(`Done${cost}. Not in the transcript yet: ${ev.reason}`, "warn"); return; }
