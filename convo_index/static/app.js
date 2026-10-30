@@ -469,7 +469,12 @@ function toggleDetailsPanel(open) {
   open = open === undefined ? !detail.classList.contains("details-open") : open;
   detail.classList.toggle("details-open", open);
   btn.setAttribute("aria-expanded", String(open));
-  if (NARROW.matches) return;
+  if (NARROW.matches) {
+    // the drawer covers the transcript: focus goes into it, and back to the button on close
+    if (open) $("details-close").focus();
+    else if ($("details-panel").contains(document.activeElement) || document.activeElement === document.body) btn.focus();   // a re-render drops focus to the body
+    return;
+  }
   try { localStorage.setItem("detailsPanel", open ? "open" : "closed"); } catch (e) { /* not remembered */ }
 }
 
@@ -596,7 +601,7 @@ async function openDetail(id, cardEl) {
       </aside>
     </div>`;
   $("details-toggle").addEventListener("click", () => toggleDetailsPanel());
-  $("details-close").addEventListener("click", () => { toggleDetailsPanel(false); $("details-toggle").focus(); });
+  $("details-close").addEventListener("click", () => toggleDetailsPanel(false));
   const tagEdit = detail.querySelector(".tag-edit");
   if (tagEdit) tagEdit.addEventListener("toggle", () => { tagEditOpen = tagEdit.open; });
   $("detail-back").addEventListener("click", closeDetail);
