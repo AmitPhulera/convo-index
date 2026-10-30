@@ -41,30 +41,35 @@
     </button>
   </header>
 
-  <section class="searchbar" aria-label="Search and filters">
-    <div class="search-row">
-      <div class="segmented" id="mode" role="group" aria-label="Search mode">
-        <button type="button" data-mode="hybrid" aria-pressed="true" title="Keyword and meaning combined">Hybrid</button>
-        <button type="button" data-mode="keyword" aria-pressed="false" title="Exact words and phrases">Keyword</button>
-        <button type="button" data-mode="semantic" aria-pressed="false" title="Similar meaning, even with different words">Semantic</button>
-      </div>
-    </div>
-    <div class="filters" id="filters">
-      <span id="source-filters" class="chip-group" aria-label="Sources"></span>
-      <span id="tag-filters" class="chip-group" aria-label="Tags"></span>
-      <span class="chip-group" aria-label="Options">
-        <span class="chip-group-label">Show</span>
-        <label class="chip" title="Only conversations that mention a ticket"><input type="checkbox" id="f-ticket"> Has ticket</label>
-        <label class="chip" title="Include conversations you hid"><input type="checkbox" id="f-hidden"> Hidden</label>
-        <label class="chip" title="Include sub-agent sessions spawned by another conversation"><input type="checkbox" id="f-children"> Sub-sessions</label>
-      </span>
-      <button class="btn ghost clear-filters" id="clear-filters" type="button">Clear filters</button>
-    </div>
-  </section>
-
   <main class="layout">
     <section id="list-pane" aria-label="Results">
-      <div class="results-head"><span class="count" id="results-count"></span><span class="hint" id="results-hint"></span></div>
+      <div class="results-head">
+        <span class="count" id="results-count"></span><span class="hint" id="results-hint"></span>
+        <button class="btn" id="filters-toggle" type="button" aria-expanded="false" aria-controls="filters-panel">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M4 6h16M7 12h10M10 18h4"/></svg><span class="label">Filters</span><span class="filter-count" id="filter-count"></span>
+        </button>
+      </div>
+      <div class="filters-panel" id="filters-panel" hidden>
+        <div class="chip-group"><span class="chip-group-label">Search</span>
+          <div class="segmented small" id="mode" role="group" aria-label="Search mode">
+            <button type="button" data-mode="hybrid" aria-pressed="true" title="Keyword and meaning combined">Hybrid</button>
+            <button type="button" data-mode="keyword" aria-pressed="false" title="Exact words and phrases">Keyword</button>
+            <button type="button" data-mode="semantic" aria-pressed="false" title="Similar meaning, even with different words">Semantic</button>
+          </div>
+        </div>
+        <div class="filters" id="filters">
+          <span id="source-filters" class="chip-group" aria-label="Sources"></span>
+          <span id="tag-filters" class="chip-group" aria-label="Tags"></span>
+          <span class="chip-group" aria-label="Options">
+            <span class="chip-group-label">Show</span>
+            <label class="chip" title="Only conversations that mention a ticket"><input type="checkbox" id="f-ticket"> Has ticket</label>
+            <label class="chip" title="Include conversations you hid"><input type="checkbox" id="f-hidden"> Hidden</label>
+            <label class="chip" title="Include sub-agent sessions spawned by another conversation"><input type="checkbox" id="f-children"> Sub-sessions</label>
+          </span>
+          <button class="btn ghost clear-filters" id="clear-filters" type="button">Clear filters</button>
+        </div>
+      </div>
+      <div class="active-filters" id="active-filters" aria-label="Active filters"></div>
       <ul id="results"></ul>
     </section>
     <section id="detail-pane" aria-label="Conversation">

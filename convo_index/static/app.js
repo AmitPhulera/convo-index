@@ -48,7 +48,22 @@ function wireChips(container) {
 function anyFilterActive() {
   return !!projectFilter || document.querySelectorAll("#filters .chip input:checked").length > 0;
 }
-function updateFilterState() { $("filters").classList.toggle("active", anyFilterActive()); }
+// The filters live in a panel behind one button; what is switched on shows as removable chips
+// above the results, so a closed panel never hides why the list is short.
+function updateFilterState() {
+  $("filters").classList.toggle("active", anyFilterActive());
+  const active = Array.from(document.querySelectorAll("#filters .chip input:checked")).map(el => ({
+    label: el.classList.contains("f-tag") ? el.value.replace(":", ": ") : el.closest(".chip").textContent.trim(),
+    remove: () => { el.checked = false; el.dispatchEvent(new Event("change")); },
+  }));
+  if (projectFilter) active.unshift({ label: "Project " + shortPath(projectFilter), remove: () => { projectFilter = null; updateFilterState(); runSearch(); } });
+  const box = $("active-filters");
+  box.innerHTML = active.map((f, i) =>
+    `<button type="button" class="active-chip" data-i="${i}" aria-label="Remove filter ${escape(f.label)}">${escape(f.label)}${ICON.close}</button>`).join("");
+  box.querySelectorAll(".active-chip").forEach(b => b.addEventListener("click", () => active[Number(b.dataset.i)].remove()));
+  $("filter-count").textContent = active.length ? String(active.length) : "";
+  $("filters-toggle").classList.toggle("on", active.length > 0);
+}
 function clearFilters() {
   document.querySelectorAll("#filters .chip input:checked").forEach(el => { el.checked = false; el.closest(".chip").classList.remove("on"); });
   projectFilter = null;
@@ -163,13 +178,7 @@ function emptyState(title, text, action) {
 function render(items, srcs, q) {
   const ul = $("results");
   ul.innerHTML = "";
-  if (projectFilter) {
-    const chipEl = document.createElement("div");
-    chipEl.className = "filter-chip";
-    chipEl.innerHTML = `Project <code title="${escape(projectFilter)}">${escape(shortPath(projectFilter))}</code> <button id="clear-project" aria-label="Remove project filter">${ICON.close}</button>`;
-    chipEl.querySelector("#clear-project").onclick = () => { projectFilter = null; updateFilterState(); runSearch(); };
-    ul.appendChild(chipEl);
-  }
+  updateFilterState();
   const filtered = items;
   currentIds = filtered.map(i => i.id);
   const n = filtered.length;
@@ -1023,6 +1032,11 @@ $("q-clear").addEventListener("click", () => { $("q").value = ""; $("search-box"
 document.querySelectorAll("#mode button").forEach(b => b.addEventListener("click", () => { if (!b.disabled) { setMode(b.dataset.mode); runSearch(); } }));
 wireChips(document.querySelector('#filters .chip-group[aria-label="Options"]'));
 $("clear-filters").addEventListener("click", clearFilters);
+$("filters-toggle").addEventListener("click", () => {
+  const panel = $("filters-panel"), open = panel.hidden;
+  panel.hidden = !open;
+  $("filters-toggle").setAttribute("aria-expanded", String(open));
+});
 $("refresh").addEventListener("click", async () => {
   const btn = $("refresh");
   btn.disabled = true;
