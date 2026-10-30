@@ -1075,7 +1075,9 @@ document.addEventListener("keydown", e => {
   const typing = tag === "input" || tag === "textarea" || tag === "select" || e.target.isContentEditable;
   // Chrome clears an <input type=search> on Escape; blur instead so the query survives.
   if (e.key === "Escape") {
-    if (typing) { e.preventDefault(); e.target.blur(); }
+    const filters = $("filters-panel");
+    if (!filters.hidden && (!typing || filters.contains(e.target))) setFiltersOpen(false, true);   // the panel first
+    else if (typing) { e.preventDefault(); e.target.blur(); }
     else if (NARROW.matches && $("detail").classList.contains("details-open")) toggleDetailsPanel(false);   // the drawer first
     else closeDetail();
     return;
@@ -1095,11 +1097,12 @@ $("q-clear").addEventListener("click", () => { $("q").value = ""; $("search-box"
 document.querySelectorAll("#mode button").forEach(b => b.addEventListener("click", () => { if (!b.disabled) { setMode(b.dataset.mode); runSearch(); } }));
 wireChips(document.querySelector('#filters .chip-group[aria-label="Options"]'));
 $("clear-filters").addEventListener("click", clearFilters);
-$("filters-toggle").addEventListener("click", () => {
-  const panel = $("filters-panel"), open = panel.hidden;
-  panel.hidden = !open;
+function setFiltersOpen(open, refocus) {
+  $("filters-panel").hidden = !open;
   $("filters-toggle").setAttribute("aria-expanded", String(open));
-});
+  if (refocus) $("filters-toggle").focus();
+}
+$("filters-toggle").addEventListener("click", () => setFiltersOpen($("filters-panel").hidden));
 $("refresh").addEventListener("click", async () => {
   const btn = $("refresh");
   btn.disabled = true;
