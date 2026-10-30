@@ -23,6 +23,8 @@ const ICON = {
   search: '<svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
   inbox: '<svg class="icon" viewBox="0 0 24 24"><path d="M3 13h5l2 3h4l2-3h5M5 4h14l2 9v7H3v-7z"/></svg>',
   close: '<svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
+  stop: '<svg class="icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
+  send: '<svg class="icon" viewBox="0 0 24 24"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4z"/></svg>',
 };
 function sourceLabel(s) { return SOURCE_LABELS[s] || s || "unknown"; }
 function sourceBadge(s) { return `<span class="badge src ${escape(s || "")}">${escape(sourceLabel(s))}</span>`; }
@@ -445,6 +447,8 @@ function applyTranscriptView(view) {
 }
 
 async function openDetail(id, cardEl) {
+  detachTurn();
+  const gen = ++detailView;
   selectedId = id;
   if (location.hash.slice(1) !== id) location.hash = id;
   document.querySelectorAll(".card.selected").forEach(c => c.classList.remove("selected"));
@@ -456,10 +460,18 @@ async function openDetail(id, cardEl) {
   detail.className = "";
   detail.innerHTML = `<div class="detail-body"><div class="skeleton" style="border:0;padding:0"><div class="sk w60"></div><div class="sk w40"></div><div class="sk w80"></div><div class="sk w80"></div></div></div>`;
 
-  const res = await fetch("/api/conversation/" + encodeURIComponent(id));
-  if (selectedId !== id) return;                       // the user already moved on
-  if (!res.ok) { detail.innerHTML = `<div class="detail-body">${emptyState("Could not load this conversation", `The server returned ${res.status}.`).replace(/^<li/, "<div").replace(/li>$/, "div>")}</div>`; return; }
-  const c = await res.json();
+  const failed = why => { detail.innerHTML = `<div class="detail-body">${emptyState("Could not load this conversation", why).replace(/^<li/, "<div").replace(/li>$/, "div>")}</div>`; };
+  let res, c;
+  try {
+    res = await fetch("/api/conversation/" + encodeURIComponent(id));
+    if (gen !== detailView) return;                    // the user already moved on
+    if (!res.ok) { failed(`The server returned ${res.status}.`); return; }
+    c = await res.json();
+  } catch (e) {
+    if (gen === detailView) failed("The server did not answer. Is it still running?");
+    return;
+  }
+  if (gen !== detailView) return;
   selectedId = c.id;  // legacy ids resolve server-side to the namespaced id
 
   const tickets = (c.tickets || []).map(ticketLink).join("");
@@ -528,6 +540,7 @@ async function openDetail(id, cardEl) {
           ${viewBtn("replies", "Replies only", "Only your messages and each final reply; the steps in between fold into a counter")}
         </div>` : ""}</div>
       ${msgs}
+      ${c.turns_supported ? composerHTML() : ""}
     </div>`;
   $("detail-back").addEventListener("click", closeDetail);
   $("btn-hide").addEventListener("click", () => toggleHide(c.id, c.hidden ? 0 : 1));
@@ -567,7 +580,11 @@ async function openDetail(id, cardEl) {
   }));
   detail.querySelectorAll(".tag-clear").forEach(b => b.addEventListener("click", () =>
     sendTag(c.id, b.dataset.group, null, "clear")));               // tag null = clear the whole group, one request
+  if (c.turns_supported) wireComposer(c);
   $("detail-pane").scrollTop = 0;
+  // a turn still running (sent before a reload, from another tab, or before navigating away)
+  // is followed again from its first event
+  if (c.turns_supported && c.active_turn) followTurn(c.id, c.active_turn.turn_id, c.active_turn.edits);
 }
 
 // Linkable references as badges with links; non-linkable ones (bare "PR 123", commits, urls)
@@ -690,12 +707,292 @@ async function deleteConv(id) {
 
 const EMPTY_DETAIL = $("detail").innerHTML;
 function closeDetail() {
+  detachTurn();
+  detailView++;
   document.body.classList.remove("detail-open");
   selectedId = null;
   document.querySelectorAll(".card.selected").forEach(c => c.classList.remove("selected"));
   $("detail").className = "empty";
   $("detail").innerHTML = EMPTY_DETAIL;
   if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+}
+
+// Browser turns: the message box under a transcript runs one more turn of the conversation
+// in the tool that owns it (server.py, turns.py) and streams what the tool does. There is one
+// stream per page, owned by the detail view: opening another conversation or closing this one
+// aborts the fetch, never the turn.
+let turnStream = null;        // {convId, turnId, controller, seen, bubble, text, denied, finished, lost}
+let detailView = 0;           // bumped whenever the detail pane is replaced: late responses check it
+const turnPrompts = new Map();    // turn id -> what was typed, so a re-render can show it again
+
+function turnHeaders(extra) {
+  return Object.assign({ "X-Convo-Index": "1", "X-Convo-Index-Turn": turnToken || "" }, extra);
+}
+
+function detachTurn() {
+  if (turnStream) { turnStream.controller.abort(); turnStream = null; }
+}
+
+function composerHTML() {
+  const send = /Mac/.test(navigator.platform) ? "⌘" : "Ctrl";
+  const hint = turnToken ? `<kbd>${send}</kbd><kbd>Enter</kbd> to send`
+    : "To send messages here, open the UI through the URL <code>convo-index serve</code> or <code>up</code> prints.";
+  return `<div id="turn-live"></div>
+    <div class="composer" id="composer">
+      <textarea id="turn-prompt" rows="2" placeholder="Continue this conversation…"${turnToken ? "" : " disabled"}></textarea>
+      <div class="composer-row">
+        <label class="chip" title="Let the tool edit files in the conversation's directory. Shell commands are never allowed."><input type="checkbox" id="turn-edits"> Allow edits</label>
+        <span class="turn-status" id="turn-status">${hint}</span>
+        <button class="btn danger" id="turn-stop" hidden title="Stop the tool. What it already wrote stays in the transcript.">${ICON.stop}<span class="label">Stop</span></button>
+        <button class="btn primary" id="turn-send"${turnToken ? "" : " disabled"}>${ICON.send}<span class="label">Send</span></button>
+      </div>
+    </div>`;
+}
+
+function wireComposer(c) {
+  const edits = $("turn-edits");
+  edits.addEventListener("change", () => edits.closest(".chip").classList.toggle("on", edits.checked));
+  $("turn-send").addEventListener("click", () => sendTurn(c.id));
+  $("turn-stop").addEventListener("click", stopTurn);
+  $("turn-prompt").addEventListener("keydown", e => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendTurn(c.id); }
+  });
+}
+
+// Server messages are shown verbatim, so the status line is always set as text.
+function turnStatus(text, kind) {
+  const el = $("turn-status");
+  if (!el) return;
+  el.className = "turn-status" + (kind ? " " + kind : "");
+  el.textContent = text;
+}
+
+function setComposerBusy(busy) {
+  if (!$("turn-send")) return;
+  $("turn-send").disabled = busy || !turnToken;
+  $("turn-edits").disabled = busy;
+  $("turn-stop").hidden = !busy;
+  $("turn-stop").disabled = false;
+}
+
+function showEdits(on) {
+  const edits = $("turn-edits");
+  if (!edits) return;
+  edits.checked = on;
+  edits.closest(".chip").classList.toggle("on", on);
+}
+
+// The live output sits just above the pinned message box: keep it in view while the reader is
+// already at the bottom, without pulling them down while they read further up.
+function followLive(force) {
+  const pane = $("detail-pane");
+  if (force || pane.scrollHeight - pane.scrollTop - pane.clientHeight < 160) pane.scrollTop = pane.scrollHeight;
+}
+
+async function activeTurn(convId) {
+  try {
+    const res = await fetch("/api/conversation/" + encodeURIComponent(convId));
+    return res.ok ? (await res.json()).active_turn : null;
+  } catch (e) { return null; }
+}
+
+async function stopTurn() {
+  const s = turnStream;
+  if (!s || s.finished) return;
+  $("turn-stop").disabled = true;
+  turnStatus("Stopping…", "busy");
+  let res = null, body = {};
+  try {
+    res = await fetch(`/api/turn/${encodeURIComponent(s.turnId)}`, { method: "DELETE", headers: turnHeaders() });
+    if (!res.ok) body = await res.json().catch(() => ({}));
+  } catch (e) { /* reported below */ }
+  if (turnStream !== s || s.finished) return;  // the terminal event says how it ended
+  if (res && res.ok) {
+    // with the stream lost no terminal event will arrive: the stop is the end
+    if (s.lost) finishTurn(s, { kind: "error", message: "stopped" });
+    return;
+  }
+  $("turn-stop").disabled = false;
+  turnStatus(`Could not stop the turn: ${body.error || (res ? res.status : "the server did not answer")}`, "error");
+}
+
+async function sendTurn(convId) {
+  const box = $("turn-prompt"), prompt = box.value, edits = $("turn-edits").checked;
+  if (!prompt.trim() || $("turn-send").disabled) return;
+  const view = detailView;
+  box.value = "";                              // what is typed from here on is the next message
+  $("turn-send").disabled = true;              // Stop appears once the turn has an id to stop
+  $("turn-edits").disabled = true;
+  turnStatus("Starting…", "busy");
+  const restore = (message) => {
+    if (!box.value) box.value = prompt;
+    setComposerBusy(false);
+    turnStatus(message, "error");
+  };
+  let res = null, body = null;
+  try {
+    res = await fetch(`/api/conversation/${encodeURIComponent(convId)}/turn`, {
+      method: "POST", headers: turnHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ prompt, edits }),
+    });
+    body = await res.json().catch(() => null);
+  } catch (e) { /* no answer: the turn may have started anyway */ }
+  if (view !== detailView) return;             // reopening the conversation picks the turn up
+  if (res && res.ok && body && body.turn_id) {
+    turnPrompts.set(body.turn_id, prompt);
+    return followTurn(convId, body.turn_id, edits);
+  }
+  if (res && !res.ok) return restore((body && body.error) || `The server returned ${res.status}.`);
+  const active = await activeTurn(convId);     // the answer was lost: did the turn start?
+  if (view !== detailView) return;
+  if (active) {
+    turnPrompts.set(active.turn_id, prompt);
+    return followTurn(convId, active.turn_id, active.edits);
+  }
+  restore("The server did not answer, and no turn is running. Send again to retry.");
+}
+
+// Reads the turn's server-sent events. A dropped connection resumes from the last event seen
+// (`after`), so nothing is shown twice; retries back off and start over once events flow again.
+async function followTurn(convId, turnId, edits) {
+  if (turnStream && turnStream.turnId === turnId && !turnStream.finished) return;   // already following it
+  detachTurn();
+  const s = { convId, turnId, controller: new AbortController(), seen: 0, bubble: null, text: "", denied: [], finished: false, lost: false };
+  turnStream = s;
+  setComposerBusy(true);
+  if (edits !== undefined) showEdits(!!edits);
+  turnStatus("Running…", "busy");
+  if (turnPrompts.has(turnId)) liveAppend(liveMsg("user", "You", renderMessageBody(turnPrompts.get(turnId))));
+  followLive(true);
+  let failures = 0;
+  while (!s.finished && turnStream === s) {
+    const before = s.seen;
+    try {
+      const res = await fetch(`/api/turn/${encodeURIComponent(turnId)}?after=${s.seen}`,
+                              { headers: turnHeaders(), signal: s.controller.signal });
+      if (turnStream !== s) return;
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        if (turnStream !== s) return;
+        return finishTurn(s, { kind: "error", message: body.error || `The server returned ${res.status}.` });
+      }
+      await readTurnEvents(res.body.getReader(), s);
+    } catch (e) {
+      if (s.controller.signal.aborted) return;
+    }
+    if (turnStream !== s || s.finished) return;
+    failures = s.seen > before ? 0 : failures + 1;
+    if (failures > 5) {
+      s.lost = true;                           // Stop still works; the turn keeps running
+      turnStatus("Lost the connection to the turn. It keeps running on the server; reopen the conversation to follow it.", "error");
+      return;
+    }
+    if (failures) await new Promise(r => setTimeout(r, 250 * 2 ** failures));
+  }
+}
+
+// Server-sent events, framed by a blank line; LF, CRLF and CR line ends are all accepted.
+async function readTurnEvents(reader, s) {
+  const decoder = new TextDecoder();
+  let buf = "", cr = false;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done || turnStream !== s) return;
+    let chunk = decoder.decode(value, { stream: true });
+    if (cr && chunk.startsWith("\n")) chunk = chunk.slice(1);    // the CRLF was split across chunks
+    cr = chunk.endsWith("\r");
+    buf += chunk.replace(/\r\n?/g, "\n");
+    let cut;
+    while ((cut = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, cut);
+      buf = buf.slice(cut + 2);
+      let id = null, data = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("id: ")) id = Number(line.slice(4));
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;                     // a keepalive comment
+      if (id !== null) s.seen = id;            // the id is the count of events seen
+      turnEvent(s, JSON.parse(data));
+      if (s.finished) return;
+    }
+  }
+}
+
+function liveMsg(cls, role, bodyHTML, kind) {
+  const el = document.createElement("div");
+  el.className = `msg ${cls} live`;
+  el.innerHTML = `<div class="msg-head"><span class="role-tag">${escape(role)}</span>${kind ? `<span class="harness-kind">${escape(kind)}</span>` : ""}</div>
+    <div class="msg-body">${bodyHTML}</div>`;
+  return el;
+}
+function liveAppend(el) {
+  const live = $("turn-live");
+  if (!live) return;
+  live.appendChild(el);
+  followLive();
+}
+// Tool activity is one collapsed line, like in the transcript; the next text starts a new bubble.
+function liveStep(s, cls, role, summary, detail, kind) {
+  s.bubble = null;
+  const body = `<details><summary>${escape(summary.slice(0, 140))}</summary>${detail ? `<pre>${escape(detail)}</pre>` : ""}</details>`;
+  liveAppend(liveMsg(cls, role, body, kind));
+}
+
+function turnEvent(s, ev) {
+  const show = x => typeof x === "string" ? x : JSON.stringify(x, null, 2);
+  switch (ev.kind) {
+    case "text":
+      if (!s.bubble) { s.bubble = liveMsg("assistant", "Assistant", ""); s.text = ""; liveAppend(s.bubble); }
+      s.text += (s.text ? "\n\n" : "") + ev.text;
+      s.bubble.querySelector(".msg-body").innerHTML = renderMessageBody(s.text);
+      followLive();
+      return;
+    case "tool":
+      return liveStep(s, "assistant tool_call", "Assistant", ev.name || "tool", show(ev.input));
+    case "tool_result":
+      return liveStep(s, "tool tool_result", "Tool", firstLine(ev.text) || (ev.error ? "failed" : "(no output)"), ev.text);
+    case "denied":
+      s.denied.push(ev.name || "tool");
+      return liveStep(s, "harness", "Harness", `${ev.name || "tool"}: finish this step in the terminal`, show(ev.input), "denied");
+    case "gap":
+      return liveStep(s, "harness", "Harness", `${ev.missed} earlier event${ev.missed === 1 ? " was" : "s were"} dropped from the buffer`, "", "gap");
+    case "done":
+    case "error":
+      return finishTurn(s, ev);
+  }
+}
+
+// Whatever the tool wrote is indexed after every exit, a stopped or failed turn included, so
+// the conversation reloads whenever the index has it; the status line and the tool's stderr
+// (neither is in the transcript) are put back after the reload.
+async function finishTurn(s, ev) {
+  s.finished = true;
+  setComposerBusy(false);
+  // what the tool reports is priced at API rates; on a subscription nothing is charged per turn
+  const cost = ev.cost_usd != null ? ` · ≈ ${fmtUsd(ev.cost_usd)} API-equivalent` : "";
+  const failed = ev.kind === "error";
+  const denied = [...new Set(s.denied)];
+  let status = failed ? `${ev.message === "stopped" ? "Stopped." : ev.message || "The turn failed."}${cost}` : `Done${cost}.`;
+  if (denied.length) status += ` Not allowed here: ${denied.join(", ")}; finish that step in the terminal.`;
+  const kind = failed ? "error" : denied.length ? "warn" : "";
+  const stderr = () => { if (ev.stderr) liveStep(s, "harness", "Harness", firstLine(ev.stderr), ev.stderr, "stderr"); };
+  if (!ev.indexed) {
+    stderr();
+    turnStatus(ev.reason ? `${status} Not in the transcript yet: ${ev.reason}` : status, kind || "warn");
+    return;
+  }
+  if (!failed) toast(`Turn finished${cost}.`, "success");
+  runSearch();
+  if (turnStream !== s) return;                // the user moved on
+  const draft = $("turn-prompt") ? $("turn-prompt").value : "";
+  await openDetail(s.convId);                  // the new messages are indexed by now
+  if (selectedId !== s.convId || !$("composer")) return;
+  if (draft && !$("turn-prompt").value) $("turn-prompt").value = draft;
+  stderr();
+  turnStatus(status, kind);
+  followLive(true);
+  $("turn-prompt").focus();
 }
 
 // Keyboard: ↑/↓ or j/k move through results, Enter opens, Esc closes, / focuses search.

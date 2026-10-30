@@ -366,6 +366,30 @@ body.hide-steps .steps-toggle[aria-expanded="true"]::before { transform: rotate(
 body.hide-steps .steps-toggle:hover { color: var(--text); }
 body.hide-steps .steps-toggle + .msg { border-top: 0; }
 
+/* Message box: one more turn of the conversation, streamed in as it runs */
+/* pinned to the bottom of the pane, so it is visible that the conversation can go on */
+.composer {
+  position: sticky; bottom: 0; z-index: 5; margin: 12px 0 -40px; padding: 12px 0 16px;
+  background: var(--surface); border-top: 1px solid var(--border); box-shadow: 0 -10px 16px -12px rgba(20, 24, 40, .18);
+}
+.composer textarea {
+  display: block; width: 100%; box-sizing: border-box; min-height: 56px; max-height: 40vh; resize: vertical; padding: 10px 12px;
+  font: 14px/1.5 var(--font); color: var(--text); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius);
+}
+.composer textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.composer textarea:disabled { background: var(--surface-2); cursor: not-allowed; }
+.composer-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+.composer-row .chip:has(input:disabled) { opacity: .55; cursor: default; }
+.composer-row .btn[hidden] { display: none; }
+.turn-status { flex: 1; min-width: 0; font-size: 12.5px; color: var(--text-3); overflow-wrap: anywhere; }
+.turn-status kbd { margin: 0 2px; }
+.turn-status code { font: 12px var(--mono); }
+.turn-status.busy { color: var(--text-2); }
+.turn-status.busy::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+.turn-status.warn { color: var(--warn); }
+.turn-status.error { color: var(--danger); }
+@keyframes pulse { 50% { opacity: .25; } }
+
 /* Slash-command pill and command output */
 .cmd-badge { display: inline-flex; align-items: center; gap: 6px; font: 12.5px var(--mono); background: var(--info-soft); color: var(--info); padding: 3px 10px; border-radius: 8px; }
 .cmd-badge::before { content: "/"; opacity: .6; }
