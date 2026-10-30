@@ -940,28 +940,35 @@ function turnEvent(s, ev) {
   }
 }
 
+// Whatever the tool wrote is indexed after every exit, a stopped or failed turn included, so
+// the conversation reloads whenever the index has it; the status line and the tool's stderr
+// (neither is in the transcript) are put back after the reload.
 async function finishTurn(s, ev) {
   s.finished = true;
   setComposerBusy(false);
   // what the tool reports is priced at API rates; on a subscription nothing is charged per turn
   const cost = ev.cost_usd != null ? ` · ≈ ${fmtUsd(ev.cost_usd)} API-equivalent` : "";
-  if (ev.kind === "error") {
-    if (ev.stderr) liveStep(s, "harness", "Harness", firstLine(ev.stderr), ev.stderr, "stderr");
-    turnStatus(`${ev.message === "stopped" ? "Stopped." : ev.message || "The turn failed."}${cost}`, "error");
+  const failed = ev.kind === "error";
+  const denied = [...new Set(s.denied)];
+  let status = failed ? `${ev.message === "stopped" ? "Stopped." : ev.message || "The turn failed."}${cost}` : `Done${cost}.`;
+  if (denied.length) status += ` Not allowed here: ${denied.join(", ")}; finish that step in the terminal.`;
+  const kind = failed ? "error" : denied.length ? "warn" : "";
+  const stderr = () => { if (ev.stderr) liveStep(s, "harness", "Harness", firstLine(ev.stderr), ev.stderr, "stderr"); };
+  if (!ev.indexed) {
+    stderr();
+    turnStatus(ev.reason ? `${status} Not in the transcript yet: ${ev.reason}` : status, kind || "warn");
     return;
   }
-  if (!ev.indexed) { turnStatus(`Done${cost}. Not in the transcript yet: ${ev.reason}`, "warn"); return; }
-  toast(`Turn finished${cost}.`, "success");
+  if (!failed) toast(`Turn finished${cost}.`, "success");
   runSearch();
-  if (selectedId !== s.convId) return;
+  if (turnStream !== s) return;                // the user moved on
   const draft = $("turn-prompt") ? $("turn-prompt").value : "";
   await openDetail(s.convId);                  // the new messages are indexed by now
   const box = $("composer");
   if (!box || selectedId !== s.convId) return;
   if (draft && !$("turn-prompt").value) $("turn-prompt").value = draft;
-  // the transcript does not record what was denied, so the status line keeps saying it
-  if (s.denied.length) turnStatus(`Done${cost}. Not allowed here: ${[...new Set(s.denied)].join(", ")}; finish that step in the terminal.`, "warn");
-  else turnStatus(`Done${cost}.`);
+  stderr();
+  turnStatus(status, kind);
   box.scrollIntoView({ block: "end" });
   $("turn-prompt").focus();
 }
