@@ -455,9 +455,12 @@ function applyTranscriptView(view) {
 }
 
 // The details panel (summary, tags, references, resume) sits beside the transcript and is
-// open by default; closing it is remembered in this browser.
+// open by default; closing it is remembered in this browser. Below 1200px it is a drawer over
+// the transcript instead: closed until asked for, and never remembered.
 let tagEditOpen = false;
+const NARROW = window.matchMedia("(max-width: 1200px)");
 function detailsPanelOpen() {
+  if (NARROW.matches) return false;
   try { return localStorage.getItem("detailsPanel") !== "closed"; } catch (e) { return true; }
 }
 function toggleDetailsPanel(open) {
@@ -466,6 +469,7 @@ function toggleDetailsPanel(open) {
   open = open === undefined ? !detail.classList.contains("details-open") : open;
   detail.classList.toggle("details-open", open);
   btn.setAttribute("aria-expanded", String(open));
+  if (NARROW.matches) return;
   try { localStorage.setItem("detailsPanel", open ? "open" : "closed"); } catch (e) { /* not remembered */ }
 }
 
@@ -473,7 +477,7 @@ function toggleDetailsPanel(open) {
 function costShort(u) {
   if (!u || !u.requests || !u.coverage) return "";     // nothing priced: say nothing rather than "$0"
   const x = u.estimated_cost || 0;
-  return `<span title="API-equivalent estimate">${u.coverage < 1 ? "≥ " : "≈ "}${x >= 1 ? "$" + x.toFixed(2) : "$" + x.toFixed(4)}</span>`;
+  return `<span class="mi" title="API-equivalent estimate">${u.coverage < 1 ? "≥ " : "≈ "}${x >= 1 ? "$" + x.toFixed(2) : "$" + x.toFixed(4)}</span>`;
 }
 
 async function openDetail(id, cardEl) {
@@ -527,14 +531,14 @@ async function openDetail(id, cardEl) {
     c.fidelity && c.fidelity !== "full" ? `<span class="badge fidelity">${escape(c.fidelity)} transcript</span>` : "",
     (c.warnings || []).length ? `<span class="badge fidelity" title="${escape(c.warnings.join("; "))}">⚠ ${c.warnings.length} warning${c.warnings.length > 1 ? "s" : ""}</span>` : "",
   ].join("");
-  const sep = `<span class="sep" aria-hidden="true">·</span>`;
+  // each item is its own element and the separators are CSS, so a phone can drop the paths
   const meta = [
-    `<span class="src-dot ${escape(c.source || "")}" aria-hidden="true"></span>${escape(sourceLabel(c.source))}`,
-    c.cwd ? `<span class="path" title="${escape(c.cwd)}">${escape(shortPath(c.cwd))}</span>` : "",
-    c.git_branch && c.git_branch !== "HEAD" ? `<span class="path" title="Git branch">⎇ ${escape(c.git_branch)}</span>` : "",
-    `${c.messages.length} message${c.messages.length === 1 ? "" : "s"}`,
+    `<span class="mi"><span class="src-dot ${escape(c.source || "")}" aria-hidden="true"></span>${escape(sourceLabel(c.source))}</span>`,
+    c.cwd ? `<span class="mi path" title="${escape(c.cwd)}">${escape(shortPath(c.cwd))}</span>` : "",
+    c.git_branch && c.git_branch !== "HEAD" ? `<span class="mi path" title="Git branch">⎇ ${escape(c.git_branch)}</span>` : "",
+    `<span class="mi">${c.messages.length} message${c.messages.length === 1 ? "" : "s"}</span>`,
     costShort(c.usage),
-  ].filter(Boolean).join(sep);
+  ].join("");
   const view = transcriptViewPref();
   const viewBtn = (v, label, title) => `<button type="button" data-view="${v}" aria-pressed="${view === v}" title="${title}">${label}</button>`;
   const open = detailsPanelOpen();
@@ -559,7 +563,7 @@ async function openDetail(id, cardEl) {
       <div class="toolbar">
         ${stepCount ? `<div class="segmented small" id="transcript-view" role="group" aria-label="Transcript view">
           ${viewBtn("replies", "Replies", "Only your messages and each final reply; the steps in between fold into a counter")}
-          ${viewBtn("all", "Everything", "Every message, with tool activity and thinking collapsed")}
+          ${viewBtn("all", "All", "Every message, with tool activity and thinking collapsed")}
         </div>` : ""}
         <button class="btn" id="details-toggle" type="button" aria-expanded="${open}" aria-controls="details-panel" title="Summary, tags, references and how to resume">${ICON.panel}<span class="label">Details</span></button>
       </div>
@@ -570,6 +574,7 @@ async function openDetail(id, cardEl) {
         ${c.turns_supported ? composerHTML(c) : ""}
       </div>
       <aside class="details-panel" id="details-panel" aria-label="Conversation details">
+        <div class="panel-head"><h2>Details</h2><button class="btn ghost icon-only" id="details-close" type="button" aria-label="Close details">${ICON.close}</button></div>
         ${section(`Continue in ${WINDOWS ? "PowerShell" : "the terminal"}`, resume ? `<div class="resume">
           <code class="resume-cmd" title="${escape(resume)}">${escape(resume)}</code>
           <button class="btn copy-btn" data-cmd="${escape(resume)}" onclick="copyCmd(this)">${ICON.copy}<span class="label">Copy</span></button>
@@ -588,6 +593,7 @@ async function openDetail(id, cardEl) {
       </aside>
     </div>`;
   $("details-toggle").addEventListener("click", () => toggleDetailsPanel());
+  $("details-close").addEventListener("click", () => { toggleDetailsPanel(false); $("details-toggle").focus(); });
   const tagEdit = detail.querySelector(".tag-edit");
   if (tagEdit) tagEdit.addEventListener("toggle", () => { tagEditOpen = tagEdit.open; });
   $("detail-back").addEventListener("click", closeDetail);
@@ -784,7 +790,7 @@ function detachTurn() {
 // The edits position is a Mode picker: Read-only, or Can edit files (never shell commands).
 function composerHTML(c) {
   const send = /Mac/.test(navigator.platform) ? "⌘" : "Ctrl";
-  const hint = turnToken ? `<kbd>${send}</kbd><kbd>Enter</kbd> to send`
+  const hint = turnToken ? `<span class="send-hint"><kbd>${send}</kbd><kbd>Enter</kbd> to send</span>`
     : "To send messages here, open the UI through the URL <code>convo-index serve</code> or <code>up</code> prints.";
   return `<div id="turn-live"></div>
     <div class="composer" id="composer">
@@ -1055,7 +1061,12 @@ document.addEventListener("keydown", e => {
   const tag = (e.target.tagName || "").toLowerCase();
   const typing = tag === "input" || tag === "textarea" || e.target.isContentEditable;
   // Chrome clears an <input type=search> on Escape; blur instead so the query survives.
-  if (e.key === "Escape") { if (typing) { e.preventDefault(); e.target.blur(); } else closeDetail(); return; }
+  if (e.key === "Escape") {
+    if (typing) { e.preventDefault(); e.target.blur(); }
+    else if (NARROW.matches && $("detail").classList.contains("details-open")) toggleDetailsPanel(false);   // the drawer first
+    else closeDetail();
+    return;
+  }
   if (typing) {
     if (e.target.id === "q" && e.key === "ArrowDown") { e.preventDefault(); moveSelection(1); }
     return;
