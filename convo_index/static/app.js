@@ -23,6 +23,7 @@ const ICON = {
   search: '<svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
   inbox: '<svg class="icon" viewBox="0 0 24 24"><path d="M3 13h5l2 3h4l2-3h5M5 4h14l2 9v7H3v-7z"/></svg>',
   close: '<svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
+  send: '<svg class="icon" viewBox="0 0 24 24"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4z"/></svg>',
 };
 function sourceLabel(s) { return SOURCE_LABELS[s] || s || "unknown"; }
 function sourceBadge(s) { return `<span class="badge src ${escape(s || "")}">${escape(sourceLabel(s))}</span>`; }
@@ -445,6 +446,7 @@ function applyTranscriptView(view) {
 }
 
 async function openDetail(id, cardEl) {
+  detachTurn();
   selectedId = id;
   if (location.hash.slice(1) !== id) location.hash = id;
   document.querySelectorAll(".card.selected").forEach(c => c.classList.remove("selected"));
@@ -528,6 +530,7 @@ async function openDetail(id, cardEl) {
           ${viewBtn("replies", "Replies only", "Only your messages and each final reply; the steps in between fold into a counter")}
         </div>` : ""}</div>
       ${msgs}
+      ${c.turns_supported ? composerHTML() : ""}
     </div>`;
   $("detail-back").addEventListener("click", closeDetail);
   $("btn-hide").addEventListener("click", () => toggleHide(c.id, c.hidden ? 0 : 1));
@@ -567,6 +570,7 @@ async function openDetail(id, cardEl) {
   }));
   detail.querySelectorAll(".tag-clear").forEach(b => b.addEventListener("click", () =>
     sendTag(c.id, b.dataset.group, null, "clear")));               // tag null = clear the whole group, one request
+  if (c.turns_supported) wireComposer(c);
   $("detail-pane").scrollTop = 0;
 }
 
@@ -690,12 +694,204 @@ async function deleteConv(id) {
 
 const EMPTY_DETAIL = $("detail").innerHTML;
 function closeDetail() {
+  detachTurn();
   document.body.classList.remove("detail-open");
   selectedId = null;
   document.querySelectorAll(".card.selected").forEach(c => c.classList.remove("selected"));
   $("detail").className = "empty";
   $("detail").innerHTML = EMPTY_DETAIL;
   if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+}
+
+// Browser turns: the message box under a transcript runs one more turn of the conversation
+// in the tool that owns it (server.py, turns.py) and streams what the tool does. There is one
+// stream per page, owned by the detail view: opening another conversation or closing this one
+// aborts the fetch, never the turn.
+let turnStream = null;        // {convId, turnId, controller, seen, bubble, text, finished}
+const turnPrompts = new Map();    // turn id -> what was typed, so a re-render can show it again
+
+function turnHeaders(extra) {
+  return Object.assign({ "X-Convo-Index": "1", "X-Convo-Index-Turn": turnToken || "" }, extra);
+}
+
+function detachTurn() {
+  if (turnStream) { turnStream.controller.abort(); turnStream = null; }
+}
+
+function composerHTML() {
+  const send = /Mac/.test(navigator.platform) ? "⌘" : "Ctrl";
+  const hint = turnToken ? `<kbd>${send}</kbd><kbd>Enter</kbd> to send`
+    : "To send messages here, open the UI through the URL <code>convo-index serve</code> or <code>up</code> prints.";
+  return `<div class="composer" id="composer">
+      <div id="turn-live"></div>
+      <textarea id="turn-prompt" rows="3" placeholder="Continue this conversation…"${turnToken ? "" : " disabled"}></textarea>
+      <div class="composer-row">
+        <label class="chip" title="Let the tool edit files in the conversation's directory. Shell commands are never allowed."><input type="checkbox" id="turn-edits"> Allow edits</label>
+        <span class="turn-status" id="turn-status">${hint}</span>
+        <button class="btn primary" id="turn-send"${turnToken ? "" : " disabled"}>${ICON.send}<span class="label">Send</span></button>
+      </div>
+    </div>`;
+}
+
+function wireComposer(c) {
+  const edits = $("turn-edits");
+  edits.addEventListener("change", () => edits.closest(".chip").classList.toggle("on", edits.checked));
+  $("turn-send").addEventListener("click", () => sendTurn(c.id));
+  $("turn-prompt").addEventListener("keydown", e => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendTurn(c.id); }
+  });
+}
+
+// Server messages are shown verbatim, so the status line is always set as text.
+function turnStatus(text, kind) {
+  const el = $("turn-status");
+  if (!el) return;
+  el.className = "turn-status" + (kind ? " " + kind : "");
+  el.textContent = text;
+}
+
+function setComposerBusy(busy) {
+  if (!$("turn-send")) return;
+  $("turn-send").disabled = busy || !turnToken;
+  $("turn-edits").disabled = busy;
+}
+
+async function sendTurn(convId) {
+  const prompt = $("turn-prompt").value;
+  if (!prompt.trim() || $("turn-send").disabled) return;
+  setComposerBusy(true);
+  turnStatus("Starting…", "busy");
+  let res, body;
+  try {
+    res = await fetch(`/api/conversation/${encodeURIComponent(convId)}/turn`, {
+      method: "POST", headers: turnHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ prompt, edits: $("turn-edits").checked }),
+    });
+    body = await res.json().catch(() => ({}));
+  } catch (e) {
+    if (selectedId === convId) { setComposerBusy(false); turnStatus(`The server did not answer: ${e}`, "error"); }
+    return;
+  }
+  if (selectedId !== convId) return;           // the user moved on; the turn (if any) runs anyway
+  if (!res.ok) { setComposerBusy(false); turnStatus(body.error || `The server returned ${res.status}.`, "error"); return; }
+  $("turn-prompt").value = "";
+  turnPrompts.set(body.turn_id, prompt);
+  followTurn(convId, body.turn_id);
+}
+
+// Reads the turn's server-sent events. A dropped connection resumes from the last event seen
+// (`after`), so nothing is shown twice.
+async function followTurn(convId, turnId) {
+  detachTurn();
+  const s = { convId, turnId, controller: new AbortController(), seen: 0, bubble: null, text: "", denied: [], finished: false };
+  turnStream = s;
+  setComposerBusy(true);
+  turnStatus("Running…", "busy");
+  if (turnPrompts.has(turnId)) liveAppend(liveMsg("user", "You", renderMessageBody(turnPrompts.get(turnId))));
+  for (let attempt = 0; attempt < 3 && !s.finished; attempt++) {
+    try {
+      const res = await fetch(`/api/turn/${encodeURIComponent(turnId)}?after=${s.seen}`,
+                              { headers: turnHeaders(), signal: s.controller.signal });
+      if (turnStream !== s) return;
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return finishTurn(s, { kind: "error", message: body.error || `The server returned ${res.status}.` });
+      }
+      await readTurnEvents(res.body.getReader(), s);
+    } catch (e) {
+      if (s.controller.signal.aborted) return;
+    }
+    if (turnStream !== s) return;
+  }
+  if (!s.finished) finishTurn(s, { kind: "error", message: "Lost the connection. The turn keeps running on the server; reopen the conversation to follow it." });
+}
+
+async function readTurnEvents(reader, s) {
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done || turnStream !== s) return;
+    buf += decoder.decode(value, { stream: true });
+    let cut;
+    while ((cut = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, cut);
+      buf = buf.slice(cut + 2);
+      let id = null, data = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("id: ")) id = Number(line.slice(4));
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;                     // a keepalive comment
+      if (id !== null) s.seen = id;            // the id is the count of events seen
+      turnEvent(s, JSON.parse(data));
+      if (s.finished) return;
+    }
+  }
+}
+
+function liveMsg(cls, role, bodyHTML, kind) {
+  const el = document.createElement("div");
+  el.className = `msg ${cls} live`;
+  el.innerHTML = `<div class="msg-head"><span class="role-tag">${escape(role)}</span>${kind ? `<span class="harness-kind">${escape(kind)}</span>` : ""}</div>
+    <div class="msg-body">${bodyHTML}</div>`;
+  return el;
+}
+function liveAppend(el) {
+  const live = $("turn-live");
+  if (live) live.appendChild(el);
+}
+// Tool activity is one collapsed line, like in the transcript; the next text starts a new bubble.
+function liveStep(s, cls, role, summary, detail, kind) {
+  s.bubble = null;
+  const body = `<details><summary>${escape(summary.slice(0, 140))}</summary>${detail ? `<pre>${escape(detail)}</pre>` : ""}</details>`;
+  liveAppend(liveMsg(cls, role, body, kind));
+}
+
+function turnEvent(s, ev) {
+  const show = x => typeof x === "string" ? x : JSON.stringify(x, null, 2);
+  switch (ev.kind) {
+    case "text":
+      if (!s.bubble) { s.bubble = liveMsg("assistant", "Assistant", ""); s.text = ""; liveAppend(s.bubble); }
+      s.text += (s.text ? "\n\n" : "") + ev.text;
+      s.bubble.querySelector(".msg-body").innerHTML = renderMessageBody(s.text);
+      return;
+    case "tool":
+      return liveStep(s, "assistant tool_call", "Assistant", ev.name || "tool", show(ev.input));
+    case "tool_result":
+      return liveStep(s, "tool tool_result", "Tool", firstLine(ev.text) || (ev.error ? "failed" : "(no output)"), ev.text);
+    case "denied":
+      s.denied.push(ev.name || "tool");
+      return liveStep(s, "harness", "Harness", `${ev.name || "tool"}: finish this step in the terminal`, show(ev.input), "denied");
+    case "gap":
+      return liveStep(s, "harness", "Harness", `${ev.missed} earlier event${ev.missed === 1 ? " was" : "s were"} dropped from the buffer`, "", "gap");
+    case "done":
+    case "error":
+      return finishTurn(s, ev);
+  }
+}
+
+async function finishTurn(s, ev) {
+  s.finished = true;
+  setComposerBusy(false);
+  const cost = ev.cost_usd != null ? ` · ${fmtUsd(ev.cost_usd)}` : "";
+  if (ev.kind === "error") {
+    if (ev.stderr) liveStep(s, "harness", "Harness", firstLine(ev.stderr), ev.stderr, "stderr");
+    turnStatus(`${ev.message || "The turn failed."}${cost}`, "error");
+    return;
+  }
+  if (!ev.indexed) { turnStatus(`Done${cost}. Not in the transcript yet: ${ev.reason}`, "warn"); return; }
+  toast(`Turn finished${cost}.`, "success");
+  runSearch();
+  if (selectedId !== s.convId) return;
+  await openDetail(s.convId);                  // the new messages are indexed by now
+  const box = $("composer");
+  if (!box || selectedId !== s.convId) return;
+  // the transcript does not record what was denied, so the status line keeps saying it
+  if (s.denied.length) turnStatus(`Done${cost}. Not allowed here: ${[...new Set(s.denied)].join(", ")}; finish that step in the terminal.`, "warn");
+  else turnStatus(`Done${cost}.`);
+  box.scrollIntoView({ block: "end" });
+  $("turn-prompt").focus();
 }
 
 // Keyboard: ↑/↓ or j/k move through results, Enter opens, Esc closes, / focuses search.
