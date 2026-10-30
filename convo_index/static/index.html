@@ -21,10 +21,16 @@
       <span class="logo"><svg class="icon" viewBox="0 0 24 24"><path d="M5 7h14M5 12h10M5 17h7"/></svg></span>
       <span>Conversation Index</span>
     </a>
-    <nav class="tabs" aria-label="Pages"><a href="/" class="active">Search</a><a href="/analytics">Analytics</a></nav>
+    <nav class="tabs" aria-label="Pages"><a href="/" class="active" aria-current="page">Search</a><a href="/analytics">Analytics</a></nav>
+    <label class="search-box" id="search-box">
+      <svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="q" type="search" aria-label="Search conversations" placeholder="Search conversations, tickets, code, error messages…" autocomplete="off" autofocus>
+      <kbd title="Press / to focus the search box">/</kbd>
+      <button class="clear" id="q-clear" type="button" aria-label="Clear search"><svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    </label>
     <span class="spacer"></span>
     <span class="status" id="status"></span>
-    <button class="btn" id="refresh" title="Re-read every source and index new or changed conversations">
+    <button class="btn icon-only" id="refresh" aria-label="Refresh index" title="Re-read every source and index new or changed conversations">
       <svg class="icon" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg><span class="label">Refresh index</span>
     </button>
     <button class="btn icon-only" id="stop-server" title="Stop the convo-index server" aria-label="Stop the server">
@@ -37,12 +43,6 @@
 
   <section class="searchbar" aria-label="Search and filters">
     <div class="search-row">
-      <label class="search-box" id="search-box">
-        <svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <input id="q" type="search" placeholder="Search conversations, tickets, code, error messages…" autocomplete="off" autofocus>
-        <kbd title="Press / to focus the search box">/</kbd>
-        <button class="clear" id="q-clear" type="button" aria-label="Clear search"><svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
-      </label>
       <div class="segmented" id="mode" role="group" aria-label="Search mode">
         <button type="button" data-mode="hybrid" aria-pressed="true" title="Keyword and meaning combined">Hybrid</button>
         <button type="button" data-mode="keyword" aria-pressed="false" title="Exact words and phrases">Keyword</button>
