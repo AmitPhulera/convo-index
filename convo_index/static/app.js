@@ -392,7 +392,7 @@ function usageLine(u) {
   if (!u || !u.requests) return "";
   const usd = x => x >= 1 ? "$" + x.toFixed(2) : "$" + x.toFixed(4);
   let cost = "";
-  if (u.coverage !== null && u.coverage !== undefined) {
+  if (u.coverage) {                         // nothing priced: no "$0" estimate
     cost = (u.coverage < 1 ? "≥ " : "≈ ") + usd(u.estimated_cost || 0) + (u.coverage < 1 ? ` (${Math.round(u.coverage * 100)}% priced)` : "");
   }
   const rep = u.reported_cost !== null && u.reported_cost !== undefined ? `<span class="sep">·</span><span>reported ${usd(u.reported_cost)}</span>` : "";
