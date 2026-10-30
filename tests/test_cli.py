@@ -118,8 +118,13 @@ def test_doctor_reports_turn_harnesses(tmp_path, monkeypatch, capsys):
     assert rep["turns"]["harnesses"]["claude_code"]["launcher"] == ["/opt/bin/claude"]
     assert rep["turns"]["harnesses"]["opencode"]["launcher"] is None
     assert set(rep["turns"]["harnesses"]) == {"claude_code", "opencode"}
+    assert rep["turns"]["edit_mcp_tools"] == []
     text = doctor.format_report(rep)
     assert "browser turns: on; usable harness: claude_code (/opt/bin/claude)" in text
+    assert "edit mode MCP tools (run without asking): none" in text
+    from convo_index import turn_tools
+    turn_tools.save(["mcp__atlassian__*"], ["atlassian"])
+    assert "edit mode MCP tools (run without asking): mcp__atlassian__*" in doctor.format_report(doctor.report())
     assert rc == 1   # the usual warnings (no config, no index) still apply
 
 

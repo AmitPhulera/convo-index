@@ -9,6 +9,7 @@ import urllib.request
 from convo_index import db as dbm
 from convo_index import jobs
 from convo_index import settings as S
+from convo_index import turn_tools
 from convo_index.lock import index_lock, IndexLocked
 from convo_index.providers import registry as R
 from convo_index.sources.base import all_adapters, is_windows, TURN_MODULES
@@ -168,6 +169,7 @@ def harness_report(settings):
         launcher = mod.launcher() if on_platform else None     # what a turn would actually run
         out["harnesses"][source] = {"binary": binary, "path": shutil.which(binary),
                                     "supported_here": on_platform, "launcher": launcher}
+    out["edit_mcp_tools"] = turn_tools.load(settings)      # what Edit-mode turns may call without asking
     return out
 
 
@@ -182,6 +184,8 @@ def format_report(rep):
     if t:
         found = [f"{src} ({' '.join(h['launcher'])})" for src, h in t["harnesses"].items() if h.get("launcher")]
         lines.append(f"browser turns: {'on' if t['enabled'] else 'off'}; usable harness: {', '.join(found) or 'none'}")
+        tools = t.get("edit_mcp_tools") or []
+        lines.append(f"  edit mode MCP tools (run without asking): {', '.join(tools) if tools else 'none'}")
     lines.append(f"llm: installed CLIs in preference order: {', '.join(rep['llm']['installed_clis']) or 'none'}")
     for job in ("classify", "summary"):
         e = rep["llm"][job]
