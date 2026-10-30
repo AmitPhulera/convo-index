@@ -567,7 +567,7 @@ async function openDetail(id, cardEl) {
     <div class="detail-grid">
       <div class="conversation">
         ${msgs}
-        ${c.turns_supported ? composerHTML() : ""}
+        ${c.turns_supported ? composerHTML(c) : ""}
       </div>
       <aside class="details-panel" id="details-panel" aria-label="Conversation details">
         ${section(`Continue in ${WINDOWS ? "PowerShell" : "the terminal"}`, resume ? `<div class="resume">
@@ -781,25 +781,28 @@ function detachTurn() {
   if (turnStream) { turnStream.controller.abort(); turnStream = null; }
 }
 
-function composerHTML() {
+// The edits position is a Mode picker: Read-only, or Can edit files (never shell commands).
+function composerHTML(c) {
   const send = /Mac/.test(navigator.platform) ? "⌘" : "Ctrl";
   const hint = turnToken ? `<kbd>${send}</kbd><kbd>Enter</kbd> to send`
     : "To send messages here, open the UI through the URL <code>convo-index serve</code> or <code>up</code> prints.";
   return `<div id="turn-live"></div>
     <div class="composer" id="composer">
-      <textarea id="turn-prompt" rows="2" placeholder="Continue this conversation…"${turnToken ? "" : " disabled"}></textarea>
-      <div class="composer-row">
-        <label class="chip" title="Let the tool edit files in the conversation's directory. Shell commands are never allowed."><input type="checkbox" id="turn-edits"> Allow edits</label>
-        <span class="turn-status" id="turn-status">${hint}</span>
-        <button class="btn danger" id="turn-stop" hidden title="Stop the tool. What it already wrote stays in the transcript.">${ICON.stop}<span class="label">Stop</span></button>
-        <button class="btn primary" id="turn-send"${turnToken ? "" : " disabled"}>${ICON.send}<span class="label">Send</span></button>
+      <div class="composer-box">
+        <textarea id="turn-prompt" rows="2" aria-label="Message" placeholder="Continue this conversation in ${escape(sourceLabel(c.source))}…"${turnToken ? "" : " disabled"}></textarea>
+        <div class="composer-row">
+          <label class="mode-pick" title="What the tool may do. Shell commands are never allowed.">Mode
+            <select id="turn-edits"><option value="read">Read-only</option><option value="edits">Can edit files</option></select>
+          </label>
+          <span class="turn-status" id="turn-status" role="status">${hint}</span>
+          <button class="btn danger" id="turn-stop" hidden title="Stop the tool. What it already wrote stays in the transcript.">${ICON.stop}<span class="label">Stop</span></button>
+          <button class="btn primary" id="turn-send"${turnToken ? "" : " disabled"}>${ICON.send}<span class="label">Send</span></button>
+        </div>
       </div>
     </div>`;
 }
 
 function wireComposer(c) {
-  const edits = $("turn-edits");
-  edits.addEventListener("change", () => edits.closest(".chip").classList.toggle("on", edits.checked));
   $("turn-send").addEventListener("click", () => sendTurn(c.id));
   $("turn-stop").addEventListener("click", stopTurn);
   $("turn-prompt").addEventListener("keydown", e => {
@@ -824,10 +827,7 @@ function setComposerBusy(busy) {
 }
 
 function showEdits(on) {
-  const edits = $("turn-edits");
-  if (!edits) return;
-  edits.checked = on;
-  edits.closest(".chip").classList.toggle("on", on);
+  if ($("turn-edits")) $("turn-edits").value = on ? "edits" : "read";
 }
 
 // The live output sits just above the pinned message box: keep it in view while the reader is
@@ -865,7 +865,7 @@ async function stopTurn() {
 }
 
 async function sendTurn(convId) {
-  const box = $("turn-prompt"), prompt = box.value, edits = $("turn-edits").checked;
+  const box = $("turn-prompt"), prompt = box.value, edits = $("turn-edits").value === "edits";
   if (!prompt.trim() || $("turn-send").disabled) return;
   const view = detailView;
   box.value = "";                              // what is typed from here on is the next message
