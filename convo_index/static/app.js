@@ -583,7 +583,7 @@ async function openDetail(id, cardEl) {
   if (c.turns_supported) wireComposer(c);
   // a turn still running (sent before a reload, from another tab, or before navigating away)
   // is followed again from its first event
-  if (c.turns_supported && c.active_turn) followTurn(c.id, c.active_turn.turn_id);
+  if (c.turns_supported && c.active_turn) followTurn(c.id, c.active_turn.turn_id, c.active_turn.edits);
   $("detail-pane").scrollTop = 0;
 }
 
@@ -775,6 +775,13 @@ function setComposerBusy(busy) {
   $("turn-stop").disabled = false;
 }
 
+function showEdits(on) {
+  const edits = $("turn-edits");
+  if (!edits) return;
+  edits.checked = on;
+  edits.closest(".chip").classList.toggle("on", on);
+}
+
 async function activeTurn(convId) {
   try {
     const res = await fetch("/api/conversation/" + encodeURIComponent(convId));
@@ -803,7 +810,7 @@ async function stopTurn() {
 }
 
 async function sendTurn(convId) {
-  const box = $("turn-prompt"), prompt = box.value;
+  const box = $("turn-prompt"), prompt = box.value, edits = $("turn-edits").checked;
   if (!prompt.trim() || $("turn-send").disabled) return;
   const view = detailView;
   box.value = "";                              // what is typed from here on is the next message
@@ -819,33 +826,34 @@ async function sendTurn(convId) {
   try {
     res = await fetch(`/api/conversation/${encodeURIComponent(convId)}/turn`, {
       method: "POST", headers: turnHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ prompt, edits: $("turn-edits").checked }),
+      body: JSON.stringify({ prompt, edits }),
     });
     body = await res.json().catch(() => null);
   } catch (e) { /* no answer: the turn may have started anyway */ }
   if (view !== detailView) return;             // reopening the conversation picks the turn up
   if (res && res.ok && body && body.turn_id) {
     turnPrompts.set(body.turn_id, prompt);
-    return followTurn(convId, body.turn_id);
+    return followTurn(convId, body.turn_id, edits);
   }
   if (res && !res.ok) return restore((body && body.error) || `The server returned ${res.status}.`);
   const active = await activeTurn(convId);     // the answer was lost: did the turn start?
   if (view !== detailView) return;
   if (active) {
     turnPrompts.set(active.turn_id, prompt);
-    return followTurn(convId, active.turn_id);
+    return followTurn(convId, active.turn_id, active.edits);
   }
   restore("The server did not answer, and no turn is running. Send again to retry.");
 }
 
 // Reads the turn's server-sent events. A dropped connection resumes from the last event seen
 // (`after`), so nothing is shown twice; retries back off and start over once events flow again.
-async function followTurn(convId, turnId) {
+async function followTurn(convId, turnId, edits) {
   if (turnStream && turnStream.turnId === turnId && !turnStream.finished) return;   // already following it
   detachTurn();
   const s = { convId, turnId, controller: new AbortController(), seen: 0, bubble: null, text: "", denied: [], finished: false, lost: false };
   turnStream = s;
   setComposerBusy(true);
+  if (edits !== undefined) showEdits(!!edits);
   turnStatus("Running…", "busy");
   if (turnPrompts.has(turnId)) liveAppend(liveMsg("user", "You", renderMessageBody(turnPrompts.get(turnId))));
   let failures = 0;
