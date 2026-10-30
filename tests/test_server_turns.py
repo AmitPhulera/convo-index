@@ -419,7 +419,7 @@ def test_edits_position_is_passed_through(site):
     assert status == 200 and body["edits"] is True
     sse_events(site, body["turn_id"])
     argv = captured.read_text(encoding="utf-8").splitlines()
-    assert "--permission-mode" in argv and "acceptEdits" in argv and "Read,Glob,Grep,Edit,Write,MultiEdit" in argv
+    assert "--permission-mode" in argv and "acceptEdits" in argv and "Read,Glob,Grep,Edit,Write,MultiEdit,Bash" in argv
 
 
 # ---- the loopback rule -------------------------------------------------------------------------

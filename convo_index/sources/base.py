@@ -153,16 +153,19 @@ def supports_turns(conversation_id: str) -> bool:
     return bool(mod) and bool(getattr(mod, "TURNS_ON_WINDOWS", True) or not is_windows())
 
 
-def turn_command(conversation_id: str, prompt: str, cwd: str, *, edits: bool = False) -> TurnCommand | None:
+def turn_command(conversation_id: str, prompt: str, cwd: str, *, edits: bool = False,
+                 mcp_tools: tuple[str, ...] = ()) -> TurnCommand | None:
     """The harness invocation for one more turn, or None when the source has no headless
-    mode here. Raises ValueError for a native id that must never reach a command line."""
+    mode here. `mcp_tools` is the allowlist an Edit-mode turn may call (turn_tools); a harness
+    that cannot load MCP servers ignores it. Raises ValueError for a native id that must never
+    reach a command line."""
     source, _, native = conversation_id.partition(":")
     if source in TURN_MODULES and not NATIVE_ID_RE.fullmatch(native or ""):
         raise ValueError(f"refusing to run a turn for a session id that is not plain text: {native!r}")
     mod, native = _turn_module(conversation_id)
     if mod is None or not supports_turns(conversation_id):
         return None
-    return mod.turn_command(native, prompt, cwd, edits=edits)
+    return mod.turn_command(native, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools) if edits else ())
 
 
 def turn_launcher(conversation_id: str) -> list[str] | None:

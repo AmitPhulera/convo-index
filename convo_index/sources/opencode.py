@@ -550,7 +550,8 @@ def turn_config_home():
     return tempfile.mkdtemp(prefix="convo-index-opencode-")
 
 
-def turn_command(native_id, prompt, cwd, *, edits=False):
+def turn_command(native_id, prompt, cwd, *, edits=False, mcp_tools=()):
+    """`mcp_tools` is ignored: a turn's configuration home is empty, so no MCP server loads."""
     prefix = launcher()
     if prefix is None:
         return None
