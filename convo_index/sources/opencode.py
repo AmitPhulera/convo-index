@@ -528,11 +528,11 @@ def _permission_rules(edits):
     """Ordered rules, last match wins: deny everything (MCP and plugin tools included, and
     `external_directory`, which confines every tool to the project: a write to /tmp or a read
     of /etc/hosts is refused with "Permission denied: external_directory"), then allow the
-    read tools and, in the edits position, the edit tool (which covers write and patch; its
-    paths are project-relative, so `*` is the whole project and nothing more). bash is never
-    allowed."""
+    read tools and, in Edit mode, the edit tool (which covers write and patch; its paths are
+    project-relative, so `*` is the whole project and nothing more) and bash, which runs as the
+    user wherever its commands reach."""
     rules = [{"action": "*", "resource": "*", "effect": "deny"}]
-    for action in _ALLOW_READ + (["edit"] if edits else []):
+    for action in _ALLOW_READ + (["edit", "bash"] if edits else []):
         rules.append({"action": action, "resource": "*", "effect": "allow"})
     return rules
 

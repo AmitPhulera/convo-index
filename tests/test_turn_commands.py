@@ -221,13 +221,14 @@ def test_opencode_read_only_turn(opencode_on_path):
     assert all(r["effect"] == "allow" for r in rules[1:])
 
 
-def test_opencode_edits_turn_allows_edit_never_bash(opencode_on_path):
-    cmd = base.turn_command("opencode:ses_abc", "fix it", "/proj", edits=True)
+def test_opencode_edit_turn_allows_edit_and_bash(opencode_on_path):
+    cmd = base.turn_command("opencode:ses_abc", "fix it", "/proj", edits=True, mcp_tools=("mcp__atlassian__*",))
     assert "--agent" not in cmd.argv and "--auto" not in cmd.argv
     rules = json.loads(cmd.env["OPENCODE_CONFIG_CONTENT"])["permissions"]
-    assert [r["action"] for r in rules] == ["*", "read", "glob", "grep", "list", "edit"]
-    assert rules[-1] == {"action": "edit", "resource": "*", "effect": "allow"}       # project-relative paths
-    assert not any(r["action"] == "bash" and r["effect"] != "deny" for r in rules)
+    assert [r["action"] for r in rules] == ["*", "read", "glob", "grep", "list", "edit", "bash"]
+    assert rules[-2] == {"action": "edit", "resource": "*", "effect": "allow"}       # project-relative paths
+    assert rules[-1] == {"action": "bash", "resource": "*", "effect": "allow"}
+    assert os.listdir(cmd.env["XDG_CONFIG_HOME"]) == []      # no MCP server: the allowlist is Claude Code's
     assert base.turn_launcher("opencode:ses_abc") == ["/opt/bin/opencode"]
 
 
