@@ -16,6 +16,7 @@ writes a starter file after probing the machine. Sections:
   [tags_learning] few_shot_k, suggest_threshold, suggest_threshold_by_group, suggest_k, vectors_per_run
   [references]   ticket_regex, ticket_prefix_blocklist, ticket_url, github_hosts, default_branches
   [summary]      head_chars, tail_chars, max_attempts
+  [ui.turns]     enabled, timeout_seconds, max_concurrent (continuing a conversation from the browser)
 """
 from __future__ import annotations
 
@@ -78,6 +79,10 @@ DEFAULTS = {
     "schedule": {"hour": 21, "minute": 0},
     # Cost estimates: user pricing file (default ~/.config/convo-index/pricing.toml) overriding the seed.
     "pricing": {"file": ""},
+    # Browser turns: the UI server runs one more turn of a conversation in its own tool. Off
+    # switches the endpoint off; a turn is killed after timeout_seconds; at most max_concurrent
+    # harness processes run at once.
+    "ui": {"turns": {"enabled": True, "timeout_seconds": 1200, "max_concurrent": 2}},
 }
 
 # Cheap / capable model per CLI backend, used when a job names a backend but no model.

@@ -11,6 +11,15 @@ def test_defaults_when_no_file(tmp_path):
     assert s["category"]["labels"] == ["work", "personal"]      # generic, nothing employer-specific
 
 
+def test_ui_turns_defaults_and_override(tmp_path):
+    s = S.load(tmp_path / "missing.toml", use_cache=False)
+    assert s["ui"]["turns"] == {"enabled": True, "timeout_seconds": 1200, "max_concurrent": 2}
+    p = tmp_path / "c.toml"
+    p.write_text('[ui.turns]\nenabled = false\n')
+    s = S.load(p, use_cache=False)
+    assert s["ui"]["turns"]["enabled"] is False and s["ui"]["turns"]["max_concurrent"] == 2
+
+
 def test_file_overrides_merge_deeply(tmp_path):
     p = tmp_path / "c.toml"
     p.write_text('[llm]\nsummary = { backend = "codex_cli" }\n[category]\nlabels = ["a", "b"]\n'

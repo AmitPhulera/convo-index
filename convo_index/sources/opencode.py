@@ -30,6 +30,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +39,8 @@ from convo_index.config import CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX
 from convo_index.model import (Conversation, Message, ToolCall, UsageRecord,
                                KIND_TEXT, KIND_THINKING, KIND_TOOL_CALL, FIDELITY_FULL,
                                FIDELITY_PARTIAL, make_id, split_id)
-from convo_index.sources.base import SourceRef, UnreadableSource, shell_quote
+from convo_index.sources import base as sources
+from convo_index.sources.base import SourceRef, TurnCommand, UnreadableSource, shell_quote
 
 SOURCE = "opencode"
 TOOL_TEXT_LIMIT = 4000       # chars of tool input+output kept per tool call
@@ -488,3 +490,149 @@ class OpencodeAdapter:
 def resume_command(conversation_id, cwd):
     _, native = split_id(conversation_id)
     return f"opencode --session {shell_quote(native)}"
+
+
+# --- Browser turns (sources.base turn protocol) ----------------------------------------------
+#
+# `opencode run --session <id>` appends one more turn to the stored session, so an interactive
+# `opencode --session <id>` afterwards sees it. Verified on 2.1.4: with the configuration below
+# the model reports no bash and no MCP tools in the read-only position, writes work in the
+# edits position, and a project `opencode.json` declaring an MCP server is not loaded.
+#
+# `--standalone` runs a private server for this process; the background service would keep
+# whatever configuration it started with and ignore the environment set here. Opencode has no
+# switch for its global configuration (`~/.config/opencode`: plugins, MCP servers, agents),
+# so the turn gets an empty XDG_CONFIG_HOME of its own, made fresh for the turn and removed
+# after it: a reused one could be given a plugin by an edits turn (it may sit inside the
+# project, as convo-index's data directory does in a checkout) that the next turn would run.
+# Credentials and the session database live under the data directory, which stays where it
+# is (verified: the turn still answers).
+# The variables through which a shell could point opencode at other configuration are
+# dropped from the turn's environment. The system directory (/etc/opencode, /Library/
+# Application Support/opencode, %ProgramData%\opencode) is administrator-managed and stays in
+# force, as Claude Code's managed settings do.
+#
+# The prompt is an argv element (run mode takes no stdin prompt), which is fine without a
+# shell on POSIX; on Windows an npm `.cmd` shim re-parses arguments through cmd.exe, so turns
+# are not offered there until a stdin path exists. A prompt starting with "-" would be read
+# as an option (`--` is no help: opencode 2.1.4 then repeats the message), so it gets a
+# leading space, which only the model sees.
+
+TURNS_ON_WINDOWS = False
+RUN_FLAGS = ["run", "--standalone", "--format", "json"]
+CONFIG_OVERRIDES = ("OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CLI_CONFIG_CONTENT")   # 2.1.4's extra config sources
+_ALLOW_READ = ["read", "glob", "grep", "list"]
+
+
+def _permission_rules(edits):
+    """Ordered rules, last match wins: deny everything (MCP and plugin tools included, and
+    `external_directory`, which confines every tool to the project: a write to /tmp or a read
+    of /etc/hosts is refused with "Permission denied: external_directory"), then allow the
+    read tools and, in the edits position, the edit tool (which covers write and patch; its
+    paths are project-relative, so `*` is the whole project and nothing more). bash is never
+    allowed."""
+    rules = [{"action": "*", "resource": "*", "effect": "deny"}]
+    for action in _ALLOW_READ + (["edit"] if edits else []):
+        rules.append({"action": action, "resource": "*", "effect": "allow"})
+    return rules
+
+
+def launcher():
+    """`opencode` on PATH, or None; never through an npm shim on Windows (see TURNS_ON_WINDOWS)."""
+    if sources.is_windows():
+        return None
+    binary = shutil.which("opencode")
+    return [binary] if binary else None
+
+
+def turn_config_home():
+    """A new, empty, owner-only configuration home for one turn (the runner removes it)."""
+    return tempfile.mkdtemp(prefix="convo-index-opencode-")
+
+
+def turn_command(native_id, prompt, cwd, *, edits=False):
+    prefix = launcher()
+    if prefix is None:
+        return None
+    if prompt.startswith("-"):
+        prompt = " " + prompt
+    argv = prefix + RUN_FLAGS + ["--session", native_id] + ([] if edits else ["--agent", "plan"]) + [prompt]
+    home = turn_config_home()
+    env = {"XDG_CONFIG_HOME": home,                   # no global opencode.json, plugins, agents, commands
+           "OPENCODE_DISABLE_CLAUDE_CODE": "1",       # nor ~/.claude and project .claude instructions
+           "OPENCODE_CONFIG_PROJECT_DISABLE": "1",    # nor the project's opencode.json and .opencode directory
+           "OPENCODE_CONFIG_CONTENT": json.dumps({"permissions": _permission_rules(edits)})}
+    return TurnCommand(argv=argv, cwd=cwd, env=env, unset=CONFIG_OVERRIDES, stdin=None, scratch=(home,))
+
+
+def _clip(value, limit=TOOL_TEXT_LIMIT // 10):
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _error_message(err):
+    """The readable part of an opencode error object (or the string it already is)."""
+    if isinstance(err, str) and err:
+        return err
+    if isinstance(err, dict):
+        data = err.get("data") if isinstance(err.get("data"), dict) else {}
+        for value in (data.get("message"), err.get("message"), err.get("name")):
+            if isinstance(value, str) and value:
+                return value
+    return "turn failed"
+
+
+def turn_events(line):
+    """Events for one `--format json` line of `opencode run`: text parts, tool parts (one event
+    per status update) and an error event for a failed step. step markers and anything
+    unknown are dropped; the process exit is the turn's end."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(d, dict):
+        return []
+    if d.get("type") == "error" and not isinstance(d.get("part"), dict):
+        # a failed step: {"type": "error", "error": {"name", "data": {"message"}}}, no part
+        return [{"kind": "error", "message": _clip(_error_message(d.get("error")), 2000)}]
+    if not isinstance(d.get("part"), dict):
+        return []
+    part, kind = d["part"], d.get("type")
+    if kind == "text" and isinstance(part.get("text"), str) and part["text"]:
+        return [{"kind": "text", "text": part["text"]}]
+    if part.get("type") == "tool":
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        status = state.get("status")
+        if status == "error":
+            return [{"kind": "tool_result", "text": _clip(state.get("error") or "tool failed"), "error": True}]
+        if status == "completed":
+            return [{"kind": "tool_result", "text": _clip(state.get("output") or ""), "error": False}]
+        if status in ("pending", "running"):
+            return [{"kind": "tool", "name": str(part.get("tool", "")), "input": _clip(state.get("input") or {})}]
+        return []
+    if kind == "error" or part.get("type") == "error":
+        msg = part.get("error") or part.get("message") or d.get("error") or "turn failed"
+        return [{"kind": "error", "message": _clip(msg, 2000)}]
+    return []
+
+
+def last_activity(native_id, locator):
+    """`time_updated` of the session row: the database file's mtime says nothing about one
+    session, and WAL writes do not touch it anyway."""
+    if not locator.startswith("sqlite:") or "#" not in locator:
+        return None
+    db_path, _, session_id = locator[len("sqlite:"):].rpartition("#")
+    if session_id != native_id:
+        return None
+    try:
+        conn = _connect_ro(db_path)
+    except sqlite3.Error:
+        return None
+    try:
+        table = SESSION_TABLE[detect_schema(conn)]
+        row = conn.execute(f"SELECT time_updated FROM {table} WHERE id=?", (session_id,)).fetchone()
+    except (sqlite3.Error, RuntimeError):   # unreadable or unknown layout: no activity information
+        return None
+    finally:
+        conn.close()
+    return row["time_updated"] / 1000 if row and row["time_updated"] is not None else None

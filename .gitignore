@@ -5,6 +5,8 @@ convos.db
 convos.db-*
 archive/
 refresh.log
+serve.log
+turn-token
 convos.db.bak-*
 *.egg-info/
 dist/

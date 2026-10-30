@@ -423,6 +423,19 @@ def _wait_for_port(host, port, seconds=15):
     return False
 
 
+def _turn_token_of_running_server(server, settings, seconds=3):
+    """The token file the server writes just after it binds: on a first start the port can
+    answer a moment before the file exists (a restart keeps the token, so an older file is
+    already right)."""
+    import time
+    deadline = time.monotonic() + seconds
+    while True:
+        token = server.read_turn_token(settings)
+        if token or time.monotonic() >= deadline:
+            return token
+        time.sleep(0.1)
+
+
 def cmd_up(args):
     """The first run in one go: write the config, keep the UI server running from login,
     schedule the daily refresh, start the index build in the background and open the UI.
@@ -472,6 +485,7 @@ def cmd_up(args):
               "(or `convo-index init --yes` to allow hosted LLM processing)")
     if not args.no_serve:
         if _wait_for_port("127.0.0.1" if host in ("0.0.0.0", "::", "") else host, port):
+            url = server.advertised_url(host, port, _turn_token_of_running_server(server, settings))
             print(_green(f"convo-index is at {url}"))
             if not args.no_open:
                 webbrowser.open(url)

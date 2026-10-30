@@ -10,13 +10,16 @@ usage is de-duplicated on `requestId`. `ai-title` events carry the generated tit
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 from pathlib import Path
 
 from convo_index.config import PROJECTS_DIR, CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX
 from convo_index.model import (Conversation, Message, ToolCall, UsageRecord, KIND_TEXT, KIND_THINKING,
                                KIND_TOOL_CALL, KIND_TOOL_RESULT, FIDELITY_FULL, FIDELITY_PARTIAL, split_id)
-from convo_index.sources.base import SourceRef, UnreadableSource, read_snapshot, shell_quote
+from convo_index.sources import base as sources
+from convo_index.sources.base import SourceRef, TurnCommand, UnreadableSource, read_snapshot, shell_quote
 
 TOOL_TEXT_LIMIT = 4000
 # tool names -> file action for the files-touched facet
@@ -368,3 +371,113 @@ def resume_command(conversation_id, cwd):
     """Shell command to continue this conversation in Claude Code."""
     _, native = split_id(conversation_id)
     return f"claude --resume {shell_quote(native)}"
+
+
+# --- Browser turns (sources.base turn protocol) ----------------------------------------------
+#
+# `claude -p --resume <id>` runs one more turn of a session and appends it to the same
+# transcript, so an interactive `claude --resume` afterwards sees it. Verified on 2.1.311: with
+# the flags below the init event lists no MCP servers, a PreToolUse hook in the project's
+# settings does not fire, Bash is absent in both positions, and a write outside the working
+# directory is refused by --restricted.
+
+TURN_FLAGS = ["-p", "--output-format", "stream-json", "--verbose",   # stream-json needs --verbose in print mode
+              "--safe-mode",              # no plugins, hooks, MCP servers, skills, commands; auth and built-in tools work
+              "--restricted",             # no Bash/code tools, no user/project/local settings, file tools confined to cwd
+              "--strict-mcp-config",      # with no --mcp-config: no MCP servers at all
+              "--disable-slash-commands", # the prompt is a message, never a skill or command
+              "--permission-prompts", "none"]   # anything that would ask is denied
+READ_TOOLS = "Read,Glob,Grep"
+EDIT_TOOLS = "Read,Glob,Grep,Edit,Write,MultiEdit"
+TURNS_ON_WINDOWS = True       # the prompt goes through stdin; see launcher()
+TURN_TEXT_LIMIT = 400         # chars of a tool input/result shown in a turn event (the transcript parser keeps TOOL_TEXT_LIMIT)
+
+
+def _script_from_shim(shim):
+    """The JavaScript entry an npm `.cmd` shim runs: "%dp0%\\node_modules\\...\\cli.js" (npm 7+,
+    which sets dp0 from %~dp0 first) or "%~dp0\\node_modules\\...\\cli.js" (npm 6)."""
+    try:
+        text = Path(shim).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'"%(?:~dp0|dp0%)\\?([^"]+?\.c?js)"', text)
+    return str(Path(shim).parent.joinpath(*m.group(1).replace("\\", "/").strip("/").split("/"))) if m else None
+
+
+def launcher():
+    """argv prefix that starts Claude Code without a shell in between, or None when it is not
+    installed. On Windows an npm install leaves a `claude.cmd` shim, which cmd.exe would run;
+    it is bypassed by launching node on the script it names. The native installer's
+    `claude.exe` and the POSIX binary are used as they are."""
+    binary = shutil.which("claude")
+    if not binary:
+        return None
+    if sources.is_windows() and binary.lower().endswith((".cmd", ".bat")):
+        script, node = _script_from_shim(binary), shutil.which("node")
+        return [node, script] if script and node and Path(script).exists() else None
+    return [binary]
+
+
+def turn_command(native_id, prompt, cwd, *, edits=False):
+    prefix = launcher()
+    if prefix is None:
+        return None
+    argv = prefix + ["--resume", native_id] + TURN_FLAGS + ["--tools", EDIT_TOOLS if edits else READ_TOOLS]
+    if edits:
+        argv += ["--permission-mode", "acceptEdits"]
+    return TurnCommand(argv=argv, cwd=cwd, stdin=prompt)
+
+
+def _turn_clip(value, limit=TURN_TEXT_LIMIT):
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _turn_result_text(block):
+    content = block.get("content")
+    if isinstance(content, list):
+        content = "\n".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+    return _turn_clip(content if isinstance(content, str) else json.dumps(content))
+
+
+def turn_events(line):
+    """Events for one stream-json line of `claude -p`. Assistant text and tool_use blocks,
+    tool results, the permission denials and the final result are kept; everything else
+    (init, rate limits, token counters) is dropped."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(d, dict):
+        return []
+    t = d.get("type")
+    message = d.get("message") if isinstance(d.get("message"), dict) else {}
+    blocks = message.get("content") if isinstance(message.get("content"), list) else []
+    out = []
+    if t == "assistant":
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text" and b.get("text"):
+                out.append({"kind": "text", "text": b["text"]})
+            elif b.get("type") == "tool_use":
+                out.append({"kind": "tool", "name": str(b.get("name", "")), "input": _turn_clip(b.get("input", {}))})
+    elif t == "user":
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                out.append({"kind": "tool_result", "text": _turn_result_text(b), "error": bool(b.get("is_error"))})
+    elif t == "result":
+        for den in d.get("permission_denials") or []:
+            if isinstance(den, dict):
+                out.append({"kind": "denied", "name": str(den.get("tool_name", "")), "input": _turn_clip(den.get("tool_input", {}))})
+        if d.get("is_error"):
+            out.append({"kind": "error", "message": _turn_clip(d.get("result") or d.get("subtype") or "turn failed", 2000)})
+        else:
+            out.append({"kind": "done", "cost_usd": d.get("total_cost_usd"), "turns": d.get("num_turns"),
+                        "stop": d.get("subtype")})
+    return out
+
+
+def last_activity(native_id, locator):
+    """mtime of the transcript, which Claude Code appends to while a session is live."""
+    return os.stat(locator).st_mtime

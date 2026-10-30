@@ -103,6 +103,26 @@ def test_doctor_json_reports_warnings(tmp_path, monkeypatch, capsys):
     assert any("no index yet" in w for w in rep["warnings"])
 
 
+def test_doctor_reports_turn_harnesses(tmp_path, monkeypatch, capsys):
+    _isolate(tmp_path, monkeypatch)
+    from convo_index import doctor
+    monkeypatch.setattr(R, "probe_cli_backends", lambda: [])
+    from convo_index.sources import base as sources
+    monkeypatch.setattr(sources, "is_windows", lambda: False)
+    monkeypatch.setattr("shutil.which", lambda name: "/opt/bin/claude" if name == "claude" else None)   # one module object for all
+    rc = cli.main(["doctor", "--json"])
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["turns"]["enabled"] is True
+    assert rep["turns"]["harnesses"]["claude_code"]["path"] == "/opt/bin/claude"
+    assert rep["turns"]["harnesses"]["opencode"]["path"] is None
+    assert rep["turns"]["harnesses"]["claude_code"]["launcher"] == ["/opt/bin/claude"]
+    assert rep["turns"]["harnesses"]["opencode"]["launcher"] is None
+    assert set(rep["turns"]["harnesses"]) == {"claude_code", "opencode"}
+    text = doctor.format_report(rep)
+    assert "browser turns: on; usable harness: claude_code (/opt/bin/claude)" in text
+    assert rc == 1   # the usual warnings (no config, no index) still apply
+
+
 def test_init_preserves_explicit_disabled_source(tmp_path, monkeypatch):
     cfg = _isolate(tmp_path, monkeypatch)
     cfg.parent.mkdir(parents=True)
@@ -316,6 +336,13 @@ def test_up_runs_init_services_and_the_first_index(tmp_path, monkeypatch, capsys
     out = capsys.readouterr().out
     assert "convo-index is at http://127.0.0.1:9753" in out and "privacy decision" in out   # nothing hosted until the user decides
     assert "tail -f" in out
+    calls.clear()
+    from convo_index import server
+    from convo_index import settings as S
+    S.reset_cache()
+    server.turn_token_path(S.load(use_cache=False)).write_text("tok123")   # a running server left its turn token
+    assert cli.main(["up"]) == 0 and calls[-1] == "open http://127.0.0.1:9753#turns=tok123"
+    assert "convo-index is at http://127.0.0.1:9753#turns=tok123" in capsys.readouterr().out
     calls.clear()
     assert cli.main(["up", "--no-serve", "--no-schedule", "--wait"]) == 0 and calls == ["init", "index"]
     calls.clear()

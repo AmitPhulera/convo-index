@@ -82,6 +82,11 @@ first one found for classification and summaries; an explicit `[llm]` entry alwa
     exclude_cwd = ["~/secret-client"]     # that directory and everything below it: never indexed,
                                           # never sent anywhere (globs such as "*/acme-*" work too)
 
+    [ui.turns]
+    enabled = true                        # continue a conversation from the browser (see below)
+    timeout_seconds = 1200                # a turn is killed after this long
+    max_concurrent = 2                    # harness processes the UI server runs at once
+
     [server]
     host = "127.0.0.1"                    # the UI answers only to loopback Host names
     allowed_hosts = []                    # extra Host names, e.g. ["mybox.lan"] when binding 0.0.0.0
@@ -117,6 +122,47 @@ Codex records the repository URL, which lets bare "PR 123" mentions link. Disabl
 Conversation ids are namespaced by source, e.g. `claude_code:<session-uuid>`,
 `opencode:<session-id>`, `pi:<session-uuid>`. Databases created before 0.2 are migrated in place on first run,
 after an automatic backup to `convos.db.bak-<timestamp>`.
+
+## Continue a conversation from the browser
+
+The UI server can run one more turn of an indexed conversation in the tool that owns it
+(`claude -p --resume`, `opencode run --session`). The tool appends the turn to its own
+transcript, so `claude --resume <id>` or `opencode --session <id>` in a terminal afterwards
+sees exactly what happened in the browser, and the index is refreshed before the turn is
+reported finished (ingest only: its summary and tags come with the next full refresh). Claude Code and Opencode are supported today; the other sources will follow.
+
+    POST   /api/conversation/<id>/turn   {"prompt": "...", "edits": false}   -> {"turn_id": ...}
+    GET    /api/turn/<turn_id>?after=<n>  server-sent events: text, tool, tool_result, denied, done | error
+    DELETE /api/turn/<turn_id>            stop it
+
+Every turn runs with the tool's customisation surface closed: no MCP servers, hooks, plugins,
+project settings or slash commands (Claude Code's `--safe-mode --restricted --strict-mcp-config`;
+for Opencode a fresh, empty configuration home per turn, the project configuration switched off, its
+configuration-path variables unset and a deny-all permission ruleset; administrator-managed
+settings of either tool stay in force), and no shell in either position. The default position
+is read-only (`Read`/`Glob`/`Grep` for Claude Code; the `plan` agent plus a deny-all
+permission ruleset for Opencode). `"edits": true` adds the file-editing tools, confined to the
+conversation's directory (Claude Code by `--restricted`, Opencode by its `external_directory`
+permission staying denied); Bash is never available. Anything the tool would normally ask
+about is denied and reported as a `denied` event, so the step can be finished in a terminal.
+
+Turns are accepted only on a loopback listener, from a loopback peer, when the browser
+addresses the server by a loopback name, with no proxy header present, and with the server's
+turn token: a secret kept in `turn-token` next to the database (readable by you only; a
+restarted server keeps it, a file others can read gets a new one) and carried in the fragment of
+the URL that `convo-index serve` prints on a terminal and `up` prints and opens. The page moves
+it out of the address bar into the tab's session storage, so a reload keeps it; the login
+service's log never holds it. A page reached any other way, a reverse proxy on this machine, or a
+client that only has what the HTTP API serves cannot run turns; everything else keeps
+working, and with `[server] host = "0.0.0.0"` the endpoint answers 403. A
+conversation whose transcript changed in the last 30 seconds is refused as well (it is
+probably open in a terminal), as is one whose directory is gone or excluded by
+`exclude_cwd`. Turns belong to the server process: closing the page does not stop one,
+reopening the conversation resumes its stream, and stopping the server stops every turn. `convo-index doctor` lists which tools are on
+PATH for this. On Windows, Claude Code turns run the tool through `node` rather than the npm
+`.cmd` shim, inside a job object that ends the whole process tree; Opencode turns are not
+offered there yet. `scripts/probe_turns.sh` is the manual
+check that the closing flags still hold after a tool upgrade.
 
 ## Daily refresh and the server from login
     convo-index schedule install            # LaunchAgent (macOS) or systemd user timer (Linux); crontab line elsewhere

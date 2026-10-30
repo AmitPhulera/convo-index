@@ -7,8 +7,10 @@ it actually read so the indexer never records a change key it observed before re
 """
 from __future__ import annotations
 
+import importlib
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Iterable, Protocol
 
 from convo_index.model import Conversation
@@ -88,6 +90,100 @@ def resume_command(conversation_id: str, cwd: str | None) -> str | None:
     else:
         return None
     return rc(conversation_id, cwd)
+
+
+# --- Browser turns -------------------------------------------------------------------------
+#
+# A source that can run one more turn of a conversation non-interactively exposes three
+# module-level functions; the registry below names the modules so adding a harness is one
+# entry plus those functions:
+#
+#   turn_command(native_id, prompt, cwd, *, edits) -> TurnCommand | None
+#       The process to run. None when this platform cannot launch it safely.
+#   turn_events(line) -> list[dict]
+#       Events for one stdout line: {"kind": "text", "text"}, {"kind": "tool", "name", "input"},
+#       {"kind": "tool_result", "text", "error"}, {"kind": "denied", "name", "input"},
+#       {"kind": "done", "cost_usd", ...} or {"kind": "error", "message"}. Unknown lines -> [].
+#   last_activity(native_id, locator) -> float | None
+#       When the session last changed (epoch seconds), None when unknown.
+#   launcher() -> list[str] | None
+#       The argv prefix that starts the tool here, None when it is not installed (or cannot
+#       be started without a shell): what `doctor` and the UI's `turns_supported` consult.
+#
+# The native id is the only conversation-derived value that reaches argv, and only after
+# NATIVE_ID_RE accepted it: plain characters, never a leading dash, which `claude --resume
+# [value]` (an optional-value option) would read as the next flag. The prompt travels
+# through stdin or as one argv element.
+
+NATIVE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def is_windows():
+    """Platform switch for the launchers (a function so tests can take the other branch
+    without patching `os.name`, which would change what `Path` builds)."""
+    return os.name == "nt"
+
+TURN_MODULES = {
+    "claude_code": "convo_index.sources.claude_code",
+    "opencode": "convo_index.sources.opencode",
+}
+
+
+@dataclass(frozen=True)
+class TurnCommand:
+    argv: list[str]                          # fixed flags plus the validated session id
+    cwd: str
+    env: dict[str, str] = field(default_factory=dict)   # added to the inherited environment
+    unset: tuple[str, ...] = ()              # removed from it (a user's own overrides must not reach a turn)
+    stdin: str | None = None                 # the prompt when the harness reads it from stdin
+    scratch: tuple[str, ...] = ()            # directories made for this turn; the runner removes them when it ends
+
+
+def _turn_module(conversation_id):
+    source, _, native = conversation_id.partition(":")
+    name = TURN_MODULES.get(source)
+    if name is None or not native or not NATIVE_ID_RE.fullmatch(native):
+        return None, native
+    return importlib.import_module(name), native
+
+
+def supports_turns(conversation_id: str) -> bool:
+    """Can this conversation's source run a browser turn on this machine's platform?"""
+    mod, _ = _turn_module(conversation_id)
+    return bool(mod) and bool(getattr(mod, "TURNS_ON_WINDOWS", True) or not is_windows())
+
+
+def turn_command(conversation_id: str, prompt: str, cwd: str, *, edits: bool = False) -> TurnCommand | None:
+    """The harness invocation for one more turn, or None when the source has no headless
+    mode here. Raises ValueError for a native id that must never reach a command line."""
+    source, _, native = conversation_id.partition(":")
+    if source in TURN_MODULES and not NATIVE_ID_RE.fullmatch(native or ""):
+        raise ValueError(f"refusing to run a turn for a session id that is not plain text: {native!r}")
+    mod, native = _turn_module(conversation_id)
+    if mod is None or not supports_turns(conversation_id):
+        return None
+    return mod.turn_command(native, prompt, cwd, edits=edits)
+
+
+def turn_launcher(conversation_id: str) -> list[str] | None:
+    """How the source's tool would be started on this machine, or None when it cannot be."""
+    mod, _ = _turn_module(conversation_id)
+    return mod.launcher() if mod and supports_turns(conversation_id) else None
+
+
+def turn_events(conversation_id: str, line: str) -> list[dict]:
+    mod, _ = _turn_module(conversation_id)
+    return mod.turn_events(line) if mod else []
+
+
+def last_activity(conversation_id: str, locator: str | None) -> float | None:
+    mod, native = _turn_module(conversation_id)
+    if mod is None or not locator:
+        return None
+    try:
+        return mod.last_activity(native, locator)
+    except (OSError, ValueError):
+        return None
 
 
 def read_snapshot(path):
