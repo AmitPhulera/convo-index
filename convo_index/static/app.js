@@ -761,8 +761,37 @@ function takeTurnToken() {
   turnToken = m[1];
   try { sessionStorage.setItem("turnToken", turnToken); } catch (e) { /* kept in memory only */ }
   history.replaceState(null, "", location.pathname + location.search);
+  updateStopButton();
   return true;
 }
+
+// Stopping the server takes the turn token too: a tab not opened through the printed URL
+// cannot stop it. Running turns end first; the page then says how to start it again.
+function updateStopButton() {
+  const btn = $("stop-server");
+  btn.disabled = !turnToken;
+  btn.title = turnToken ? "Stop the convo-index server"
+    : "To stop the server here, open the UI through the URL `convo-index serve` or `up` prints (or run `convo-index stop`)";
+}
+$("stop-server").addEventListener("click", async () => {
+  if (!confirm("Stop the convo-index server? Running browser turns end. Start it again with `convo-index serve`.")) return;
+  const btn = $("stop-server");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/shutdown", { method: "POST", headers: { "X-Convo-Index": "1", "X-Convo-Index-Turn": turnToken } });
+    if (r.status !== 202) {
+      const body = await r.json().catch(() => ({}));
+      showError("The server refused to stop: " + (body.error || r.status));
+      btn.disabled = false;
+      return;
+    }
+    document.body.innerHTML = `<main class="server-stopped"><h1>Server stopped</h1>
+      <p>Start it again with <code>convo-index serve</code>, or it starts at your next login if the service is installed.</p></main>`;
+  } catch (e) {
+    showError("Could not stop the server: " + e);
+    btn.disabled = false;
+  }
+});
 
 // Back/forward and hand-edited hashes open the named conversation; an empty hash closes it.
 window.addEventListener("hashchange", () => {
@@ -780,6 +809,7 @@ const debouncedSearch = debounce(runSearch, 220);
 // Also honor ?q= / ?category= / ?source= / ?project= (used by the analytics page links).
 async function init() {
   takeTurnToken();
+  updateStopButton();
   applyTranscriptView(transcriptViewPref());
   const p = new URLSearchParams(location.search);
   if (p.get("q")) { $("q").value = p.get("q"); $("search-box").classList.add("has-value"); }

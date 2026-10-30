@@ -437,6 +437,29 @@ class BodyTooLarge(ValueError):
     """A request body outside the accepted size."""
 
 
+def shutdown_refusal(client_address, headers=None):
+    """Why this request may not stop the server, or None. Beyond the Host/Origin/CSRF checks it
+    needs a loopback peer, no proxy header and the turn token (from the terminal or the 0600
+    file). Unlike a turn it does not need a loopback listener: a server bound to 0.0.0.0 can
+    still be stopped from this machine, and the peer check keeps everyone else out."""
+    if not _loopback(client_address[0]):
+        return f"the server can be stopped only from this machine (request from {client_address[0]})"
+    for name in PROXY_HEADERS:
+        if (headers or {}).get(name) is not None:
+            return f"the server cannot be stopped through a proxy ({name} header present)"
+    return token_refusal(headers)
+
+
+def request_shutdown(srv):
+    """End running turns, then leave serve_forever (main() returns 0 after it, so a login
+    service that restarts only failed exits leaves the server stopped). Runs on its own
+    thread: shutdown() from a request thread would wait for itself."""
+    def _stop():
+        stop_turns()
+        srv.shutdown()
+    threading.Thread(target=_stop, daemon=True).start()
+
+
 PROXY_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP", "Via")
 MAX_TURN_BODY = 1024 * 1024
 PROMPT_FORBIDDEN = {chr(c) for c in range(32)} - {"\n", "\r", "\t"}
@@ -707,6 +730,12 @@ class Handler(BaseHTTPRequestHandler):
             path, qs = u.path, parse_qs(u.query)
             if path == "/api/refresh":
                 return self._send(200, json.dumps(_run_indexer()))
+            if path == "/api/shutdown":
+                err = shutdown_refusal(self.client_address, self.headers)
+                if err:
+                    return self._send(403, json.dumps({"error": err}))
+                self._send(202, json.dumps({"ok": True, "stopping": True}))
+                return request_shutdown(self.server)
             if path.startswith("/api/conversation/") and path.endswith("/turn"):
                 if self._turns_refused():
                     return
@@ -832,6 +861,8 @@ def main():
         n = stop_turns()
         if n:
             print(f"stopped {n} running turn(s)", file=sys.stderr)
+        srv.server_close()                    # the port is free as soon as the loop ends (`convo-index stop` waits for it)
+    print("server stopped")
     return 0
 
 
