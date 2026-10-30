@@ -216,11 +216,12 @@ function render(items, srcs, q) {
     // One line of where it ran; tags and tickets live in the conversation's details. The
     // snippet only says something when there is a query to match.
     const proj = it.project_root || it.cwd || "";
-    const flags = [it.hidden && "hidden", it.parent_id && "sub-session", it.fidelity && it.fidelity !== "full" && it.fidelity].filter(Boolean);
+    const flags = [it.hidden && ["hidden-tag", "hidden"], it.parent_id && ["child", "sub-session"],
+                   it.fidelity && it.fidelity !== "full" && ["fidelity", it.fidelity]].filter(Boolean);
     const msgs = it.message_count ? `<span class="sep">·</span><span>${it.message_count} msg${it.message_count === 1 ? "" : "s"}</span>` : "";
     li.innerHTML = `<div class="card-top"><div class="title" title="${escape(it.title)}">${escape(it.title)}</div>
         <time datetime="${escape(it.start_ts || "")}" title="${escape(fullTime(it.start_ts))}">${escape(relTime(it.start_ts))}</time></div>
-      <div class="card-meta"><span class="src-dot ${escape(it.source || "")}" aria-hidden="true"></span><span>${escape(sourceLabel(it.source))}</span>${proj ? `<span class="sep">·</span><span class="proj" title="${escape(proj)}">${escape(baseName(proj))}</span>` : ""}${msgs}${flags.map(f => `<span class="badge hidden-tag">${escape(f)}</span>`).join("")}</div>
+      <div class="card-meta"><span class="src-dot ${escape(it.source || "")}" aria-hidden="true"></span><span>${escape(sourceLabel(it.source))}</span>${proj ? `<span class="sep">·</span><span class="proj" title="${escape(proj)}">${escape(baseName(proj))}</span>` : ""}${msgs}${flags.map(([cls, label]) => `<span class="badge ${cls}">${escape(label)}</span>`).join("")}</div>
       ${q ? `<div class="snippet">${snippetHTML(it.snippet)}</div>` : ""}`;
     ul.appendChild(li);
   }
