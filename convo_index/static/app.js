@@ -459,10 +459,17 @@ async function openDetail(id, cardEl) {
   detail.className = "";
   detail.innerHTML = `<div class="detail-body"><div class="skeleton" style="border:0;padding:0"><div class="sk w60"></div><div class="sk w40"></div><div class="sk w80"></div><div class="sk w80"></div></div></div>`;
 
-  const res = await fetch("/api/conversation/" + encodeURIComponent(id));
-  if (selectedId !== id) return;                       // the user already moved on
-  if (!res.ok) { detail.innerHTML = `<div class="detail-body">${emptyState("Could not load this conversation", `The server returned ${res.status}.`).replace(/^<li/, "<div").replace(/li>$/, "div>")}</div>`; return; }
-  const c = await res.json();
+  const failed = why => { detail.innerHTML = `<div class="detail-body">${emptyState("Could not load this conversation", why).replace(/^<li/, "<div").replace(/li>$/, "div>")}</div>`; };
+  let res, c;
+  try {
+    res = await fetch("/api/conversation/" + encodeURIComponent(id));
+    if (selectedId !== id) return;                     // the user already moved on
+    if (!res.ok) { failed(`The server returned ${res.status}.`); return; }
+    c = await res.json();
+  } catch (e) {
+    if (selectedId === id) failed("The server did not answer. Is it still running?");
+    return;
+  }
   selectedId = c.id;  // legacy ids resolve server-side to the namespaced id
 
   const tickets = (c.tickets || []).map(ticketLink).join("");
