@@ -49,9 +49,6 @@ jobs:
   audit:
     name: dependency audit
     runs-on: ubuntu-latest
-    # Advisory until the lockfile catches up with pillow 13 (fastembed pulls in 12.3.0, which
-    # has open advisories); Dependabot's uv updates bump it. Make this job required again then.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
