@@ -24,6 +24,7 @@ const ICON = {
   inbox: '<svg class="icon" viewBox="0 0 24 24"><path d="M3 13h5l2 3h4l2-3h5M5 4h14l2 9v7H3v-7z"/></svg>',
   close: '<svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
   stop: '<svg class="icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
+  panel: '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>',
   send: '<svg class="icon" viewBox="0 0 24 24"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4z"/></svg>',
 };
 function sourceLabel(s) { return SOURCE_LABELS[s] || s || "unknown"; }
@@ -48,7 +49,22 @@ function wireChips(container) {
 function anyFilterActive() {
   return !!projectFilter || document.querySelectorAll("#filters .chip input:checked").length > 0;
 }
-function updateFilterState() { $("filters").classList.toggle("active", anyFilterActive()); }
+// The filters live in a panel behind one button; what is switched on shows as removable chips
+// above the results, so a closed panel never hides why the list is short.
+function updateFilterState() {
+  $("filters").classList.toggle("active", anyFilterActive());
+  const active = Array.from(document.querySelectorAll("#filters .chip input:checked")).map(el => ({
+    label: el.classList.contains("f-tag") ? el.value.replace(":", ": ") : el.closest(".chip").textContent.trim(),
+    remove: () => { el.checked = false; el.dispatchEvent(new Event("change")); },
+  }));
+  if (projectFilter) active.unshift({ label: "Project " + shortPath(projectFilter), remove: () => { projectFilter = null; updateFilterState(); runSearch(); } });
+  const box = $("active-filters");
+  box.innerHTML = active.map((f, i) =>
+    `<button type="button" class="active-chip" data-i="${i}" aria-label="Remove filter ${escape(f.label)}">${escape(f.label)}${ICON.close}</button>`).join("");
+  box.querySelectorAll(".active-chip").forEach(b => b.addEventListener("click", () => active[Number(b.dataset.i)].remove()));
+  $("filter-count").textContent = active.length ? String(active.length) : "";
+  $("filters-toggle").classList.toggle("on", active.length > 0);
+}
 function clearFilters() {
   document.querySelectorAll("#filters .chip input:checked").forEach(el => { el.checked = false; el.closest(".chip").classList.remove("on"); });
   projectFilter = null;
@@ -163,13 +179,7 @@ function emptyState(title, text, action) {
 function render(items, srcs, q) {
   const ul = $("results");
   ul.innerHTML = "";
-  if (projectFilter) {
-    const chipEl = document.createElement("div");
-    chipEl.className = "filter-chip";
-    chipEl.innerHTML = `Project <code title="${escape(projectFilter)}">${escape(shortPath(projectFilter))}</code> <button id="clear-project" aria-label="Remove project filter">${ICON.close}</button>`;
-    chipEl.querySelector("#clear-project").onclick = () => { projectFilter = null; updateFilterState(); runSearch(); };
-    ul.appendChild(chipEl);
-  }
+  updateFilterState();
   const filtered = items;
   currentIds = filtered.map(i => i.id);
   const n = filtered.length;
@@ -203,17 +213,16 @@ function render(items, srcs, q) {
     li.tabIndex = 0;
     li.onclick = () => openDetail(it.id, li);
     li.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); openDetail(it.id, li); } };
-    const tickets = it.tickets.map(ticketLink).join("");
-    const hiddenBadge = it.hidden ? `<span class="badge hidden-tag">hidden</span>` : "";
-    const childBadge = it.parent_id ? `<span class="badge child">sub-session</span>` : "";
-    const fidelity = it.fidelity && it.fidelity !== "full" ? `<span class="badge fidelity">${escape(it.fidelity)}</span>` : "";
+    // One line of where it ran; tags and tickets live in the conversation's details. The
+    // snippet only says something when there is a query to match.
     const proj = it.project_root || it.cwd || "";
+    const flags = [it.hidden && ["hidden-tag", "hidden"], it.parent_id && ["child", "sub-session"],
+                   it.fidelity && it.fidelity !== "full" && ["fidelity", it.fidelity]].filter(Boolean);
     const msgs = it.message_count ? `<span class="sep">·</span><span>${it.message_count} msg${it.message_count === 1 ? "" : "s"}</span>` : "";
     li.innerHTML = `<div class="card-top"><div class="title" title="${escape(it.title)}">${escape(it.title)}</div>
         <time datetime="${escape(it.start_ts || "")}" title="${escape(fullTime(it.start_ts))}">${escape(relTime(it.start_ts))}</time></div>
-      <div class="card-meta">${sourceBadge(it.source)}${proj ? `<span class="sep">·</span><span class="proj" title="${escape(proj)}">${escape(shortPath(proj))}</span>` : ""}${msgs}</div>
-      <div class="card-tags">${hiddenBadge}${childBadge}${fidelity}${tagBadges(it.tags)}${tickets}</div>
-      <div class="snippet">${snippetHTML(it.snippet)}</div>`;
+      <div class="card-meta"><span class="src-dot ${escape(it.source || "")}" aria-hidden="true"></span><span>${escape(sourceLabel(it.source))}</span>${proj ? `<span class="sep">·</span><span class="proj" title="${escape(proj)}">${escape(baseName(proj))}</span>` : ""}${msgs}${flags.map(([cls, label]) => `<span class="badge ${cls}">${escape(label)}</span>`).join("")}</div>
+      ${q ? `<div class="snippet">${snippetHTML(it.snippet)}</div>` : ""}`;
     ul.appendChild(li);
   }
 }
@@ -384,7 +393,7 @@ function usageLine(u) {
   if (!u || !u.requests) return "";
   const usd = x => x >= 1 ? "$" + x.toFixed(2) : "$" + x.toFixed(4);
   let cost = "";
-  if (u.coverage !== null && u.coverage !== undefined) {
+  if (u.coverage) {                         // nothing priced: no "$0" estimate
     cost = (u.coverage < 1 ? "≥ " : "≈ ") + usd(u.estimated_cost || 0) + (u.coverage < 1 ? ` (${Math.round(u.coverage * 100)}% priced)` : "");
   }
   const rep = u.reported_cost !== null && u.reported_cost !== undefined ? `<span class="sep">·</span><span>reported ${usd(u.reported_cost)}</span>` : "";
@@ -428,15 +437,15 @@ function stepsLabel(c) {
   return `${c.n} step${c.n === 1 ? "" : "s"}` + (h.length ? ` · <span class="harness-kind">${escape(h.join(", "))}</span>` : "");
 }
 
-// Transcript view: "all", "no-tools" (hide thinking and tool activity) or "replies" (only what
-// the user typed and each final reply). Falls back to the older hideTools preference.
-const TRANSCRIPT_VIEWS = ["all", "no-tools", "replies"];
+// Transcript view: "replies" (the default: only what the user typed and each final reply, the
+// steps between folded into a counter) or "all". The retired "no-tools" view reads as "all".
+const TRANSCRIPT_VIEWS = ["replies", "all"];
 function transcriptViewPref() {
   try {
     const v = localStorage.getItem("transcriptView");
     if (TRANSCRIPT_VIEWS.includes(v)) return v;
-    return localStorage.getItem("hideTools") === "1" ? "no-tools" : "all";
-  } catch (e) { return "all"; }
+    return v === "no-tools" ? "all" : "replies";
+  } catch (e) { return "replies"; }
 }
 function applyTranscriptView(view) {
   document.body.classList.toggle("hide-tools", view !== "all");
@@ -446,7 +455,42 @@ function applyTranscriptView(view) {
   try { localStorage.setItem("transcriptView", view); } catch (e) { /* ignore */ }
 }
 
+// The details panel (summary, tags, references, resume) sits beside the transcript and is
+// open by default; closing it is remembered in this browser. Below 1200px it is a drawer over
+// the transcript instead: closed until asked for, and never remembered.
+let tagEditOpen = false;
+const NARROW = window.matchMedia("(max-width: 1200px)");
+function detailsPanelOpen() {
+  if (NARROW.matches) return false;
+  try { return localStorage.getItem("detailsPanel") !== "closed"; } catch (e) { return true; }
+}
+function toggleDetailsPanel(open) {
+  const detail = $("detail"), btn = $("details-toggle");
+  if (!btn) return;
+  open = open === undefined ? !detail.classList.contains("details-open") : open;
+  detail.classList.toggle("details-open", open);
+  btn.setAttribute("aria-expanded", String(open));
+  if (NARROW.matches) {
+    // the drawer covers the transcript: focus goes into it, and back to the button on close
+    if (open) $("details-close").focus();
+    else if ($("details-panel").contains(document.activeElement) || document.activeElement === document.body) btn.focus();   // a re-render drops focus to the body
+    return;
+  }
+  try { localStorage.setItem("detailsPanel", open ? "open" : "closed"); } catch (e) { /* not remembered */ }
+}
+
+// "≈ $1.23" for the header: the API-equivalent estimate, when there is one.
+function costShort(u) {
+  if (!u || !u.requests || !u.coverage) return "";     // nothing priced: say nothing rather than "$0"
+  const x = u.estimated_cost || 0;
+  return `<span class="mi" title="API-equivalent estimate">${u.coverage < 1 ? "≥ " : "≈ "}${x >= 1 ? "$" + x.toFixed(2) : "$" + x.toFixed(4)}</span>`;
+}
+
 async function openDetail(id, cardEl) {
+  // re-rendering the conversation on show (after a tag, reference or hide change) keeps the
+  // details panel as it was, drawer included
+  const keepPanel = id === selectedId && $("detail").classList.contains("details-open");
+  if (id !== selectedId) tagEditOpen = false;    // the tag editor stays open only for re-renders
   detachTurn();
   const gen = ++detailView;
   selectedId = id;
@@ -474,7 +518,6 @@ async function openDetail(id, cardEl) {
   if (gen !== detailView) return;
   selectedId = c.id;  // legacy ids resolve server-side to the namespaced id
 
-  const tickets = (c.tickets || []).map(ticketLink).join("");
   let prevDate = "";
   const turns = transcriptTurns(c.messages);
   const msgs = c.messages.map((m, i) => {
@@ -485,63 +528,87 @@ async function openDetail(id, cardEl) {
     prevDate = (m.ts || "").slice(0, 10) || prevDate;
     return h;
   }).join("");
-  const toolish = c.messages.filter(m => ["tool_call", "tool_result", "thinking"].includes(m.kind || "text")).length;
   const stepCount = turns.counts.reduce((a, c) => a + c.n, 0);
 
   const cwd = c.cwd || ".";
   const resume = !c.resume_cmd ? null
     : WINDOWS ? `Set-Location -LiteralPath ${shellQuote(cwd)} -ErrorAction Stop; ${c.resume_cmd}`   // a missing dir stops the line
     : `cd ${shellQuote(cwd)} && ${c.resume_cmd}`;
-  const resumeHTML = resume ? `<div class="dsec"><div class="dsec-label">Continue in ${WINDOWS ? "PowerShell" : "the terminal"}</div><div class="resume">
-        <code class="resume-cmd">${escape(resume)}</code>
-        <button class="btn copy-btn" data-cmd="${escape(resume)}" onclick="copyCmd(this)">${ICON.copy}<span class="label">Copy</span></button>
-      </div></div>` : "";
   // Links carry the target id in a data attribute; a delegated click handler opens it.
   const convLink = (id, label) => `<a href="#${encodeURIComponent(id)}" class="conv-link" data-id="${escape(id)}">${escape(label)}</a>`;
-  const parent = c.parent_id
-    ? `<div class="children">${escape(c.relation || "child")} of ${convLink(c.parent_id, c.parent_id)}</div>` : "";
-  const children = (c.children || []).length
-    ? `<div class="children">Sub-sessions: ${c.children.map(k => convLink(k, k.split(":")[1] || k)).join(" · ")}</div>` : "";
-  const fidelity = c.fidelity && c.fidelity !== "full"
-    ? `<span class="badge fidelity">${escape(c.fidelity)} transcript</span>` : "";
-  const warn = (c.warnings || []).length
-    ? `<span class="badge fidelity" title="${escape(c.warnings.join("; "))}">⚠ ${c.warnings.length} warning${c.warnings.length > 1 ? "s" : ""}</span>` : "";
-  const models = (c.models || []).length ? `<span class="sep">·</span><span title="Models used">${escape(c.models.join(", "))}</span>` : "";
-  const branch = c.git_branch && c.git_branch !== "HEAD" ? `<span class="sep">·</span><span class="path" title="Git branch">⎇ ${escape(c.git_branch)}</span>` : "";
-  const hidden = c.hidden ? `<span class="badge hidden-tag">hidden</span>` : "";
-  const tagsHTML = tagEditorHTML(c);
-  const refsHTML = referencesHTML(c);
+  const flags = [
+    c.hidden ? `<span class="badge hidden-tag">hidden</span>` : "",
+    c.fidelity && c.fidelity !== "full" ? `<span class="badge fidelity">${escape(c.fidelity)} transcript</span>` : "",
+    (c.warnings || []).length ? `<span class="badge fidelity" title="${escape(c.warnings.join("; "))}">⚠ ${c.warnings.length} warning${c.warnings.length > 1 ? "s" : ""}</span>` : "",
+  ].join("");
+  // each item is its own element and the separators are CSS, so a phone can drop the paths
+  const meta = [
+    `<span class="mi"><span class="src-dot ${escape(c.source || "")}" aria-hidden="true"></span>${escape(sourceLabel(c.source))}</span>`,
+    c.cwd ? `<span class="mi path" title="${escape(c.cwd)}">${escape(shortPath(c.cwd))}</span>` : "",
+    c.git_branch && c.git_branch !== "HEAD" ? `<span class="mi path" title="Git branch">⎇ ${escape(c.git_branch)}</span>` : "",
+    `<span class="mi">${c.messages.length} message${c.messages.length === 1 ? "" : "s"}</span>`,
+    costShort(c.usage),
+  ].join("");
   const view = transcriptViewPref();
   const viewBtn = (v, label, title) => `<button type="button" data-view="${v}" aria-pressed="${view === v}" title="${title}">${label}</button>`;
+  const open = keepPanel || detailsPanelOpen();
+  const section = (label, body) => body ? `<section class="dsec"><h3 class="dsec-label">${label}</h3>${body}</section>` : "";
+  const assigned = tagBadges((c.tags || {}).assignments);
+  const tagsHTML = tagEditorHTML(c);
+  const refs = (c.tickets || []).map(ticketLink).join("") + referencesHTML(c);
+  const session = [
+    `<div>Started <span title="${escape(fullTime(c.start_ts))}">${escape(fullTime(c.start_ts))}</span></div>`,
+    // the title bar drops these on small phones, so the details always carry them
+    c.cwd ? `<div>Directory <span class="path" title="${escape(c.cwd)}">${escape(shortPath(c.cwd))}</span></div>` : "",
+    c.git_branch && c.git_branch !== "HEAD" ? `<div>Branch <span class="path">${escape(c.git_branch)}</span></div>` : "",
+    (c.models || []).length ? `<div title="Models used">${escape(c.models.join(", "))}</div>` : "",
+    c.parent_id ? `<div>${escape(c.relation || "child")} of ${convLink(c.parent_id, c.parent_id)}</div>` : "",
+    (c.children || []).length ? `<div>Sub-sessions: ${c.children.map(k => convLink(k, k.split(":")[1] || k)).join(" · ")}</div>` : "",
+    usageLine(c.usage),
+  ].join("");
+  detail.className = open ? "details-open" : "";
   detail.innerHTML = `<div class="detail-bar">
       <button class="btn ghost icon-only" id="detail-back" aria-label="Back to results">${ICON.back}</button>
-      <h2 title="${escape(c.title)}">${escape(c.title)}</h2>
+      <div class="detail-head">
+        <h2 class="detail-title" title="${escape(c.title)}">${escape(c.title)}</h2>
+        <div class="meta-line">${meta}${flags}</div>
+      </div>
       <div class="toolbar">
-        ${resume ? `<button class="btn primary copy-btn" data-cmd="${escape(resume)}" onclick="copyCmd(this)" title="Copy the command that resumes this conversation">${ICON.copy}<span class="label">Copy resume command</span></button>` : ""}
-        <button class="btn" id="btn-hide" title="${c.hidden ? "Show this conversation in results again" : "Keep this conversation out of results (reversible)"}">${c.hidden ? ICON.eye : ICON.eyeOff}<span class="label">${c.hidden ? "Unhide" : "Hide"}</span></button>
-        <button class="btn danger" id="btn-delete" title="Remove permanently; it will not come back on reindex">${ICON.trash}<span class="label">Delete</span></button>
-        <span id="confirm-slot"></span>
+        ${stepCount ? `<div class="segmented small" id="transcript-view" role="group" aria-label="Transcript view">
+          ${viewBtn("replies", "Replies", "Only your messages and each final reply; the steps in between fold into a counter")}
+          ${viewBtn("all", "All", "Every message, with tool activity and thinking collapsed")}
+        </div>` : ""}
+        <button class="btn" id="details-toggle" type="button" aria-expanded="${open}" aria-controls="details-panel" title="Summary, tags, references and how to resume">${ICON.panel}<span class="label">Details</span></button>
       </div>
     </div>
-    <div class="detail-body">
-      <h1 class="detail-title">${escape(c.title)}</h1>
-      <div class="meta-row">${hidden}${sourceBadge(c.source)}${fidelity}${warn}${tickets}
-        <span title="${escape(fullTime(c.start_ts))}">${escape(fullTime(c.start_ts))}</span>
-        ${c.cwd ? `<span class="sep">·</span><span class="path" title="${escape(c.cwd)}">${escape(shortPath(c.cwd))}</span>` : ""}${branch}${models}</div>
-      ${usageLine(c.usage)}${parent}${children}
-      ${tagsHTML ? `<div class="dsec"><div class="dsec-label">Tags</div>${tagsHTML}</div>` : ""}
-      ${refsHTML ? `<div class="dsec"><div class="dsec-label">References</div>${refsHTML}</div>` : ""}
-      ${resumeHTML}
-      ${summaryHTML(c.summary)}${relatedHTML(c)}
-      <div class="transcript-head"><h3>Transcript</h3><span>${c.messages.length} message${c.messages.length === 1 ? "" : "s"}${toolish ? ` · ${toolish} tool / thinking` : ""}</span>
-        ${stepCount ? `<div class="segmented small" id="transcript-view" role="group" aria-label="Transcript view">
-          ${viewBtn("all", "Everything", "Every message, with tool activity and thinking collapsed")}
-          ${toolish ? viewBtn("no-tools", "No tools", "Hide thinking, tool calls and tool results") : ""}
-          ${viewBtn("replies", "Replies only", "Only your messages and each final reply; the steps in between fold into a counter")}
-        </div>` : ""}</div>
-      ${msgs}
-      ${c.turns_supported ? composerHTML() : ""}
+    <div class="detail-grid">
+      <div class="conversation">
+        ${msgs}
+        ${c.turns_supported ? composerHTML(c) : ""}
+      </div>
+      <aside class="details-panel" id="details-panel" aria-label="Conversation details">
+        <div class="panel-head"><h2>Details</h2><button class="btn ghost icon-only" id="details-close" type="button" aria-label="Close details">${ICON.close}</button></div>
+        ${section(`Continue in ${WINDOWS ? "PowerShell" : "the terminal"}`, resume ? `<div class="resume">
+          <code class="resume-cmd" title="${escape(resume)}">${escape(resume)}</code>
+          <button class="btn copy-btn" data-cmd="${escape(resume)}" onclick="copyCmd(this)">${ICON.copy}<span class="label">Copy</span></button>
+        </div>` : "")}
+        ${section("Summary", summaryHTML(c.summary))}
+        ${tagsHTML ? section("Tags", `<div class="tag-list">${assigned || `<span class="hint">None yet</span>`}</div>
+          <details class="tag-edit"${tagEditOpen ? " open" : ""}><summary>Edit tags</summary>${tagsHTML}</details>`) : ""}
+        ${section("References", refs ? `<div class="refs">${refs}</div>` : "")}
+        ${section("Related", relatedHTML(c))}
+        ${section("Session", session)}
+        <div class="detail-actions">
+          <button class="btn" id="btn-hide" title="${c.hidden ? "Show this conversation in results again" : "Keep this conversation out of results (reversible)"}">${c.hidden ? ICON.eye : ICON.eyeOff}<span class="label">${c.hidden ? "Unhide" : "Hide"}</span></button>
+          <button class="btn danger" id="btn-delete" title="Remove permanently; it will not come back on reindex">${ICON.trash}<span class="label">Delete</span></button>
+          <span id="confirm-slot"></span>
+        </div>
+      </aside>
     </div>`;
+  $("details-toggle").addEventListener("click", () => toggleDetailsPanel());
+  $("details-close").addEventListener("click", () => toggleDetailsPanel(false));
+  const tagEdit = detail.querySelector(".tag-edit");
+  if (tagEdit) tagEdit.addEventListener("toggle", () => { tagEditOpen = tagEdit.open; });
   $("detail-back").addEventListener("click", closeDetail);
   $("btn-hide").addEventListener("click", () => toggleHide(c.id, c.hidden ? 0 : 1));
   $("btn-delete").addEventListener("click", () => askDelete(c.id));
@@ -625,7 +692,7 @@ function relatedHTML(c) {
     return `<div class="rel-group"><div class="rel-head"><span class="tg-name">${escape(g.kind)}</span> ${head}
       <span class="rel-meta">${g.count} other conversation${g.count > 1 ? "s" : ""}</span></div>${items}</div>`;
   }).join("");
-  return `<div class="related"><h3>Related work</h3>${rows}</div>`;
+  return `<div class="related">${rows}</div>`;
 }
 
 // Per group: every tag as a toggle chip (click = accept; for exclusive groups this replaces
@@ -733,25 +800,28 @@ function detachTurn() {
   if (turnStream) { turnStream.controller.abort(); turnStream = null; }
 }
 
-function composerHTML() {
+// The edits position is a Mode picker: Read-only, or Can edit files (never shell commands).
+function composerHTML(c) {
   const send = /Mac/.test(navigator.platform) ? "⌘" : "Ctrl";
-  const hint = turnToken ? `<kbd>${send}</kbd><kbd>Enter</kbd> to send`
+  const hint = turnToken ? `<span class="send-hint"><kbd>${send}</kbd><kbd>Enter</kbd> to send</span>`
     : "To send messages here, open the UI through the URL <code>convo-index serve</code> or <code>up</code> prints.";
   return `<div id="turn-live"></div>
     <div class="composer" id="composer">
-      <textarea id="turn-prompt" rows="2" placeholder="Continue this conversation…"${turnToken ? "" : " disabled"}></textarea>
-      <div class="composer-row">
-        <label class="chip" title="Let the tool edit files in the conversation's directory. Shell commands are never allowed."><input type="checkbox" id="turn-edits"> Allow edits</label>
-        <span class="turn-status" id="turn-status">${hint}</span>
-        <button class="btn danger" id="turn-stop" hidden title="Stop the tool. What it already wrote stays in the transcript.">${ICON.stop}<span class="label">Stop</span></button>
-        <button class="btn primary" id="turn-send"${turnToken ? "" : " disabled"}>${ICON.send}<span class="label">Send</span></button>
+      <div class="composer-box">
+        <textarea id="turn-prompt" rows="2" aria-label="Message" placeholder="Continue this conversation in ${escape(sourceLabel(c.source))}…"${turnToken ? "" : " disabled"}></textarea>
+        <div class="composer-row">
+          <label class="mode-pick" title="What the tool may do. Shell commands are never allowed.">Mode
+            <select id="turn-edits"><option value="read">Read-only</option><option value="edits">Can edit files</option></select>
+          </label>
+          <span class="turn-status" id="turn-status" role="status">${hint}</span>
+          <button class="btn danger" id="turn-stop" hidden title="Stop the tool. What it already wrote stays in the transcript.">${ICON.stop}<span class="label">Stop</span></button>
+          <button class="btn primary" id="turn-send"${turnToken ? "" : " disabled"}>${ICON.send}<span class="label">Send</span></button>
+        </div>
       </div>
     </div>`;
 }
 
 function wireComposer(c) {
-  const edits = $("turn-edits");
-  edits.addEventListener("change", () => edits.closest(".chip").classList.toggle("on", edits.checked));
   $("turn-send").addEventListener("click", () => sendTurn(c.id));
   $("turn-stop").addEventListener("click", stopTurn);
   $("turn-prompt").addEventListener("keydown", e => {
@@ -776,10 +846,7 @@ function setComposerBusy(busy) {
 }
 
 function showEdits(on) {
-  const edits = $("turn-edits");
-  if (!edits) return;
-  edits.checked = on;
-  edits.closest(".chip").classList.toggle("on", on);
+  if ($("turn-edits")) $("turn-edits").value = on ? "edits" : "read";
 }
 
 // The live output sits just above the pinned message box: keep it in view while the reader is
@@ -817,7 +884,7 @@ async function stopTurn() {
 }
 
 async function sendTurn(convId) {
-  const box = $("turn-prompt"), prompt = box.value, edits = $("turn-edits").checked;
+  const box = $("turn-prompt"), prompt = box.value, edits = $("turn-edits").value === "edits";
   if (!prompt.trim() || $("turn-send").disabled) return;
   const view = detailView;
   box.value = "";                              // what is typed from here on is the next message
@@ -1005,9 +1072,17 @@ function moveSelection(delta) {
 }
 document.addEventListener("keydown", e => {
   const tag = (e.target.tagName || "").toLowerCase();
-  const typing = tag === "input" || tag === "textarea" || e.target.isContentEditable;
+  // a select uses the arrow keys and typed letters itself, like a text field
+  const typing = tag === "input" || tag === "textarea" || tag === "select" || e.target.isContentEditable;
   // Chrome clears an <input type=search> on Escape; blur instead so the query survives.
-  if (e.key === "Escape") { if (typing) { e.preventDefault(); e.target.blur(); } else closeDetail(); return; }
+  if (e.key === "Escape") {
+    const filters = $("filters-panel");
+    if (!filters.hidden && (!typing || filters.contains(e.target))) setFiltersOpen(false, true);   // the panel first
+    else if (typing) { e.preventDefault(); e.target.blur(); }
+    else if (NARROW.matches && $("detail").classList.contains("details-open")) toggleDetailsPanel(false);   // the drawer first
+    else closeDetail();
+    return;
+  }
   if (typing) {
     if (e.target.id === "q" && e.key === "ArrowDown") { e.preventDefault(); moveSelection(1); }
     return;
@@ -1023,6 +1098,12 @@ $("q-clear").addEventListener("click", () => { $("q").value = ""; $("search-box"
 document.querySelectorAll("#mode button").forEach(b => b.addEventListener("click", () => { if (!b.disabled) { setMode(b.dataset.mode); runSearch(); } }));
 wireChips(document.querySelector('#filters .chip-group[aria-label="Options"]'));
 $("clear-filters").addEventListener("click", clearFilters);
+function setFiltersOpen(open, refocus) {
+  $("filters-panel").hidden = !open;
+  $("filters-toggle").setAttribute("aria-expanded", String(open));
+  if (refocus) $("filters-toggle").focus();
+}
+$("filters-toggle").addEventListener("click", () => setFiltersOpen($("filters-panel").hidden));
 $("refresh").addEventListener("click", async () => {
   const btn = $("refresh");
   btn.disabled = true;
@@ -1044,8 +1125,6 @@ $("refresh").addEventListener("click", async () => {
   await loadSources();
   runSearch();
 });
-// The compact title in the sticky bar only shows once the big one has scrolled away.
-$("detail-pane").addEventListener("scroll", () => $("detail-pane").classList.toggle("scrolled", $("detail-pane").scrollTop > 60));
 
 // The turn token arrives in the fragment of the URL `serve` and `up` print (#turns=<token>).
 // It is kept for this tab (sessionStorage outlives a reload, never leaves the browser) and
