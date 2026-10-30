@@ -1059,7 +1059,8 @@ function moveSelection(delta) {
 }
 document.addEventListener("keydown", e => {
   const tag = (e.target.tagName || "").toLowerCase();
-  const typing = tag === "input" || tag === "textarea" || e.target.isContentEditable;
+  // a select uses the arrow keys and typed letters itself, like a text field
+  const typing = tag === "input" || tag === "textarea" || tag === "select" || e.target.isContentEditable;
   // Chrome clears an <input type=search> on Escape; blur instead so the query survives.
   if (e.key === "Escape") {
     if (typing) { e.preventDefault(); e.target.blur(); }
