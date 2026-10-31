@@ -487,10 +487,14 @@ def _cost(messages):
 
 def _verdict(messages):
     """done or error for a run that pi will not retry, judged by its final assistant message: in
-    JSON mode pi exits 0 even when that request failed."""
+    JSON mode pi exits 0 even when that request failed, was aborted or was cut off at the model's
+    output limit (its text mode exits 1 for all three)."""
     last = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "assistant"), {})
-    if last.get("stopReason") == "error":
-        return {"kind": "error", "message": _turn_clip(last.get("errorMessage") or "request failed", 2000)}
+    stop = last.get("stopReason")
+    if stop in ("error", "aborted"):
+        return {"kind": "error", "message": _turn_clip(last.get("errorMessage") or f"request {stop}", 2000)}
+    if stop == "length":
+        return {"kind": "error", "message": "the response was cut off at the model's output limit"}
     return {"kind": "done", "cost_usd": _cost(messages),
             "turns": sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant")}
 

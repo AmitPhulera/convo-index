@@ -431,8 +431,17 @@ def test_pi_failed_request_is_an_error_though_pi_exits_0():
     assert pi.turn_events(json.dumps({"type": "message_end", "message": failed})) == []
     assert pi.turn_events(json.dumps({"type": "agent_end", "messages": [failed], "willRetry": False})) == [
         {"kind": "error", "message": "404: model 'nosuchmodel-xyz' not found"}]
+    assert pi.turn_events(json.dumps({"type": "agent_end", "messages": [_pi_assistant("aborted")]})) == [
+        {"kind": "error", "message": "request aborted"}]
     assert pi.turn_events(json.dumps({"type": "agent_end", "messages": []})) == [{"kind": "done", "cost_usd": None, "turns": 0}]
     assert pi.turn_events("not json") == [] and pi.turn_events("[1]") == [] and pi.turn_events('{"type": "message_end"}') == []
+
+
+def test_pi_truncated_final_response_is_an_error():
+    cut = _pi_assistant("length", text="Partial reply")
+    assert pi.turn_events(json.dumps({"type": "message_end", "message": cut})) == [{"kind": "text", "text": "Partial reply"}]
+    (ev,) = pi.turn_events(json.dumps({"type": "agent_end", "messages": [cut], "willRetry": False}))
+    assert ev["kind"] == "error" and "output limit" in ev["message"]
 
 
 def test_pi_retried_failure_ends_as_the_retry_does():
