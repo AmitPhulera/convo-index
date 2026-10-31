@@ -324,15 +324,17 @@ def plan(settings=None, hour=None, minute=None, system=None, home=None, job="ref
             out["commands"].append(["schtasks", "/Run", "/TN", spec["task"]])
     elif kind == "cron":
         out["crontab"] = crontab_line(argv, hour, minute, log, config_path)
-    # how to run it by hand: the only way with kind "none", the fallback when an install fails
-    out["manual"] = manual_line(argv, log, config_path, background=job == "serve")
+    # how to run it by hand: the only way with kind "none", the fallback when an install fails.
+    # The server goes to the background with its log; the refresh runs in front, its progress visible.
+    out["manual"] = manual_line(argv, log if job == "serve" else None, config_path, background=job == "serve")
     return out
 
 
-def manual_line(argv, log, config_path=None, background=False):
-    """The shell line that runs a job by hand, its output appended to the job's log."""
+def manual_line(argv, log=None, config_path=None, background=False):
+    """The shell line that runs a job by hand with the job's configuration: in the background
+    with output appended to `log` when asked."""
     env = f"CONVO_INDEX_CONFIG={_sh(config_path)} " if config_path else ""   # before nohup: it runs a command, not a shell
-    run = f"{' '.join(_sh(a) for a in argv)} >> {_sh(str(log))} 2>&1"
+    run = " ".join(_sh(a) for a in argv) + (f" >> {_sh(str(log))} 2>&1" if log else "")
     return f"{env}nohup {run} &" if background else env + run
 
 

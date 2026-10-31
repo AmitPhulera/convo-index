@@ -489,6 +489,8 @@ def test_linux_without_a_user_session_falls_back_and_says_why(tmp_path, monkeypa
     assert SCH.systemd_user_available() is False                                         # a broken binary is no systemd
     line = SCH.manual_line(["/opt/convo-index", "serve"], "/d/serve.log", "/my cfg.toml", background=True)
     assert line == "CONVO_INDEX_CONFIG='/my cfg.toml' nohup /opt/convo-index serve >> /d/serve.log 2>&1 &"   # env before nohup
+    assert SCH.manual_line(["/opt/convo-index", "index"], None, "/c.toml") == "CONVO_INDEX_CONFIG=/c.toml /opt/convo-index index"
+    assert SCH.plan(st, system="Linux", home=tmp_path / "home")["manual"] == "/opt/convo-index index"   # refresh: in front, no log
 
 
 def test_existing_systemd_units_are_found_without_a_user_session(tmp_path, monkeypatch):

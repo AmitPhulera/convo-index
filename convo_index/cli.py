@@ -578,7 +578,7 @@ def cmd_up(args):
                              "add this line with `crontab -e` to refresh daily:", [out["crontab"]]))
             else:
                 todo.append(("New conversations are not indexed automatically. Run this when you want "
-                             "them searchable:", ["convo-index index"]))
+                             "them searchable:", [out["manual"]]))
     host, port = settings["server"]["host"], int(settings["server"]["port"])
     url = server.advertised_url(host, port)
     if args.wait:
