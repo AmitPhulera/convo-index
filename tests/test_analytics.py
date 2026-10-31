@@ -112,3 +112,16 @@ def test_usage_coverage_counts_token_bearing_requests_only(tmp_path):
     u = A.analytics(p, st)["usage"]
     assert u["totals"]["requests"] == 11 and u["totals"]["coverage"] == 0.5
     assert u["by_model"][0][1]["coverage"] == 1.0 and u["by_project"][0][1]["coverage"] == 0.5
+
+
+def test_usage_analytics_apply_prompt_size_tiers_per_request(tmp_path):
+    """The DuckDB path groups by size band too: same numbers as the SQLite path."""
+    from tests.conftest import make_settings
+    from tests.test_cost import _tiered, TIERED_TOTAL
+    st = make_settings(tmp_path)
+    _tiered(tmp_path / "t.db").close()
+    u = A.analytics(tmp_path / "t.db", st)["usage"]
+    assert abs(u["totals"]["estimated_cost"] - round(TIERED_TOTAL, 4)) < 1e-9 and u["totals"]["requests"] == 4
+    by_model = dict(u["by_model"])
+    assert abs(by_model["openai / gpt-6.1-sol"]["estimated_cost"] - (0.205 + 0.59 + 0.50)) < 1e-9
+    assert by_model["openai / gpt-6.1-sol"]["requests"] == 3                # one row per model, bands summed
