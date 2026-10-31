@@ -562,6 +562,7 @@ def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=
     probe = f"{target}:x"            # turn_events picks the adapter from the source part only
 
     def translate(line):
+        found = []
         if state["id"] is None:
             sid = SB.session_id(target, line)
             if sid:
@@ -575,7 +576,10 @@ def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=
                         conn.close()
                 except sqlite3.Error as e:
                     state["link_error"] = str(e)
-        return SB.turn_events(probe, line)
+                # the new conversation's id, for a page following the stream (the turn's own
+                # conversation id is a placeholder); consumers that do not know the kind skip it
+                found = [{"kind": "session", "id": state["id"], "linked": state["linked"]}]
+        return found + SB.turn_events(probe, line)
 
     # a placeholder conversation id: the runner allows one turn per conversation, and this one is new
     turn = runner.start(f"{target}:handoff-{uuid.uuid4().hex}", cmd, translate, edits=edits)
