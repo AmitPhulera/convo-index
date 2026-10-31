@@ -775,3 +775,16 @@ def test_a_conversation_deleted_during_prepare_leaves_no_copy(site, monkeypatch)
     monkeypatch.setattr(HO, "write_transcript", then_deleted)
     status, _ = handoff(site, f"/api/conversation/{CID}/handoff", {"kind": "review"})
     assert status == 404 and not list((site.tmp / "handoffs").glob("*"))
+
+
+def test_a_running_handoff_is_named_in_the_conversation_so_a_page_can_follow_it_again(site):
+    site.settings["privacy"]["hosted_processing"] = "allow"
+    pid = handoff(site, f"/api/conversation/{CID}/handoff", {"kind": "review"})[1]["preview_id"]
+    os.environ["FAKE_HARNESS"] = json.dumps(claude_lines("thinking")[:2] + [{"sleep": 3}] + claude_lines("done now")[1:])
+    status, snap = handoff(site, "/api/handoff/start", {"preview_id": pid, "target": "claude_code", "prompt": "go"})
+    assert status == 200
+    conv = request(site, "GET", f"/api/conversation/{CID}")[1]
+    assert conv["active_handoff"] == {"turn_id": snap["turn_id"], "target": "claude_code", "kind": "review"}
+    events, _ = sse_events(site, snap["turn_id"])                           # replayed from the start
+    assert events[-1]["kind"] == "done"
+    assert request(site, "GET", f"/api/conversation/{CID}")[1]["active_handoff"] is None

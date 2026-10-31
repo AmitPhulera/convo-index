@@ -265,6 +265,7 @@ def handle_conversation(conversation_id):
         "hidden": hidden, "summary": summary, "tags": tag_detail, "usage": usage,
         "references": refs, "related": related, "links": links,
         "handoff_targets": handoff_targets() if CFG.load()["ui"]["turns"].get("enabled", True) else [],
+        "active_handoff": active_handoff(conversation_id),
         "messages": [{"role": m[0], "kind": m[1] or "text", "ts": m[2], "text": m[3]} for m in msgs],
     })
 
@@ -609,8 +610,21 @@ def handle_turn_stop(turn_id):
 # on the server under a random preview id, so the page never names a path the session may read.
 
 HANDOFF_PREVIEWS = {}         # preview id -> {"from", "kind", "dir", "at"}
+HANDOFF_TURNS = {}            # turn id -> {"from", "target", "kind"}: a reopened page follows it again
 PREVIEW_TTL = 3600
 _previews_lock = threading.Lock()
+
+
+def active_handoff(conversation_id):
+    """{turn_id, target, kind} of a handoff from this conversation still running, or None."""
+    with _previews_lock:
+        for tid, t in list(HANDOFF_TURNS.items()):
+            turn = _runner().get(tid)
+            if turn is None or turn.done:
+                del HANDOFF_TURNS[tid]
+            elif t["from"] == conversation_id:
+                return {"turn_id": tid, "target": t["target"], "kind": t["kind"]}
+    return None
 
 
 def handoff_targets():
@@ -715,6 +729,8 @@ def handle_handoff_start(body):
         return 412, json.dumps({"error": str(e)})
     except LookupError as e:
         return 424, json.dumps({"error": str(e)})
+    with _previews_lock:
+        HANDOFF_TURNS[turn.id] = {"from": h["id"], "target": target, "kind": p["kind"]}
     return 200, json.dumps(turn.snapshot())
 
 
