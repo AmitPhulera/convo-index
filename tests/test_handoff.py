@@ -568,7 +568,7 @@ def test_an_edited_prompt_points_at_the_copy_this_run_opens(tmp_path, monkeypatc
     printed = capsys.readouterr().out
     assert str(tmp_path / "first" / "transcript.md") in printed
     edited = tmp_path / "edited.md"
-    edited.write_text(printed.replace("Give a second opinion", "Give a short second opinion"))
+    edited.write_text(printed.replace("Give a second opinion", "Give a short second opinion"), encoding="utf-8")
     assert cli.main(["handoff", "s1", "--start", "opencode", "--review", "--prompt-file", str(edited)]) == 0
     opened = sent["read_dirs"][0] / "transcript.md"
     assert f"is in `{opened}`" in sent["prompt"] and str(tmp_path / "first") not in sent["prompt"]
