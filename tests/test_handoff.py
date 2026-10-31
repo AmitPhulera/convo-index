@@ -168,3 +168,21 @@ def test_digest_uses_the_summary_job_and_reports_failure(fake_llm, llm_settings)
     assert H.digest(msgs, "T", llm_settings) == (None, "the summary backend did not answer within 90 s")
     assert len(f.calls) == 1                                                        # a timeout is not retried
 
+
+def test_cli_prints_only_the_prompt_on_stdout(tmp_path, monkeypatch, capsys):
+    from convo_index import cli
+    from convo_index import settings as S
+    from tests.conftest import make_settings
+    st = make_settings(tmp_path)
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    _db(tmp_path).close()
+    assert cli.main(["handoff", "s1", "--review", "--transcript-dir", str(tmp_path / "h")]) == 0
+    out = capsys.readouterr()
+    assert out.out.startswith("You are reviewing") and "known problem: tool error" not in out.out
+    assert "review: ~" in out.err and "known problem: tool error: 2 failed" in out.err
+    assert (tmp_path / "h" / "transcript.md").exists() and str(tmp_path / "h" / "transcript.md") in out.out
+    assert cli.main(["handoff", "s1"]) == 0                           # no backend configured: still a prompt
+    out = capsys.readouterr()
+    assert "None could be written" in out.out and "no handoff note:" in out.err
+    assert list((tmp_path / "handoffs").glob("claude_code-s1-*/transcript.md"))
+    assert cli.main(["handoff", "nope"]) == 1

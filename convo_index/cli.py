@@ -283,6 +283,54 @@ def cmd_search(args):
     return 0
 
 
+def cmd_handoff(args):
+    """Print the prompt that seeds a new session in another harness: paste it there. What the
+    preview would show beside it (known problems, credential-looking strings, size) goes to
+    stderr, so stdout is only the prompt."""
+    import time
+    from convo_index import settings as S
+    from convo_index import db as dbm
+    from convo_index import export as X
+    from convo_index import handoff as H
+    settings = S.load()
+    kind = "review" if args.review else "continue"
+    conn = dbm.connect(settings.db_path())
+    try:
+        try:
+            cid = dbm.resolve_id(conn, args.id)
+        except dbm.AmbiguousId as e:
+            print(f"ambiguous id; use one of {e.args[0]}", file=sys.stderr)
+            return 1
+        h = X.head(conn, cid)
+        if h is None:
+            print(f"no conversation {args.id}", file=sys.stderr)
+            return 1
+        d, status = None, None
+        if kind == "continue":
+            if args.no_digest:
+                status = "skipped with --no-digest"
+            else:
+                print("writing the handoff note with the summary backend…", file=sys.stderr)
+                d, status = H.digest(X.messages(conn, cid), h["title"] or "", settings)
+        where = Path(args.transcript_dir).expanduser() if args.transcript_dir else \
+            settings.db_path().parent / "handoffs" / f"{cid.replace(':', '-')}-{time.strftime('%Y%m%d-%H%M%S')}"
+        transcript = H.write_transcript(conn, cid, where, settings)
+        out = H.build(conn, cid, kind, digest_result=d, digest_status=status, transcript_path=transcript,
+                      repo=H.repo_state(h["cwd"]))
+    finally:
+        conn.close()
+    print(out["prompt"], end="")
+    note = [f"{kind}: ~{out['tokens']:,} tokens" + (" (over the budget)" if out["over_budget"] else "")
+            + (f", {out['dropped']} assistant message(s) left out" if out["dropped"] else ""),
+            f"transcript: {transcript}"]
+    if out["digest_status"] and out["digest_status"] != "ok":
+        note.append(f"no handoff note: {out['digest_status']}")
+    note += [f"known problem: {p['kind']}: {p['text']}" for p in out["problems"]]
+    note += [f"looks like a secret, remove before sending: {s['kind']} {s['sample']}" for s in out["secrets"]]
+    print("\n".join(note), file=sys.stderr)
+    return 0
+
+
 def cmd_export(args):
     from convo_index import settings as S
     from convo_index import db as dbm
@@ -620,6 +668,11 @@ def main(argv=None):
     p_exp.add_argument("--tools", action="store_true", help="include tool calls and results")
     p_exp.add_argument("-o", "--out", help="write to this file instead of stdout")
     p_exp.add_argument("--force", action="store_true", help="overwrite an existing --out file")
+    p_hand = sub.add_parser("handoff", help="print a prompt that continues (or reviews) a conversation in another harness")
+    p_hand.add_argument("id")
+    p_hand.add_argument("--review", action="store_true", help="a second opinion instead of a continuation")
+    p_hand.add_argument("--no-digest", action="store_true", help="skip the LLM handoff note (continue only)")
+    p_hand.add_argument("--transcript-dir", help="where to write the full transcript the prompt points at")
     p_bak = sub.add_parser("backup", help="copy the database (SQLite backup API, WAL-safe) to a path")
     p_bak.add_argument("path")
     p_sch = sub.add_parser("schedule", help="daily refresh via LaunchAgent (macOS), systemd user timer (Linux) or a crontab line")
@@ -674,6 +727,8 @@ def main(argv=None):
         return cmd_search(args)
     if args.cmd == "export":
         return cmd_export(args)
+    if args.cmd == "handoff":
+        return cmd_handoff(args)
     if args.cmd == "backup":
         return cmd_backup(args)
     if args.cmd == "schedule":
