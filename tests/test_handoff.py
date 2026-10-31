@@ -335,3 +335,9 @@ def test_a_failing_git_command_is_not_shown_as_a_clean_tree(tmp_path):
     p = H._repo(state)
     assert state["status"] is None and "git status --short:\n(unavailable" in p
     assert "first commit" in p                                            # the log still reads
+
+
+def test_a_fence_in_a_commit_subject_stays_inside_the_block(tmp_path):
+    repo = _git_repo(tmp_path / "repo", subject="fix ``` in docs")
+    p = H._repo(H.repo_state(str(repo)))
+    assert p[p.index("git log --oneline -10:"):].startswith("git log --oneline -10:\n````\n")

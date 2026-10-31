@@ -354,7 +354,7 @@ def _repo(state):
     for label, key in (("git status --short", "status"), ("git diff --stat HEAD", "diff_stat"), ("git log --oneline -10", "log")):
         body = state.get(key)
         parts.append(f"{label}:\n" + ("(unavailable: git failed or did not answer)" if body is None else
-                                       f"```\n{body}\n```" if body else "(nothing)"))
+                                       _block(body) if body else "(nothing)"))
     return "\n\n".join(parts)
 
 
