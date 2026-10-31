@@ -606,3 +606,16 @@ def test_the_refresh_after_a_session_has_a_time_limit(monkeypatch):
     monkeypatch.setattr(subprocess, "run", slow)
     out = cli._ingest_only()
     assert out["ok"] is False and out["busy"] is False and "run convo-index index" in out["error"]
+
+
+def test_the_masked_count_is_what_was_masked_not_marker_text(tmp_path, monkeypatch, capsys):
+    from convo_index import cli
+    from convo_index import settings as S
+    from tests.conftest import make_settings
+    msgs = [Message(seq=0, role="user", text="this talks about [credential masked: API key] markers"),
+            Message(seq=1, role="tool", kind=KIND_TOOL_RESULT, text="export AWS_KEY=AKIAABCDEFGHIJKLMNOP")]
+    st = make_settings(tmp_path)
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    _db(tmp_path, msgs).close()
+    assert cli.main(["handoff", "s1", "--review", "--transcript-dir", str(tmp_path / "h")]) == 0
+    assert "masked 1 credential-looking string(s)" in capsys.readouterr().err

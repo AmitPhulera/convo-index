@@ -647,7 +647,8 @@ def handle_handoff_preview(conversation_id, body):
     HO.prune_copies(db)
     conn = dbm.connect(db)
     try:
-        transcript = HO.write_transcript(conn, h["id"], HO.copy_dir(db, h["id"]), cfg)
+        stats = {}
+        transcript = HO.write_transcript(conn, h["id"], HO.copy_dir(db, h["id"]), cfg, stats=stats)
         msgs = X.messages(conn, h["id"])
     finally:
         conn.close()
@@ -655,7 +656,7 @@ def handle_handoff_preview(conversation_id, body):
     conn = dbm.connect(db)
     try:
         out = HO.build(conn, h["id"], kind, digest_result=d, digest_status=status, transcript_path=transcript,
-                       repo=HO.repo_state(h["cwd"]))
+                       transcript_masked=stats.get("masked", 0), repo=HO.repo_state(h["cwd"]))
     finally:
         conn.close()
     pid = secrets.token_urlsafe(16)

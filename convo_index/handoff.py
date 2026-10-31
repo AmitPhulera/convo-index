@@ -258,14 +258,16 @@ def prune_copies(db_path, days=COPY_DAYS, now=None):
             pass
 
 
-def write_transcript(conn, cid, directory, settings=None):
+def write_transcript(conn, cid, directory, settings=None, stats=None):
     """The full conversation, tools included, as Markdown in `directory` (readable by this
-    user only), credentials masked. The prompt names the file so the target reads detail on
-    demand."""
+    user only), credentials masked; `stats["masked"]` gets how many. The prompt names the file
+    so the target reads detail on demand."""
     md = X.as_markdown(conn, cid, settings, include_tools=True)
     if md is None:
         return None
-    md, _ = mask_secrets(md)
+    md, masked = mask_secrets(md)
+    if stats is not None:
+        stats["masked"] = masked
     directory = Path(directory).expanduser().resolve()   # the target harness starts elsewhere
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = directory / "transcript.md"
@@ -487,13 +489,13 @@ def _exchange_md(exchange, dropped):
 
 
 def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript_path=None,
-          repo=None, budget_chars=BUDGET_CHARS):
+          transcript_masked=0, repo=None, budget_chars=BUDGET_CHARS):
     """The seed prompt and what the preview shows beside it, or None for an unknown id.
 
     `digest_result` (continue only) and `repo` are passed in so the caller decides what runs:
     the digest is an LLM call and repo state runs git. Returns {kind, prompt, problems,
-    secrets, transcript_masked, chars, tokens, over_budget, dropped, digest_status}, where
-    transcript_masked counts the credentials masked in the transcript file."""
+    secrets, transcript_masked, chars, tokens, over_budget, dropped, digest_status};
+    `transcript_masked` is what write_transcript reported masking in the file."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}, not {kind!r}")
     h = X.head(conn, cid)
@@ -535,11 +537,7 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
 
     prompt = "\n\n".join(sections) + "\n"
     secrets = find_secrets(prompt)
-    try:
-        masked = Path(transcript_path).read_text(encoding="utf-8").count(MASK.split("{")[0]) if transcript_path else 0
-    except OSError:
-        masked = 0            # a pointer the caller made up (tests) or a file already removed
-    return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": secrets, "transcript_masked": masked,
+    return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": secrets, "transcript_masked": transcript_masked,
             "chars": len(prompt), "tokens": len(prompt) // 4, "over_budget": len(prompt) > budget_chars,
             "dropped": dropped, "digest_status": digest_status if kind == "continue" else None}
 

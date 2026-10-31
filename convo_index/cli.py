@@ -325,7 +325,8 @@ def cmd_handoff(args):
         H.prune_copies(settings.db_path())
         where = Path(args.transcript_dir).expanduser() if args.transcript_dir else H.copy_dir(settings.db_path(), cid)
         try:                       # before the digest: a bad directory should not cost an LLM call
-            transcript = H.write_transcript(conn, cid, where, settings)
+            stats = {}
+            transcript = H.write_transcript(conn, cid, where, settings, stats=stats)
         except OSError as e:
             print(f"cannot write the transcript to {where}: {e.strerror or e}", file=sys.stderr)
             return 1
@@ -337,6 +338,7 @@ def cmd_handoff(args):
                 print("writing the handoff note with the summary backend…", file=sys.stderr)
                 d, status = H.digest(X.messages(conn, cid), h["title"] or "", settings)
         out = H.build(conn, cid, kind, digest_result=d, digest_status=status, transcript_path=transcript,
+                      transcript_masked=stats.get("masked", 0),
                       repo=H.repo_state(h["cwd"]))
     finally:
         conn.close()
