@@ -665,6 +665,7 @@ def test_tools_endpoint_validates_and_saves(site, mcp_home):
     assert status == 403
     status, body = request(site, "POST", "/api/turns/tools", {"mcp_tools": ["mcp__atlassian__getJiraIssue"]})
     assert status == 200 and body["allowed"] == ["mcp__atlassian__getJiraIssue"]
+    assert request(site, "GET", f"/api/conversation/{CID}")[1]["edit_mcp_tools"] == 1   # the Tools button's count
     assert request(site, "GET", "/api/turns/tools")[1]["allowed"] == ["mcp__atlassian__getJiraIssue"]
 
 

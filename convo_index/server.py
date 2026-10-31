@@ -250,6 +250,7 @@ def handle_conversation(conversation_id):
         "turns_supported": (bool(CFG.load()["ui"]["turns"].get("enabled", True)) and supports_turns(conversation_id)
                             and turn_launcher(conversation_id) is not None),
         "active_turn": (lambda t: t.snapshot() if t else None)(_runner().active(conversation_id)),
+        "edit_mcp_tools": len(TT.load()) if head[7] == "claude_code" else 0,   # how many the Tools button shows
         "hidden": hidden, "summary": summary, "tags": tag_detail, "usage": usage,
         "references": refs, "related": related,
         "messages": [{"role": m[0], "kind": m[1] or "text", "ts": m[2], "text": m[3]} for m in msgs],

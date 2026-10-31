@@ -822,7 +822,7 @@ function composerHTML(c) {
           <label class="mode-pick" title="Read-only reads files. Edit also edits files, runs shell commands and uses the allowed MCP tools, without asking.">Mode
             <select id="turn-edits"><option value="read">Read-only</option><option value="edits">Edit</option></select>
           </label>
-          ${tools ? `<button class="btn ghost" id="turn-tools" type="button" aria-expanded="false" aria-controls="tools-panel" title="MCP tools Edit mode may use">${ICON.tools}<span class="label">Tools</span></button>` : ""}
+          ${tools ? `<button class="btn ghost" id="turn-tools" type="button" aria-expanded="false" aria-controls="tools-panel" title="MCP tools Edit mode may use">${ICON.tools}<span class="label">${c.edit_mcp_tools ? `Tools · ${c.edit_mcp_tools}` : "Tools"}</span></button>` : ""}
           <span class="turn-status" id="turn-status" role="status">${hint}</span>
           <button class="btn danger" id="turn-stop" hidden title="Stop the tool. What it already wrote stays in the transcript.">${ICON.stop}<span class="label">Stop</span></button>
           <button class="btn primary" id="turn-send"${turnToken ? "" : " disabled"}>${ICON.send}<span class="label">Send</span></button>
