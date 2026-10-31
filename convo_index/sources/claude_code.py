@@ -104,7 +104,7 @@ _HANDOFF_TITLE_RE = re.compile(r"^- title: (.+)$", re.M)
 
 
 def handoff_title(prompt):
-    """"Continued: <title>" / "Second opinion: <title>" for a handoff's session, whose prompt
+    """The title of a handoff's session ("Continued: <title>" or "Second opinion: <title>"), whose prompt
     opens with HANDOFF_PROMPT_PREFIXES and names the original's title; else None."""
     for prefix, label in zip(HANDOFF_PROMPT_PREFIXES, ("Continued", "Second opinion"), strict=True):
         if (prompt or "").startswith(prefix):

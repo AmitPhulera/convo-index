@@ -4,8 +4,9 @@ Two kinds: `continue` (pick the work up elsewhere, e.g. when a provider is rate-
 a brief with an LLM digest of the assistant side; `review` (a second opinion) gets the
 conversation's own words and no digest, so the reviewer is not anchored on the original
 agent's framing. Both carry facts gathered without an LLM (where, when, repo state, known
-problems), every user message verbatim, and a pointer to the full transcript on disk. Nothing
-here runs a harness: `convo-index handoff` prints the prompt for the user to paste.
+problems), every user message verbatim, and a pointer to the full transcript on disk.
+`convo-index handoff` prints the prompt for the user to paste; start_session runs the new
+session itself on a TurnRunner (`--start`, and the browser's Hand off).
 """
 from __future__ import annotations
 

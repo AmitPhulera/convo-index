@@ -553,7 +553,7 @@ def turn_config_home():
 
 
 def session_model(native_id, locator):
-    """"provider/model" of the session's last request, or None. A turn names it: with the turn's
+    """The `provider/model` of the session's last request, or None. A turn names it: with the turn's
     empty configuration home opencode would otherwise fall back to a default model, which a
     workspace's privacy settings may refuse ("This Go model trains on request data", 2.2.4)."""
     if not locator or not locator.startswith("sqlite:") or "#" not in locator:
@@ -591,7 +591,7 @@ def turn_command(native_id, prompt, cwd, *, edits=False, mcp_tools=(), locator=N
 # session's (session_model): the caller's, else the first of opencode's own recent models.
 
 def recent_model():
-    """"provider/model" the user last picked in opencode, or None."""
+    """The `provider/model` the user last picked in opencode, or None."""
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "opencode" / "model.json"
     try:
         first = (json.loads(state.read_text(encoding="utf-8")).get("recent") or [None])[0]
