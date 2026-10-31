@@ -483,3 +483,151 @@ def test_pi_last_activity_is_the_session_file_mtime(pi_file, tmp_path):
     os.utime(pi_file, (then, then))
     assert abs(base.last_activity(f"pi:{PI_SID}", pi_file) - then) < 2
     assert base.last_activity(f"pi:{PI_SID}", str(tmp_path / "gone.jsonl")) is None
+
+
+# ---- Codex ------------------------------------------------------------------------------------
+
+from convo_index.sources import codex   # noqa: E402
+
+CODEX_TID = "01a19110-163e-7c21-8b8d-c6a1e61530f4"
+
+
+@pytest.fixture
+def codex_on_path(monkeypatch):
+    monkeypatch.setattr(base.shutil, "which", lambda name: "/opt/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr(base, "is_windows", lambda: False)
+
+
+def write_rollout(directory, tid=CODEX_TID, provider="openai", models=("gpt-6.1-terra", "gpt-6.1-sol")):
+    directory.mkdir(parents=True, exist_ok=True)
+    f = directory / f"rollout-2026-10-31T14-05-01-{tid}.jsonl"
+    lines = [{"timestamp": "2026-10-31T08:35:01Z", "type": "session_meta",
+              "payload": {"id": tid, "session_id": tid, "cwd": "/proj", "cli_version": "0.166.0", "model_provider": provider}}]
+    for m in models:
+        lines.append({"timestamp": "2026-10-31T08:35:02Z", "type": "turn_context",
+                      "payload": {"model": m, "cwd": "/proj", "sandbox_policy": {"type": "read-only"}, "approval_policy": "never"}})
+        lines.append({"timestamp": "2026-10-31T08:35:03Z", "type": "response_item",
+                      "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}})
+    f.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    return str(f)
+
+
+@pytest.fixture
+def rollout(tmp_path):
+    return write_rollout(tmp_path / "sessions" / "2026" / "10" / "31")
+
+
+def test_codex_read_only_turn_closes_the_surface_and_resumes_with_the_recorded_model(codex_on_path, rollout):
+    cmd = base.turn_command(f"codex:{CODEX_TID}", "what changed?", "/proj", locator=rollout)
+    a = cmd.argv
+    assert a[:3] == ["/opt/bin/codex", "exec", "--json"] and cmd.stdin == "what changed?" and "what changed?" not in a
+    for flag in ["--strict-config", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check"]:
+        assert flag in a
+    disabled = {a[i + 1] for i, x in enumerate(a) if x == "--disable"}
+    assert {"apps", "plugins", "hooks", "multi_agent", "computer_use", "browser_use", "memories"} <= disabled
+    overrides = {a[i + 1] for i, x in enumerate(a) if x == "-c"}
+    assert {"project_doc_max_bytes=0", "skills.include_instructions=false", 'web_search="disabled"',
+            'approval_policy="never"', 'model_provider="openai"'} <= overrides
+    assert a[a.index("-m") + 1] == "gpt-6.1-sol"                        # the thread's latest model, not Codex's default
+    assert a[a.index("-s") + 1] == "read-only" and a[a.index("-C") + 1] == "/proj"
+    assert a[-3:] == ["resume", CODEX_TID, "-"]                          # options before the subcommand; prompt from stdin
+
+
+def test_codex_edit_turn_uses_the_workspace_write_sandbox_and_no_mcp(codex_on_path, rollout):
+    cmd = base.turn_command(f"codex:{CODEX_TID}", "fix it", "/proj", edits=True, mcp_tools=("mcp__atlassian__*",), locator=rollout)
+    assert cmd.argv[cmd.argv.index("-s") + 1] == "workspace-write"
+    assert not any("mcp__" in x or "mcp_servers" in x for x in cmd.argv) and "danger-full-access" not in cmd.argv
+
+
+def test_codex_refuses_names_other_threads_and_missing_rollouts(codex_on_path, rollout, tmp_path):
+    other = write_rollout(tmp_path / "other", tid="0f1e2d3c-1234-4abc-8def-0123456789ab")
+    cases = [("my-thread-name", rollout),          # resume would look a thread name up
+             (CODEX_TID, None), (CODEX_TID, "relative.jsonl"), (CODEX_TID, str(tmp_path / "gone.jsonl")), (CODEX_TID, other)]
+    for tid, locator in cases:
+        with pytest.raises(ValueError, match="no longer holds"):
+            base.turn_command(f"codex:{tid}", "x", "/proj", locator=locator)
+
+
+def test_codex_rollout_of_a_release_that_wrote_only_session_id(codex_on_path, tmp_path):
+    from tests.test_codex import TID, default_rollout
+    f = tmp_path / f"rollout-{TID}.jsonl"
+    f.write_text("\n".join(default_rollout("hello")) + "\n")
+    cmd = base.turn_command(f"codex:{TID}", "x", "/proj", locator=str(f))
+    assert cmd.argv[-3:] == ["resume", TID, "-"]
+
+
+def test_codex_malformed_records_in_the_rollout_are_skipped(codex_on_path, rollout):
+    with open(rollout, "a") as fh:
+        fh.write('["turn_context"]\n3\nnot json\n')
+    assert base.turn_command(f"codex:{CODEX_TID}", "x", "/proj", locator=rollout).argv[-3:] == ["resume", CODEX_TID, "-"]
+
+
+def test_codex_recorded_names_that_could_be_options_are_not_passed(codex_on_path, tmp_path):
+    f = write_rollout(tmp_path, provider="--danger", models=("-m",))
+    cmd = base.turn_command(f"codex:{CODEX_TID}", "x", "/proj", locator=f)
+    assert "-m" not in cmd.argv and not any("--danger" in x for x in cmd.argv)
+
+
+def test_codex_turns_are_not_offered_on_windows_or_without_the_binary(monkeypatch, rollout):
+    monkeypatch.setattr(base, "is_windows", lambda: True)
+    assert base.supports_turns(f"codex:{CODEX_TID}") is False and base.turn_launcher(f"codex:{CODEX_TID}") is None
+    monkeypatch.setattr(base, "is_windows", lambda: False)
+    monkeypatch.setattr(base.shutil, "which", lambda name: None)
+    assert base.turn_command(f"codex:{CODEX_TID}", "x", "/proj", locator=rollout) is None
+
+
+# Captured from codex-cli 0.166.0 `exec --json` (reasoning items and most of each payload
+# dropped; paths shortened).
+CODEX_STREAM = [
+    {"type": "thread.started", "thread_id": CODEX_TID},
+    {"type": "item.completed", "item": {"id": "item_0", "type": "error",
+                                        "message": "This session was recorded with model `a` but is resuming with `b`."}},
+    {"type": "turn.started"},
+    {"type": "item.completed", "item": {"id": "item_1", "type": "reasoning", "text": "Read it first."}},
+    {"type": "item.completed", "item": {"id": "item_2", "type": "agent_message", "text": "I'll read `fact.txt`."}},
+    {"type": "item.started", "item": {"id": "item_3", "type": "command_execution", "command": "/bin/zsh -lc 'cat fact.txt'",
+                                      "aggregated_output": "", "exit_code": None, "status": "in_progress"}},
+    {"type": "item.completed", "item": {"id": "item_3", "type": "command_execution", "command": "/bin/zsh -lc 'cat fact.txt'",
+                                        "aggregated_output": "the answer is 42\n", "exit_code": 0, "status": "completed"}},
+    {"type": "item.started", "item": {"id": "item_4", "type": "command_execution", "command": "/bin/zsh -lc 'touch ro.txt'",
+                                      "aggregated_output": "", "exit_code": None, "status": "in_progress"}},
+    {"type": "item.completed", "item": {"id": "item_4", "type": "command_execution", "command": "/bin/zsh -lc 'touch ro.txt'",
+                                        "aggregated_output": "touch: ro.txt: Operation not permitted\n", "exit_code": 1, "status": "failed"}},
+    {"type": "item.started", "item": {"id": "item_5", "type": "mcp_tool_call", "server": "codex_apps", "tool": "github.get_profile",
+                                      "arguments": {}, "result": None, "error": None, "status": "in_progress"}},
+    {"type": "item.completed", "item": {"id": "item_5", "type": "mcp_tool_call", "server": "codex_apps", "tool": "github.get_profile",
+                                        "arguments": {}, "result": None,
+                                        "error": {"message": "MCP tool call requires approval, but approval policy is never"},
+                                        "status": "failed"}},
+    {"type": "item.completed", "item": {"id": "item_6", "type": "file_change", "status": "completed",
+                                        "changes": [{"path": "/proj/note.txt", "kind": "update"}]}},
+    {"type": "item.completed", "item": {"id": "item_7", "type": "agent_message", "text": "`fact.txt`: the answer is 42"}},
+    {"type": "turn.completed", "usage": {"input_tokens": 95487, "cached_input_tokens": 87544, "output_tokens": 3126}},
+]
+
+
+def test_codex_stream_is_translated_and_noise_dropped():
+    events = [e for line in CODEX_STREAM for e in base.turn_events(f"codex:{CODEX_TID}", json.dumps(line))]
+    assert [e["kind"] for e in events] == ["text", "tool", "tool_result", "tool", "tool_result", "tool", "tool_result",
+                                           "tool", "tool_result", "text", "done"]
+    assert events[1] == {"kind": "tool", "name": "shell", "input": "/bin/zsh -lc 'cat fact.txt'"}
+    assert events[2] == {"kind": "tool_result", "text": "the answer is 42\n", "error": False}
+    assert events[4]["error"] is True and events[4]["text"].startswith("exit 1\ntouch: ro.txt")
+    assert events[5]["name"] == "codex_apps.github.get_profile" and events[6]["error"] is True
+    assert events[7] == {"kind": "tool", "name": "edit", "input": "update /proj/note.txt"}
+    assert events[10] == {"kind": "done", "cost_usd": None}
+
+
+def test_codex_failed_turn_is_an_error_and_a_stream_notice_is_not():
+    failed = {"type": "turn.failed", "error": {"message": "unknown input item type"}}
+    assert codex.turn_events(json.dumps(failed)) == [{"kind": "error", "message": "unknown input item type"}]
+    assert codex.turn_events(json.dumps({"type": "error", "message": "Reconnecting... 2/5"})) == [
+        {"kind": "text", "text": "[codex: Reconnecting... 2/5]"}]
+    assert codex.turn_events("not json") == [] and codex.turn_events("[1]") == [] and codex.turn_events('{"type": "item.completed"}') == []
+
+
+def test_codex_last_activity_is_the_rollout_mtime(rollout, tmp_path):
+    then = time.time() - 600
+    os.utime(rollout, (then, then))
+    assert abs(base.last_activity(f"codex:{CODEX_TID}", rollout) - then) < 2
+    assert base.last_activity(f"codex:{CODEX_TID}", str(tmp_path / "gone.jsonl")) is None

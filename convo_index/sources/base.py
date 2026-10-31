@@ -156,6 +156,7 @@ TURN_MODULES = {
     "claude_code": "convo_index.sources.claude_code",
     "opencode": "convo_index.sources.opencode",
     "pi": "convo_index.sources.pi",
+    "codex": "convo_index.sources.codex",
 }
 
 

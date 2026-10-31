@@ -66,7 +66,7 @@ def site(tmp_path, monkeypatch):
                         source_ref=str(transcript), cwd=str(proj), start_ts="2026-06-16T00:00:00Z",
                         messages=[Message(seq=0, role="user", text="k8s", ts="2026-06-16T00:00:00Z")])
     dbm.upsert_conversation(conn, conv, "globex", "path", [], None, "1", lambda t: [[0.0] * EMBED_DIM for _ in t])
-    other = Conversation(source="codex", native_id="t1", title="Other", first_prompt="x", source_ref="/x", cwd=str(proj),
+    other = Conversation(source="antigravity", native_id="t1", title="Other", first_prompt="x", source_ref="/x", cwd=str(proj),
                          start_ts="2026-06-16T00:00:00Z", messages=[Message(seq=0, role="user", text="x", ts="2026-06-16T00:00:00Z")])
     dbm.upsert_conversation(conn, other, "globex", "path", [], None, "1", lambda t: [[0.0] * EMBED_DIM for _ in t])
     conn.close()
@@ -372,8 +372,8 @@ def test_preconditions(site):
     os.environ["FAKE_HARNESS"] = "[]"
     st = site.settings
     assert request(site, "POST", "/api/conversation/claude_code:nope/turn", {"prompt": "x"})[0] == 404
-    got, out = request(site, "POST", "/api/conversation/codex:t1/turn", {"prompt": "x"})
-    assert got == 400 and "no browser turns for codex" in out["error"]
+    got, out = request(site, "POST", "/api/conversation/antigravity:t1/turn", {"prompt": "x"})
+    assert got == 400 and "no browser turns for antigravity" in out["error"]
     st["sources"]["claude_code"]["enabled"] = False
     got, out = request(site, "POST", f"/api/conversation/{CID}/turn", {"prompt": "x"})
     assert got == 403 and "disabled" in out["error"]
