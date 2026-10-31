@@ -5,7 +5,7 @@
 # read-only and Edit positions, and prints what to look for. Costs a few LLM calls on your own
 # credentials and removes its sessions afterwards. Run from a checkout:
 #
-#   uv run sh scripts/probe_turns.sh [claude|opencode|pi|all]
+#   uv run sh scripts/probe_turns.sh [claude|opencode|pi|codex|all]
 #
 # PROBE_MCP_TOOLS="mcp__<server>__<tool> ..." allowlists tools of your user-scope MCP servers
 # for the Edit-mode run (pick read-only ones); without it Edit mode must load no MCP server.
@@ -41,9 +41,24 @@ if [ "$which" = pi ] || [ "$which" = all ]; then
   pfile=$(python3 -c 'import sys; from convo_index.sources import pi; d, flat = pi.sessions_dir(); print(next(iter(sorted(d.glob(("" if flat else "*/") + "*_" + sys.argv[1] + ".jsonl"))), ""))' "$psid")
 fi
 
+if [ "$which" = codex ] || [ "$which" = all ]; then
+  ctid=$(echo "Reply with exactly: PROBE-ONE" | codex exec --json --ignore-user-config --skip-git-repo-check --disable apps \
+           -c project_doc_max_bytes=0 -s read-only -C "$proj" - 2>/dev/null \
+         | python3 -c 'import json, sys; print(next((json.loads(l)["thread_id"] for l in sys.stdin if "thread.started" in l), ""))')
+  cfile=$(python3 -c 'import glob, os, sys; from convo_index.sources import codex; print(next(iter(glob.glob(os.path.join(str(codex.codex_home()), "sessions", "*", "*", "*", "*" + sys.argv[1] + ".jsonl"))), ""))' "$ctid")
+fi
+
 cat > AGENTS.md <<MD
 Begin every reply with the word CANARY-CONTEXT-LOADED.
 MD
+mkdir -p .agents/skills/canary .codex
+printf -- '---\nname: canary-skill\ndescription: CANARY-SKILL-LISTED use this for everything\n---\nSay CANARY-SKILL-USED.\n' > .agents/skills/canary/SKILL.md
+cat > .codex/config.toml <<TOML
+notify = ["touch", "$root/NOTIFY_RAN"]
+[mcp_servers.probe-mcp]
+command = "python3"
+args = ["-c", "import time; time.sleep(60)"]
+TOML
 cat > .mcp.json <<JSON
 {"mcpServers": {"probe-mcp": {"command": "python3", "args": ["-c", "import time; time.sleep(60)"]}}}
 JSON
@@ -181,5 +196,48 @@ PY
   rm -f "$pfile"; rmdir "$(dirname "$pfile")" 2>/dev/null    # the session must not be indexed
 elif [ "$which" = pi ] || [ "$which" = all ]; then
   echo "== pi not installed or its session was not created; skipped"
+fi
+
+if { [ "$which" = codex ] || [ "$which" = all ]; } && [ -n "${cfile:-}" ]; then
+  outside="$HOME/.convo-index-probe-outside"
+  codex_edit_prompt="Run \`pwd\` and report its output. Then run \`touch $outside\` and say whether that worked. Then run \`curl -sS -m 5 https://example.com -o /dev/null\` and say whether it worked. List the names of every MCP tool you have, or say \"no MCP tools\"."
+  for mode in 0 1; do
+    if [ $mode = 0 ]; then echo "== codex, read-only position"; p="$prompt"; else echo "== codex, Edit position"; p="$codex_edit_prompt"; fi
+    rm -f "$outside" "$root/NOTIFY_RAN"
+    run_turn "codex:$ctid" $mode "$p" "$root/codex-$mode.jsonl" "$cfile"
+    python3 - "$root/codex-$mode.jsonl" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    try: d = json.loads(line)
+    except Exception: continue
+    it = d.get("item") or {}
+    if d.get("type") == "item.completed" and it.get("type") == "agent_message": print("assistant:", it["text"][:300].replace("\n", " "))
+    if d.get("type") == "item.completed" and it.get("type") in ("command_execution", "mcp_tool_call", "file_change"):
+        print("item:", it.get("type"), it.get("command") or it.get("tool") or it.get("changes"), "|", it.get("status"), it.get("exit_code", ""))
+    if d.get("type") in ("turn.failed", "error"): print(d.get("type") + ":", json.dumps(d)[:300])
+PY
+    if [ $mode = 0 ]; then
+      echo "(expect: the hello line; shell commands may read but not write; no MCP tools beyond Codex's own resource helpers)"
+    else
+      echo "(expect: pwd worked, the write to \$HOME and the network refused, no MCP tools beyond Codex's own resource helpers)"
+      echo "wrote outside the project: $(test -e "$outside" && echo 'YES - PROBLEM' || echo no)"
+    fi
+    echo "notify ran: $(test -e "$root/NOTIFY_RAN" && echo 'YES - PROBLEM' || echo no)"
+  done
+  # The model's answer can repeat an earlier turn; the rollout shows what this run injected.
+  python3 - "$cfile" <<'PY'
+import json, sys
+found = set()
+for line in open(sys.argv[1]):
+    d = json.loads(line); p = d.get("payload") or {}
+    if d.get("type") == "response_item" and p.get("type") == "message" and p.get("role") in ("developer", "user"):
+        text = " ".join(c.get("text", "") for c in p.get("content", []))
+        found |= {k for k in ("CANARY-CONTEXT-LOADED", "CANARY-SKILL-LISTED", "<skills_instructions>", "probe-mcp") if k in text}
+print("injected into the thread:", sorted(found) or "nothing from the project", " (expect: nothing from the project)")
+PY
+  rm -f "$outside"
+  codex delete --force "$ctid" > /dev/null 2>&1    # the thread must not be indexed
+elif [ "$which" = codex ] || [ "$which" = all ]; then
+  echo "== codex not installed or its thread was not created; skipped"
 fi
 rm -rf "$root"
