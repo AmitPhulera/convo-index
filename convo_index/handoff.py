@@ -4,11 +4,13 @@ Two kinds: `continue` (pick the work up elsewhere, e.g. when a provider is rate-
 a brief with an LLM digest of the assistant side; `review` (a second opinion) gets the
 conversation's own words and no digest, so the reviewer is not anchored on the original
 agent's framing. Both carry facts gathered without an LLM (where, when, repo state, known
-problems), every user message verbatim, and a pointer to the full transcript on disk. Nothing
-here runs a harness: `convo-index handoff` prints the prompt for the user to paste.
+problems), every user message verbatim, and a pointer to the full transcript on disk.
+`convo-index handoff` prints the prompt for the user to paste; start_session runs the new
+session itself on a TurnRunner (`--start`, and the browser's Hand off).
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -58,7 +60,10 @@ CORRECTION_RE = re.compile(
 # Credentials people paste into chats. Marked in the preview for the user to remove before the
 # prompt goes to another provider; never removed silently.
 SECRET_PATTERNS = [
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "private key"),
+    # the whole block: to its END line, or (cut short in a tool's output) over the key's own
+    # lines, which hold only base64 and PEM headers
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+                r"|(?:\n[A-Za-z0-9+/=:,. -]*)*)"), "private key"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key"),
     (re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b|\bgithub_pat_[A-Za-z0-9_]{40,}\b"), "GitHub token"),
     (re.compile(r"\bsk-(ant-|proj-)?[A-Za-z0-9_-]{20,}\b"), "API key"),
@@ -163,6 +168,15 @@ def mask_secrets(text):
     return text, count
 
 
+_TRANSCRIPT_POINTER_RE = re.compile(r"(is in `)([^`\n]*transcript\.md)(`)")
+
+
+def point_at(prompt, transcript_path):
+    """`prompt` naming `transcript_path` as its full transcript. A prompt printed by an earlier
+    run and edited names that run's copy, which the new session is not allowed to read."""
+    return _TRANSCRIPT_POINTER_RE.sub(lambda m: m.group(1) + str(transcript_path) + m.group(3), prompt or "")
+
+
 def find_secrets(text):
     """[{kind, sample}] for each credential-looking match, the sample shortened so the
     preview can point at it without repeating it."""
@@ -245,14 +259,16 @@ def prune_copies(db_path, days=COPY_DAYS, now=None):
             pass
 
 
-def write_transcript(conn, cid, directory, settings=None):
+def write_transcript(conn, cid, directory, settings=None, stats=None):
     """The full conversation, tools included, as Markdown in `directory` (readable by this
-    user only), credentials masked. The prompt names the file so the target reads detail on
-    demand."""
+    user only), credentials masked; `stats["masked"]` gets how many. The prompt names the file
+    so the target reads detail on demand."""
     md = X.as_markdown(conn, cid, settings, include_tools=True)
     if md is None:
         return None
-    md, _ = mask_secrets(md)
+    md, masked = mask_secrets(md)
+    if stats is not None:
+        stats["masked"] = masked
     directory = Path(directory).expanduser().resolve()   # the target harness starts elsewhere
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = directory / "transcript.md"
@@ -474,13 +490,13 @@ def _exchange_md(exchange, dropped):
 
 
 def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript_path=None,
-          repo=None, budget_chars=BUDGET_CHARS):
+          transcript_masked=0, repo=None, budget_chars=BUDGET_CHARS):
     """The seed prompt and what the preview shows beside it, or None for an unknown id.
 
     `digest_result` (continue only) and `repo` are passed in so the caller decides what runs:
     the digest is an LLM call and repo state runs git. Returns {kind, prompt, problems,
-    secrets, transcript_masked, chars, tokens, over_budget, dropped, digest_status}, where
-    transcript_masked counts the credentials masked in the transcript file."""
+    secrets, transcript_masked, chars, tokens, over_budget, dropped, digest_status};
+    `transcript_masked` is what write_transcript reported masking in the file."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}, not {kind!r}")
     h = X.head(conn, cid)
@@ -522,11 +538,7 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
 
     prompt = "\n\n".join(sections) + "\n"
     secrets = find_secrets(prompt)
-    try:
-        masked = Path(transcript_path).read_text(encoding="utf-8").count(MASK.split("{")[0]) if transcript_path else 0
-    except OSError:
-        masked = 0            # a pointer the caller made up (tests) or a file already removed
-    return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": secrets, "transcript_masked": masked,
+    return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": secrets, "transcript_masked": transcript_masked,
             "chars": len(prompt), "tokens": len(prompt) // 4, "over_budget": len(prompt) > budget_chars,
             "dropped": dropped, "digest_status": digest_status if kind == "continue" else None}
 
@@ -534,6 +546,13 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
 # --------------------------------------------------------------- the new session ----
 
 RELATIONS = {"continue": "continued_from", "review": "review_of"}
+
+
+def _is_event(line):
+    try:
+        return isinstance(json.loads(line), dict)
+    except (ValueError, TypeError):
+        return False
 
 
 def session_model(settings, target, model=None):
@@ -551,8 +570,8 @@ def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=
     failed). A review never edits. Raises ValueError when the
     target cannot start a session as asked, LookupError when it is not available here."""
     edits = bool(edits) and kind == "continue"
-    cmd, _ = SB.new_session_command(target, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools),
-                                    read_dirs=tuple(read_dirs), model=model)
+    cmd, native = SB.new_session_command(target, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools),
+                                         read_dirs=tuple(read_dirs), model=model)
     if cmd is None:
         raise LookupError(f"{target} cannot start a session here: not installed, or no headless mode on this platform")
     conn = dbm.connect(db_path)
@@ -566,7 +585,9 @@ def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=
     def translate(line):
         found = []
         if state["id"] is None:
-            sid = SB.session_id(target, line)
+            # the stream names the session; an id we chose ourselves (Claude Code) counts as soon
+            # as the tool writes its first event, should a new version name it differently
+            sid = SB.session_id(target, line) or (native if native and _is_event(line) else None)
             if sid:
                 state["id"] = f"{target}:{sid}"
                 try:           # a failed write must not cut the session's stream short

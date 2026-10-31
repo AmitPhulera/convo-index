@@ -4,6 +4,7 @@ import os
 import json
 import re
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -264,6 +265,7 @@ def handle_conversation(conversation_id):
         "hidden": hidden, "summary": summary, "tags": tag_detail, "usage": usage,
         "references": refs, "related": related, "links": links,
         "handoff_targets": handoff_targets() if CFG.load()["ui"]["turns"].get("enabled", True) else [],
+        "active_handoff": active_handoff(conversation_id),
         "messages": [{"role": m[0], "kind": m[1] or "text", "ts": m[2], "text": m[3]} for m in msgs],
     })
 
@@ -608,8 +610,21 @@ def handle_turn_stop(turn_id):
 # on the server under a random preview id, so the page never names a path the session may read.
 
 HANDOFF_PREVIEWS = {}         # preview id -> {"from", "kind", "dir", "at"}
+HANDOFF_TURNS = {}            # turn id -> {"from", "target", "kind"}: a reopened page follows it again
 PREVIEW_TTL = 3600
 _previews_lock = threading.Lock()
+
+
+def active_handoff(conversation_id):
+    """{turn_id, target, kind} of a handoff from this conversation still running, or None."""
+    with _previews_lock:
+        for tid, t in list(HANDOFF_TURNS.items()):
+            turn = _runner().get(tid)
+            if turn is None or turn.done:
+                del HANDOFF_TURNS[tid]
+            elif t["from"] == conversation_id:
+                return {"turn_id": tid, "target": t["target"], "kind": t["kind"]}
+    return None
 
 
 def handoff_targets():
@@ -647,15 +662,22 @@ def handle_handoff_preview(conversation_id, body):
     HO.prune_copies(db)
     conn = dbm.connect(db)
     try:
-        transcript = HO.write_transcript(conn, h["id"], HO.copy_dir(db, h["id"]), cfg)
+        stats = {}
+        transcript = HO.write_transcript(conn, h["id"], HO.copy_dir(db, h["id"]), cfg, stats=stats)
         msgs = X.messages(conn, h["id"])
+        # deleted meanwhile (its copies were removed before this one existed): leave no copy behind
+        gone = transcript is None or dbm.is_deleted(conn, h["id"]) or not dbm.exists(conn, h["id"])
     finally:
         conn.close()
+    if gone:
+        if transcript is not None:
+            shutil.rmtree(transcript.parent, ignore_errors=True)
+        return 404, json.dumps({"error": "conversation not found"})
     d, status = HO.digest(msgs, h["title"] or "", cfg) if kind == "continue" else (None, None)   # no connection held meanwhile
     conn = dbm.connect(db)
     try:
         out = HO.build(conn, h["id"], kind, digest_result=d, digest_status=status, transcript_path=transcript,
-                       repo=HO.repo_state(h["cwd"]))
+                       transcript_masked=stats.get("masked", 0), repo=HO.repo_state(h["cwd"]))
     finally:
         conn.close()
     pid = secrets.token_urlsafe(16)
@@ -674,8 +696,11 @@ def handle_handoff_start(body):
     with the turn's snapshot; its stream names the new conversation in a `session` event."""
     if not isinstance(body, dict):
         return 400, json.dumps({"error": "body must be a JSON object"})
+    pid = body.get("preview_id")
+    if not isinstance(pid, str):
+        return 400, json.dumps({"error": "preview_id is required"})
     with _previews_lock:
-        p = HANDOFF_PREVIEWS.get(body.get("preview_id"))
+        p = HANDOFF_PREVIEWS.get(pid)
     if p is None or time.time() - p["at"] > PREVIEW_TTL:
         return 404, json.dumps({"error": "the prepared prompt has expired; prepare it again"})
     target, prompt, edits = body.get("target"), body.get("prompt"), body.get("edits", False)
@@ -704,6 +729,8 @@ def handle_handoff_start(body):
         return 412, json.dumps({"error": str(e)})
     except LookupError as e:
         return 424, json.dumps({"error": str(e)})
+    with _previews_lock:
+        HANDOFF_TURNS[turn.id] = {"from": h["id"], "target": target, "kind": p["kind"]}
     return 200, json.dumps(turn.snapshot())
 
 

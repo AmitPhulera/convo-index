@@ -549,3 +549,73 @@ def test_cli_start_needs_hosted_processing_allowed(tmp_path, monkeypatch, capsys
     assert not (tmp_path / "handoffs").exists()                          # refused before anything is written
     assert cli.main(["handoff", "s1", "--review"]) == 0                  # printing the prompt is still fine
     assert capsys.readouterr().out.startswith("You are reviewing")
+
+
+def test_a_private_key_is_masked_whole_even_when_cut_short():
+    body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="
+    whole = f"before\n-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n{body}\n-----END RSA PRIVATE KEY-----\nafter"
+    text, n = H.mask_secrets(whole)
+    assert n == 1 and "MIIEvQ" not in text and "QUJDREVG" not in text and "END RSA" not in text
+    assert text.startswith("before\n[credential masked: private key]") and text.endswith("\nafter")
+    cut = f"-----BEGIN PRIVATE KEY-----\n{body}\n…[tool text truncated]"            # a tool's output cut mid-key
+    text, n = H.mask_secrets(cut)
+    assert n == 1 and "MIIEvQ" not in text and "QUJDREVG" not in text and "truncated" in text
+
+
+def test_an_edited_prompt_points_at_the_copy_this_run_opens(tmp_path, monkeypatch, capsys):
+    cli, sent = _start_env(tmp_path, monkeypatch)
+    assert cli.main(["handoff", "s1", "--review", "--transcript-dir", str(tmp_path / "first")]) == 0
+    printed = capsys.readouterr().out
+    assert str(tmp_path / "first" / "transcript.md") in printed
+    edited = tmp_path / "edited.md"
+    edited.write_text(printed.replace("Give a second opinion", "Give a short second opinion"), encoding="utf-8")
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review", "--prompt-file", str(edited)]) == 0
+    opened = sent["read_dirs"][0] / "transcript.md"
+    assert f"is in `{opened}`" in sent["prompt"] and str(tmp_path / "first") not in sent["prompt"]
+    assert "Give a short second opinion" in sent["prompt"]
+    assert H.point_at("no pointer here", "/x/transcript.md") == "no pointer here"
+
+
+def test_an_id_we_chose_links_even_when_the_stream_does_not_name_it(tmp_path, monkeypatch):
+    from convo_index import turns
+    from convo_index.sources import base as SB
+    from tests.test_turns import command, drain
+    _db(tmp_path).close()
+    monkeypatch.setattr(SB, "new_session_command", lambda *a, **k: (command([
+        {"line": "warming up"},                                            # not an event: not proof the session exists
+        {"line": json.dumps({"type": "system", "subtype": "init", "sessionId_v2": "renamed"})}]), "ours-1234"))
+    runner = turns.TurnRunner()
+    turn, state = H.start_session(runner, tmp_path / "t.db", "claude_code:s1", "claude_code", "p", str(tmp_path), kind="review")
+    drain(runner, turn)
+    assert state["id"] == "claude_code:ours-1234" and state["linked"]
+
+
+def test_cli_says_when_nothing_was_linked(tmp_path, monkeypatch, capsys):
+    cli, _ = _start_env(tmp_path, monkeypatch, lines=["no session here"])
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 0
+    assert "the tool never reported its session, so nothing was linked" in capsys.readouterr().err
+
+
+def test_the_refresh_after_a_session_has_a_time_limit(monkeypatch):
+    import subprocess
+    from convo_index import cli
+
+    def slow(*a, **k):
+        assert k["timeout"] == cli.INGEST_TIMEOUT
+        raise subprocess.TimeoutExpired(a[0], k["timeout"])
+    monkeypatch.setattr(subprocess, "run", slow)
+    out = cli._ingest_only()
+    assert out["ok"] is False and out["busy"] is False and "run convo-index index" in out["error"]
+
+
+def test_the_masked_count_is_what_was_masked_not_marker_text(tmp_path, monkeypatch, capsys):
+    from convo_index import cli
+    from convo_index import settings as S
+    from tests.conftest import make_settings
+    msgs = [Message(seq=0, role="user", text="this talks about [credential masked: API key] markers"),
+            Message(seq=1, role="tool", kind=KIND_TOOL_RESULT, text="export AWS_KEY=AKIAABCDEFGHIJKLMNOP")]
+    st = make_settings(tmp_path)
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    _db(tmp_path, msgs).close()
+    assert cli.main(["handoff", "s1", "--review", "--transcript-dir", str(tmp_path / "h")]) == 0
+    assert "masked 1 credential-looking string(s)" in capsys.readouterr().err

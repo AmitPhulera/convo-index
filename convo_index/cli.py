@@ -325,7 +325,8 @@ def cmd_handoff(args):
         H.prune_copies(settings.db_path())
         where = Path(args.transcript_dir).expanduser() if args.transcript_dir else H.copy_dir(settings.db_path(), cid)
         try:                       # before the digest: a bad directory should not cost an LLM call
-            transcript = H.write_transcript(conn, cid, where, settings)
+            stats = {}
+            transcript = H.write_transcript(conn, cid, where, settings, stats=stats)
         except OSError as e:
             print(f"cannot write the transcript to {where}: {e.strerror or e}", file=sys.stderr)
             return 1
@@ -337,6 +338,7 @@ def cmd_handoff(args):
                 print("writing the handoff note with the summary backend…", file=sys.stderr)
                 d, status = H.digest(X.messages(conn, cid), h["title"] or "", settings)
         out = H.build(conn, cid, kind, digest_result=d, digest_status=status, transcript_path=transcript,
+                      transcript_masked=stats.get("masked", 0),
                       repo=H.repo_state(h["cwd"]))
     finally:
         conn.close()
@@ -359,11 +361,18 @@ def cmd_handoff(args):
     return 0
 
 
+INGEST_TIMEOUT = 600     # seconds: the session's end waits for this refresh
+
+
 def _ingest_only():
     """The refresh a browser turn runs after the harness exits: ingest, no LLM jobs."""
     import subprocess
     from convo_index.indexer import EXIT_LOCKED
-    res = subprocess.run([sys.executable, "-m", "convo_index.indexer", "--no-jobs"], capture_output=True, text=True, check=False)
+    try:
+        res = subprocess.run([sys.executable, "-m", "convo_index.indexer", "--no-jobs"], capture_output=True, text=True,
+                             check=False, timeout=INGEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "busy": False, "error": f"indexing took over {INGEST_TIMEOUT} s; run convo-index index"}
     return {"ok": res.returncode == 0, "busy": res.returncode == EXIT_LOCKED, "error": (res.stderr or "")[-500:]}
 
 
@@ -375,7 +384,7 @@ def _start_handoff(args, settings, cid, h, kind, out, transcript):
     from convo_index.sources.base import resume_command
     if args.prompt_file:
         try:
-            prompt = Path(args.prompt_file).expanduser().read_text(encoding="utf-8")
+            prompt = H.point_at(Path(args.prompt_file).expanduser().read_text(encoding="utf-8"), transcript)
         except OSError as e:
             print(f"cannot read {args.prompt_file}: {e.strerror or e}", file=sys.stderr)
             return 1
@@ -411,13 +420,21 @@ def _start_handoff(args, settings, cid, h, kind, out, transcript):
                 print(f"✗ {ev.get('name') or 'tool'}: not allowed in this mode", file=sys.stderr)
     except KeyboardInterrupt:
         runner.stop(turn.id)
-        for _, ev in runner.events(turn.id):
-            last = ev if ev is not None else last
+        print("stopping… (Ctrl-C again to leave now)", file=sys.stderr)
+        try:
+            for _, ev in runner.events(turn.id):
+                last = ev if ev is not None else last
+        except KeyboardInterrupt:          # the refresh after a session can take a while
+            print("left before the session finished; it is indexed on the next refresh", file=sys.stderr)
+            return 130
     ok = bool(last) and last["kind"] == "done"
     if not ok and last:
         print(f"the session failed: {last.get('message') or 'unknown error'}", file=sys.stderr)
         if last.get("stderr"):
             print(last["stderr"], file=sys.stderr)
+    if not state["id"]:
+        print("the tool never reported its session, so nothing was linked; it may still be in that tool's history",
+              file=sys.stderr)
     if state["id"]:
         relation = "reviews" if kind == "review" else "continues"
         print(f"new conversation {state['id']} {relation} {cid}" if state["linked"] else

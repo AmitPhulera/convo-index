@@ -226,7 +226,10 @@ def _run(adapters, db_path, settings, derived=True):
         totals["references_rescanned"] = n
     totals["removed"] += purge_excluded(conn, settings)
     embed_fn, embedder_fp = embed_fn_and_fingerprint(conn, settings, totals["warnings"])
+    handoffs = dbm.handoff_sessions(conn)
     for adapter in (adapters if adapters is not None else enabled_adapters(settings)):
+        # sessions a handoff started: indexed even where the adapter skips headless runs
+        adapter.handoff_ids = {cid.partition(":")[2] for cid in handoffs if cid.partition(":")[0] == adapter.name}
         counts = {"indexed": 0, "skipped": 0, "removed": 0, "failed": 0}
         totals["sources"][adapter.name] = counts
         try:

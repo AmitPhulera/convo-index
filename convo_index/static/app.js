@@ -469,6 +469,9 @@ async function openDetail(id, cardEl) {
   const keepPanel = id === selectedId && $("detail").classList.contains("details-open");
   if (id !== selectedId) tagEditOpen = false;    // the tag editor stays open only for re-renders
   detachTurn();
+  // a re-render of this conversation keeps a prepared prompt and what was typed into it
+  const keptPrep = id === selectedId && handoffPrep && $("handoff-panel") && !$("handoff-panel").hidden && !handoffStream
+    ? { prep: handoffPrep, text: $("handoff-prompt").value, target: $("handoff-target").value, edits: $("handoff-edits").value } : null;
   detachHandoff();
   const gen = ++detailView;
   selectedId = id;
@@ -630,7 +633,12 @@ async function openDetail(id, cardEl) {
   detail.querySelectorAll(".tag-clear").forEach(b => b.addEventListener("click", () =>
     sendTag(c.id, b.dataset.group, null, "clear")));               // tag null = clear the whole group, one request
   if (c.turns_supported) wireComposer(c);
-  if ($("handoff-panel")) wireHandoff(c);
+  if ($("handoff-panel")) {
+    wireHandoff(c);
+    // a handoff still running (started before a reload or before navigating away) is followed again
+    if (c.active_handoff) resumeHandoff(c, c.active_handoff);
+    else if (keptPrep) restoreHandoff(keptPrep);
+  }
   $("detail-pane").scrollTop = 0;
   // a turn still running (sent before a reload, from another tab, or before navigating away)
   // is followed again from its first event
@@ -1146,7 +1154,8 @@ function detachHandoff() {
 }
 
 function handoffHTML(c) {
-  const opts = c.handoff_targets.map(t => `<option value="${escape(t)}"${t !== c.source ? " selected" : ""}>${escape(sourceLabel(t))}</option>`).join("");
+  const first = c.handoff_targets.find(t => t !== c.source) || c.handoff_targets[0];   // another tool, when there is one
+  const opts = c.handoff_targets.map(t => `<option value="${escape(t)}"${t === first ? " selected" : ""}>${escape(sourceLabel(t))}</option>`).join("");
   return `<div class="handoff-panel" id="handoff-panel" hidden>
     <div class="handoff-head"><strong>Hand off</strong>
       <span class="hint">A new session in another tool starts from a prompt built from this conversation. You can edit the prompt first.</span></div>
@@ -1205,8 +1214,7 @@ function wireHandoff(c) {
   };
   document.querySelectorAll("#handoff-kind button").forEach(b => b.addEventListener("click", () => {
     if (b.getAttribute("aria-pressed") === "true" || handoffStream) return;
-    document.querySelectorAll("#handoff-kind button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
-    $("handoff-mode").hidden = b.dataset.kind === "review";      // a review never edits
+    setHandoffKind(b.dataset.kind);                              // a review never edits: no Mode
     reset();
   }));
   $("handoff-prepare").addEventListener("click", () => prepareHandoff(c));
@@ -1229,6 +1237,11 @@ async function prepareHandoff(c) {
   $("handoff-prepare").disabled = false;
   if (!res || !res.ok) { handoffStatus(body.error || (res ? `The server returned ${res.status}.` : "The server did not answer."), "error"); return; }
   if (kind !== handoffKind()) return;          // switched while it was being built
+  showHandoffPreview(body, body.prompt);
+}
+
+function showHandoffPreview(body, text) {
+  const kind = body.kind;
   handoffPrep = body;
   const notes = [`About ${body.tokens.toLocaleString()} tokens${body.over_budget ? " (over the budget: trim it)" : ""}` +
                  (body.dropped ? `; ${body.dropped} older assistant message${body.dropped === 1 ? "" : "s"} left out` : "") + "."];
@@ -1239,7 +1252,7 @@ async function prepareHandoff(c) {
     + (body.secrets.length ? `<p class="handoff-warn">The prompt holds what looks like a credential: ${body.secrets.map(s => escape(`${s.kind} ${s.sample}`)).join(", ")}. Remove it before starting.</p>` : "")
     + list(`${body.problems.length} known problem${body.problems.length === 1 ? "" : "s"} in the transcript`, body.problems.map(p => `${p.kind}: ${p.text}`))
     + (body.send_refusal ? `<p class="handoff-warn">${escape(body.send_refusal.replace(" Without --start the prompt is printed for you to paste.", ""))} You can still copy the prompt.</p>` : "");
-  $("handoff-prompt").value = body.prompt;
+  $("handoff-prompt").value = text;
   $("handoff-prompt").scrollTop = 0;
   $("handoff-confirm").hidden = !body.secrets.length;
   $("handoff-ignore-secrets").checked = false;
@@ -1248,6 +1261,31 @@ async function prepareHandoff(c) {
   handoffStatus("");
   $("handoff-prompt").focus({ preventScroll: true });
   $("handoff-prompt").setSelectionRange(0, 0);                 // read from the top
+}
+
+function setHandoffKind(kind) {
+  document.querySelectorAll("#handoff-kind button").forEach(x => x.setAttribute("aria-pressed", String(x.dataset.kind === kind)));
+  $("handoff-mode").hidden = kind === "review";
+}
+
+function openHandoffPanel() {
+  $("handoff-panel").hidden = false;
+  $("handoff-toggle").setAttribute("aria-expanded", "true");
+}
+
+function resumeHandoff(c, a) {
+  openHandoffPanel();
+  setHandoffKind(a.kind);
+  if ([...$("handoff-target").options].some(o => o.value === a.target)) $("handoff-target").value = a.target;
+  followHandoff(c, a.turn_id, a.target, a.kind);
+}
+
+function restoreHandoff(k) {
+  openHandoffPanel();
+  setHandoffKind(k.prep.kind);
+  $("handoff-target").value = k.target;
+  $("handoff-edits").value = k.edits;
+  showHandoffPreview(k.prep, k.text);
 }
 
 async function startHandoff(c) {
@@ -1277,6 +1315,7 @@ async function startHandoff(c) {
 async function followHandoff(c, turnId, target, kind) {
   const h = { turnId, controller: new AbortController(), seen: 0, text: "", bubble: null, newId: null, finished: false, target, kind };
   handoffStream = h;
+  $("handoff-live").innerHTML = "";            // an earlier run's output, or this one's before a replay
   $("handoff-preview").hidden = true;
   $("handoff-start").hidden = true;
   $("handoff-prepare").disabled = true;
