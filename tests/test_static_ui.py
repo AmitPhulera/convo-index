@@ -9,7 +9,7 @@ BUTTON = re.compile(r"<button\b[^>]*>", re.S)
 
 def _buttons():
     for name in FILES:
-        for tag in BUTTON.findall((STATIC / name).read_text()):
+        for tag in BUTTON.findall((STATIC / name).read_text(encoding="utf-8")):
             yield name, tag
 
 
