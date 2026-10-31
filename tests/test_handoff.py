@@ -201,3 +201,13 @@ def test_cli_refuses_a_disabled_or_excluded_conversation(tmp_path, monkeypatch, 
     assert cli.main(["handoff", "s1", "--transcript-dir", str(tmp_path / "h")]) == 1
     out = capsys.readouterr()
     assert f.calls == [] and out.out == "" and "not handing off:" in out.err and not (tmp_path / "h").exists()
+
+
+def test_the_digest_session_is_not_indexed_as_a_conversation(fake_llm, llm_settings, tmp_path):
+    from convo_index.sources import antigravity as ag
+    from tests.test_antigravity import make_home, default_records
+    f = fake_llm({"goal": "g"})
+    H.digest([m.__dict__ for m in _msgs()], "T", llm_settings)
+    home = make_home(tmp_path, records=default_records(first=f.calls[0]["prompt"]))
+    ad = ag.AntigravityAdapter(home)
+    assert ad.load(next(iter(ad.discover()))) is None
