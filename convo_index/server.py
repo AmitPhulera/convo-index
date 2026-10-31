@@ -30,6 +30,7 @@ from convo_index.sources import claude_code as CC
 from convo_index import tags as T
 from convo_index import references as REF
 from convo_index import cost as K
+from convo_index import handoff as HO
 from convo_index import vectors as V
 
 DB_PATH = None   # tests override; otherwise resolved from settings at request time
@@ -208,6 +209,10 @@ def handle_delete(conversation_id):
                         Path(row[0]).unlink(missing_ok=True)
                     except OSError as e:
                         raise RuntimeError(f"archive copy not removed, conversation kept: {e}") from e
+                try:
+                    HO.remove_copies(db, conversation_id)
+                except OSError as e:
+                    raise RuntimeError(f"handoff transcript not removed, conversation kept: {e}") from e
                 dbm.delete_conversation(conn, conversation_id)
             finally:
                 conn.close()

@@ -45,6 +45,7 @@ Hugging Face into `models/` next to the database, and nothing leaves the machine
     convo-index stop    # stop the running UI server (running browser turns end first)
     convo-index search "kubernetes crash" --source codex --since 30d   # from the terminal
     convo-index export <id> --md          # one conversation as Markdown (or JSON without --md)
+    convo-index handoff <id> [--review]   # a prompt to continue (or review) it in another harness
     convo-index backup ~/backups/         # WAL-safe copy of the database
     uv run pytest       # tests (from a checkout)
 
@@ -183,6 +184,26 @@ PATH for this. On Windows, Claude Code turns run the tool through `node` rather 
 `.cmd` shim, inside a job object that ends the whole process tree; Opencode turns are not
 offered there yet. `scripts/probe_turns.sh` is the manual
 check that the closing flags still hold after a tool upgrade.
+
+## Hand a conversation to another tool
+
+`convo-index handoff <id>` prints a prompt that picks the work up in a new session of any
+other tool: paste it there. It is built for two cases. **Continue** (the default) is for
+when one tool hits its limits: the prompt carries a handoff note written by the `summary`
+backend (goal, decisions, where it stands, the next step, and the claims the agent made that
+the transcript does not show it checking). **`--review`** asks for a second opinion: the
+prompt carries the conversation's own words and no note, so the reviewer is not steered by
+the first agent's account. Both include where and when it happened, the repository's state
+now (`git status`, diff stat, recent commits), problems found without an LLM (tool errors,
+interruptions, compactions, user messages that look like corrections), every user message
+verbatim, and the path of a full transcript the new session can read on demand (under
+`handoffs/` next to the database, readable only by you). Older assistant text is left out
+first when the prompt would pass ~100k tokens; user messages never are.
+
+Only the prompt goes to stdout. Its size, the known problems, and anything that looks like a
+credential (remove it before pasting into a tool from another provider) go to stderr. A
+note that cannot be written (no backend, `hosted_processing` not `allow`, a timeout) leaves
+the prompt without one and says why; `--no-digest` skips it.
 
 ## Daily refresh and the server from login
     convo-index schedule install            # LaunchAgent (macOS) or systemd user timer (Linux); crontab line elsewhere

@@ -4,6 +4,7 @@ __pycache__/
 convos.db
 convos.db-*
 archive/
+handoffs/
 refresh.log
 serve.log
 turn-token
