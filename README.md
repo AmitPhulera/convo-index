@@ -207,6 +207,15 @@ check that the closing flags still hold after a tool upgrade.
 
 ## Hand a conversation to another tool
 
+In the browser, **Hand off** in a conversation's toolbar does all of this without a terminal:
+pick Continue elsewhere or Second opinion, the tool and (to continue) Read-only or Edit, then
+**Prepare prompt**. The prompt opens to edit, with the known problems, anything that looks
+like a credential and its size beside it; **Start** runs the new session and shows its
+replies. When it is done the new conversation opens from the panel, both conversations link
+to each other in their details, and **Bring back** puts a second opinion in this
+conversation's message box for the first agent. It needs the turn token in the URL, like the
+message box, and the same `hosted_processing = allow` as `--start`.
+
 `convo-index handoff <id>` prints a prompt that picks the work up in a new session of any
 other tool: paste it there. It is built for two cases. **Continue** (the default) is for
 when one tool hits its limits: the prompt carries a handoff note written by the `summary`
