@@ -64,8 +64,10 @@ SECRET_PATTERNS = [
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{20,}=*"), "bearer token"),
 ]
 
-# Adapters prefix a failed tool's output with this (opencode after its input, on a new line).
-ERROR_RE = re.compile(r"^ERROR: ", re.M)
+# Where the adapters mark a failed tool: Claude Code and pi put "ERROR: " first, opencode ends
+# the text with a STATUS line and then the ERROR line. Anywhere else it is the tool's output
+# (a log the agent read), not a failure.
+ERROR_RE = re.compile(r"\AERROR: |\nSTATUS: [^\n]*\nERROR: ")
 
 HARNESS_NAMES = {"claude_code": "Claude Code", "opencode": "opencode", "codex": "Codex CLI",
                  "antigravity": "Antigravity", "pi": "pi"}

@@ -50,9 +50,14 @@ def test_a_correction_needs_a_reply_before_it():
     assert H.known_problems(msgs) == []
 
 
-def test_opencode_errors_after_the_input_are_found():
-    msgs = [{"seq": 0, "role": "tool", "kind": KIND_TOOL_RESULT, "text": "[bash] ls /nope\nERROR: No such file"}]
+def test_opencode_errors_after_the_status_line_are_found():
+    msgs = [{"seq": 0, "role": "tool", "kind": KIND_TOOL_RESULT, "text": "[bash] ls /nope\nSTATUS: error\nERROR: No such file"}]
     assert H.known_problems(msgs)[0]["text"] == "No such file"
+
+
+def test_an_error_line_in_successful_output_is_not_a_tool_error():
+    msgs = [{"seq": 0, "role": "tool", "kind": KIND_TOOL_RESULT, "text": "tail of app.log:\nERROR: connection reset (old entry)"}]
+    assert H.known_problems(msgs) == []
 
 
 def test_continue_brief_has_user_words_digest_and_no_harness_messages(tmp_path):
