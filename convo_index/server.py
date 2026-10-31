@@ -4,6 +4,7 @@ import os
 import json
 import re
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -650,8 +651,14 @@ def handle_handoff_preview(conversation_id, body):
         stats = {}
         transcript = HO.write_transcript(conn, h["id"], HO.copy_dir(db, h["id"]), cfg, stats=stats)
         msgs = X.messages(conn, h["id"])
+        # deleted meanwhile (its copies were removed before this one existed): leave no copy behind
+        gone = transcript is None or dbm.is_deleted(conn, h["id"]) or not dbm.exists(conn, h["id"])
     finally:
         conn.close()
+    if gone:
+        if transcript is not None:
+            shutil.rmtree(transcript.parent, ignore_errors=True)
+        return 404, json.dumps({"error": "conversation not found"})
     d, status = HO.digest(msgs, h["title"] or "", cfg) if kind == "continue" else (None, None)   # no connection held meanwhile
     conn = dbm.connect(db)
     try:

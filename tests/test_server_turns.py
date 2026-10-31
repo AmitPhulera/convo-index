@@ -762,3 +762,16 @@ def test_a_continue_preview_carries_the_note_or_says_why_not(site, monkeypatch):
 def test_a_bad_preview_id_is_a_400(site):
     for pid in ([], {}, 3, None):
         assert handoff(site, "/api/handoff/start", {"preview_id": pid, "target": "claude_code", "prompt": "x"})[0] == 400
+
+
+def test_a_conversation_deleted_during_prepare_leaves_no_copy(site, monkeypatch):
+    from convo_index import handoff as HO
+    real = HO.write_transcript
+
+    def then_deleted(conn, cid, directory, settings=None, stats=None):
+        path = real(conn, cid, directory, settings, stats=stats)
+        dbm.delete_conversation(dbm.connect(site.tmp / "t.db"), cid)      # a delete that lands in between
+        return path
+    monkeypatch.setattr(HO, "write_transcript", then_deleted)
+    status, _ = handoff(site, f"/api/conversation/{CID}/handoff", {"kind": "review"})
+    assert status == 404 and not list((site.tmp / "handoffs").glob("*"))
