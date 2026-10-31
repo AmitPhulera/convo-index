@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -409,29 +408,11 @@ TURNS_ON_WINDOWS = True       # the prompt goes through stdin; see launcher()
 TURN_TEXT_LIMIT = 400         # chars of a tool input/result shown in a turn event (the transcript parser keeps TOOL_TEXT_LIMIT)
 
 
-def _script_from_shim(shim):
-    """The JavaScript entry an npm `.cmd` shim runs: "%dp0%\\node_modules\\...\\cli.js" (npm 7+,
-    which sets dp0 from %~dp0 first) or "%~dp0\\node_modules\\...\\cli.js" (npm 6)."""
-    try:
-        text = Path(shim).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    m = re.search(r'"%(?:~dp0|dp0%)\\?([^"]+?\.c?js)"', text)
-    return str(Path(shim).parent.joinpath(*m.group(1).replace("\\", "/").strip("/").split("/"))) if m else None
-
-
 def launcher():
     """argv prefix that starts Claude Code without a shell in between, or None when it is not
-    installed. On Windows an npm install leaves a `claude.cmd` shim, which cmd.exe would run;
-    it is bypassed by launching node on the script it names. The native installer's
-    `claude.exe` and the POSIX binary are used as they are."""
-    binary = shutil.which("claude")
-    if not binary:
-        return None
-    if sources.is_windows() and binary.lower().endswith((".cmd", ".bat")):
-        script, node = _script_from_shim(binary), shutil.which("node")
-        return [node, script] if script and node and Path(script).exists() else None
-    return [binary]
+    installed: an npm `claude.cmd` shim on Windows is bypassed for node (sources.npm_launcher);
+    the native installer's `claude.exe` and the POSIX binary are used as they are."""
+    return sources.npm_launcher("claude")
 
 
 def claude_config_path():

@@ -27,7 +27,7 @@ def claude_mcp(monkeypatch, tmp_path):
 
 @pytest.fixture
 def claude_on_path(monkeypatch):
-    monkeypatch.setattr(cc.shutil, "which", lambda name: "/opt/bin/claude" if name == "claude" else None)
+    monkeypatch.setattr(base.shutil, "which", lambda name: "/opt/bin/claude" if name == "claude" else None)
     monkeypatch.setattr(base, "is_windows", lambda: False)
 
 
@@ -87,7 +87,7 @@ def test_claude_turn_helpers_leave_the_transcript_parser_alone():
 
 
 def test_claude_missing_binary_means_no_command(monkeypatch):
-    monkeypatch.setattr(cc.shutil, "which", lambda name: None)
+    monkeypatch.setattr(base.shutil, "which", lambda name: None)
     assert base.turn_command("claude_code:abc", "x", "/proj") is None
     assert base.turn_launcher("claude_code:abc") is None
 
@@ -100,7 +100,7 @@ def test_claude_windows_npm_shim_is_bypassed_for_node(monkeypatch, tmp_path):
     shim.write_text('@ECHO off\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  '
                     '"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n')
     monkeypatch.setattr(base, "is_windows", lambda: True)
-    monkeypatch.setattr(cc.shutil, "which", lambda name: {"claude": str(shim), "node": "C:\\node\\node.exe"}.get(name))
+    monkeypatch.setattr(base.shutil, "which", lambda name: {"claude": str(shim), "node": "C:\\node\\node.exe"}.get(name))
     cmd = cc.turn_command("abc", "x", "C:\\proj")
     assert cmd.argv[:2] == ["C:\\node\\node.exe", str(script)]
     assert not any(a.lower().endswith(".cmd") for a in cmd.argv)
@@ -115,7 +115,7 @@ def test_claude_windows_npm6_shim_is_bypassed_for_node(monkeypatch, tmp_path):
                     '"%~dp0\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n) ELSE (\r\n'
                     '  node  "%~dp0\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n)\r\n')
     monkeypatch.setattr(base, "is_windows", lambda: True)
-    monkeypatch.setattr(cc.shutil, "which", lambda name: {"claude": str(shim), "node": "C:\\node\\node.exe"}.get(name))
+    monkeypatch.setattr(base.shutil, "which", lambda name: {"claude": str(shim), "node": "C:\\node\\node.exe"}.get(name))
     assert cc.turn_command("abc", "x", "C:\\proj").argv[:2] == ["C:\\node\\node.exe", str(script)]
 
 
@@ -123,14 +123,14 @@ def test_claude_windows_shim_without_a_script_is_refused(monkeypatch, tmp_path):
     shim = tmp_path / "claude.cmd"
     shim.write_text("@ECHO off\r\nsomething else\r\n")
     monkeypatch.setattr(base, "is_windows", lambda: True)
-    monkeypatch.setattr(cc.shutil, "which", lambda name: {"claude": str(shim), "node": "node"}.get(name))
+    monkeypatch.setattr(base.shutil, "which", lambda name: {"claude": str(shim), "node": "node"}.get(name))
     assert cc.turn_command("abc", "x", "C:\\proj") is None
     assert base.turn_launcher("claude_code:abc") is None            # what doctor and the UI see
 
 
 def test_claude_windows_native_exe_is_used_directly(monkeypatch):
     monkeypatch.setattr(base, "is_windows", lambda: True)
-    monkeypatch.setattr(cc.shutil, "which", lambda name: "C:\\Users\\me\\.local\\bin\\claude.exe")
+    monkeypatch.setattr(base.shutil, "which", lambda name: "C:\\Users\\me\\.local\\bin\\claude.exe")
     assert cc.turn_command("abc", "x", "C:\\proj").argv[0].endswith("claude.exe")
 
 

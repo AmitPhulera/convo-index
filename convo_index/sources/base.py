@@ -10,6 +10,8 @@ from __future__ import annotations
 import importlib
 import os
 import re
+import shutil
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Iterable, Protocol
 
@@ -122,6 +124,31 @@ def is_windows():
     """Platform switch for the launchers (a function so tests can take the other branch
     without patching `os.name`, which would change what `Path` builds)."""
     return os.name == "nt"
+
+
+def _script_from_shim(shim):
+    """The JavaScript entry an npm `.cmd` shim runs: "%dp0%\\node_modules\\...\\cli.js" (npm 7+,
+    which sets dp0 from %~dp0 first) or "%~dp0\\node_modules\\...\\cli.js" (npm 6)."""
+    try:
+        text = Path(shim).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'"%(?:~dp0|dp0%)\\?([^"]+?\.c?js)"', text)
+    return str(Path(shim).parent.joinpath(*m.group(1).replace("\\", "/").strip("/").split("/"))) if m else None
+
+
+def npm_launcher(name):
+    """argv prefix that starts the tool `name` without a shell in between, or None when it is
+    not installed. On Windows an npm install leaves a `<name>.cmd` shim, which cmd.exe would
+    run; it is bypassed by launching node on the script it names. Anything else on PATH (a
+    native `.exe`, the POSIX binary or npm's POSIX symlink) is used as it is."""
+    binary = shutil.which(name)
+    if not binary:
+        return None
+    if is_windows() and binary.lower().endswith((".cmd", ".bat")):
+        script, node = _script_from_shim(binary), shutil.which("node")
+        return [node, script] if script and node and Path(script).exists() else None
+    return [binary]
 
 TURN_MODULES = {
     "claude_code": "convo_index.sources.claude_code",
