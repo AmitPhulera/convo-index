@@ -225,6 +225,22 @@ credential (remove it before pasting into a tool from another provider) go to st
 note that cannot be written (no backend, `hosted_processing` not `allow`, a timeout) leaves
 the prompt without one and says why; `--no-digest` skips it.
 
+`--start claude_code` or `--start opencode` runs the new session here instead of printing the
+prompt, with the same closed surface as a browser turn (read-only unless `--edit`, which a
+review ignores), and prints its replies, the new conversation's id and the command that
+resumes it in that tool. The two conversations are linked in the index as soon as the tool
+reports its session. The new session may read the transcript copy's directory and nothing
+else outside the project. It is not started when the prompt or the transcript holds what
+looks like a credential: print the prompt, edit it, and pass it back with `--prompt-file`, or
+pass `--ignore-secrets`. The model comes from `--model`, else `[handoff.models]`:
+
+    [handoff.models]
+    claude_code = ""                                  # "" = Claude Code's own default
+    opencode = "opencode-go/deepseek-v4.1-flash"      # "" = the first of opencode's recent models
+
+opencode needs one: in the turn's empty configuration home it falls back to a default model
+that a workspace's privacy settings may refuse.
+
 ## Daily refresh and the server from login
     convo-index schedule install            # LaunchAgent (macOS) or systemd user timer (Linux); crontab line elsewhere
                                             # (no systemd user session and no crontab: prints the command to run yourself)
