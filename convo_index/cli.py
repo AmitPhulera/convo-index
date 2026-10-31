@@ -305,6 +305,10 @@ def cmd_handoff(args):
         if h is None:
             print(f"no conversation {args.id}", file=sys.stderr)
             return 1
+        why = H.refusal(settings, h)
+        if why:
+            print(f"not handing off: {why}", file=sys.stderr)
+            return 1
         d, status = None, None
         if kind == "continue":
             if args.no_digest:

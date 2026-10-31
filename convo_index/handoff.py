@@ -16,6 +16,7 @@ from pathlib import Path
 
 from convo_index import export as X
 from convo_index import summarize as SUM
+from convo_index.indexer import cwd_excluded
 from convo_index.model import KIND_TEXT, KIND_TOOL_CALL, KIND_TOOL_RESULT
 from convo_index.providers import registry as R
 
@@ -68,6 +69,18 @@ HARNESS_NAMES = {"claude_code": "Claude Code", "opencode": "opencode", "codex": 
 
 PROBLEM_QUOTE = 300   # characters of a message quoted in the known-problems list
 DIGEST_TOOL_CALL = 200   # characters of each tool call the digest model sees
+
+
+def refusal(settings, h):
+    """Why this conversation may not be handed off, or None. The switches that keep a source or
+    a project away from every provider apply here too: a handoff sends it to another tool, and
+    the digest to the summary backend."""
+    spec = settings["sources"].get(h["source"]) or {}
+    if spec.get("enabled", True) is False:
+        return f"source {h['source']} is disabled in settings"
+    if cwd_excluded(h.get("cwd"), spec.get("exclude_cwd") or []):
+        return f"this project is excluded by [sources.{h['source']}] exclude_cwd"
+    return None
 
 
 def harness_label(m):

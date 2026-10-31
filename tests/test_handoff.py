@@ -186,3 +186,18 @@ def test_cli_prints_only_the_prompt_on_stdout(tmp_path, monkeypatch, capsys):
     assert "None could be written" in out.out and "no handoff note:" in out.err
     assert list((tmp_path / "handoffs").glob("claude_code-s1-*/transcript.md"))
     assert cli.main(["handoff", "nope"]) == 1
+
+
+@pytest.mark.parametrize("source_spec", [{"enabled": False}, {"exclude_cwd": ["/nowhere"]}])
+def test_cli_refuses_a_disabled_or_excluded_conversation(tmp_path, monkeypatch, fake_llm, capsys, source_spec):
+    from convo_index import cli
+    from convo_index import settings as S
+    from tests.conftest import make_settings
+    st = make_settings(tmp_path, llm={"summary": {"backend": "claude_cli", "model": "m"}},
+                       privacy={"hosted_processing": "allow"}, sources={"claude_code": source_spec})
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    _db(tmp_path).close()
+    f = fake_llm({"goal": "g"})
+    assert cli.main(["handoff", "s1", "--transcript-dir", str(tmp_path / "h")]) == 1
+    out = capsys.readouterr()
+    assert f.calls == [] and out.out == "" and "not handing off:" in out.err and not (tmp_path / "h").exists()
