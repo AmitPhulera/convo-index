@@ -757,3 +757,8 @@ def test_a_continue_preview_carries_the_note_or_says_why_not(site, monkeypatch):
     status, prep = handoff(site, f"/api/conversation/{CID}/handoff", {"kind": "continue"})
     assert status == 200 and prep["digest_status"].startswith("the summary backend did not answer")
     assert "None could be written (the summary backend did not answer" in prep["prompt"]
+
+
+def test_a_bad_preview_id_is_a_400(site):
+    for pid in ([], {}, 3, None):
+        assert handoff(site, "/api/handoff/start", {"preview_id": pid, "target": "claude_code", "prompt": "x"})[0] == 400

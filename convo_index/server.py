@@ -675,8 +675,11 @@ def handle_handoff_start(body):
     with the turn's snapshot; its stream names the new conversation in a `session` event."""
     if not isinstance(body, dict):
         return 400, json.dumps({"error": "body must be a JSON object"})
+    pid = body.get("preview_id")
+    if not isinstance(pid, str):
+        return 400, json.dumps({"error": "preview_id is required"})
     with _previews_lock:
-        p = HANDOFF_PREVIEWS.get(body.get("preview_id"))
+        p = HANDOFF_PREVIEWS.get(pid)
     if p is None or time.time() - p["at"] > PREVIEW_TTL:
         return 404, json.dumps({"error": "the prepared prompt has expired; prepare it again"})
     target, prompt, edits = body.get("target"), body.get("prompt"), body.get("edits", False)
