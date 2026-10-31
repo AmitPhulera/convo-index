@@ -120,3 +120,15 @@ def test_alias_with_a_non_string_target_is_reported_not_fatal(tmp_path):
     up.write_text('[aliases]\nalias = ["m"]\n')
     p = K.load(s)
     assert len(p.errors) == 1 and "alias" in p.errors[0] and p.rates("claude-haiku-4-5")["input"] == 1.0
+
+
+def test_a_broken_long_context_is_reported_and_the_base_rates_stay(tmp_path):
+    s = make_settings(tmp_path)
+    up = tmp_path / "pricing.toml"
+    up.write_text('[models]\n"m" = { input = 1.0, output = 2.0, long_context = { above = "lots", input = 9.0, output = 9.0 } }\n'
+                  '"n" = { input = 1.0, output = 2.0, long_context = { above = 1000, input = 3.0 } }\n')
+    s["pricing"] = {"file": str(up)}
+    p = K.load(s)
+    assert p.rates("m", prompt=10**9)["input"] == 1.0 and p.rates("n", prompt=10**9)["input"] == 1.0
+    assert sum("long_context" in e for e in p.errors) == 2
+    assert 1000 not in p.thresholds

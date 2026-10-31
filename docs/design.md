@@ -454,6 +454,13 @@ usage_records(id INTEGER PRIMARY KEY, conversation_id TEXT, native_request_id TE
   Exact id, then explicit alias, else **unpriced**. No prefix guessing. The seed file is
   generated from vendor pricing pages at release time and `doctor` lists model ids with no
   entry.
+- **Prompt-size tiers.** A model may add `long_context = { above = 272000, input = .., output = .. }`:
+  the rates for a request whose prompt (all input buckets, cached ones included) is over
+  `above` tokens, as OpenAI gpt-6.1 (272k) and Gemini Pro (200k) bill. The tier is chosen per
+  request, but usage is summed in SQL (SQLite for one conversation, DuckDB for analytics), so
+  both queries also group by a size band: how many of the distinct `above` values the prompt
+  exceeds. A band's floor (just above its highest threshold) picks the right tier for every
+  model in it.
 - Two numbers, never merged: `reported_cost` (sum of `reported_cost_usd` where not NULL) and
   `estimated_cost` (priced buckets × rates). Every aggregate also returns `coverage`: the
   share of records that were priceable. The UI shows partial totals as "≥ $x (72% priced)".

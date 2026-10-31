@@ -18,10 +18,10 @@ def _grouped(con, pricing, dim_sql, extra_join="", where="", limit=None, order="
     """[(label, summary)] for one grouping dimension: rows grouped by (dim, provider, model) are
     priced per model and rolled up per dim."""
     rows = con.execute(
-        f"""SELECT {dim_sql} AS dim, u.provider, u.model, {_USAGE_COLS}
+        f"""SELECT {dim_sql} AS dim, u.provider, u.model, {_USAGE_COLS}, {pricing.band_sql()} AS band
             FROM c.usage_records u JOIN c.conversations cv ON cv.id = u.conversation_id {extra_join}
             {_VISIBLE} {('AND ' + where[len('WHERE '):]) if where.upper().startswith('WHERE ') else where}
-            GROUP BY dim, u.provider, u.model""").fetchall()
+            GROUP BY dim, u.provider, u.model, band""").fetchall()
     by_dim = {}
     for dim, *rest in rows:
         by_dim.setdefault(dim, []).append(tuple(rest))
@@ -44,8 +44,8 @@ def usage(con, pricing):
     """Tokens and API-equivalent cost: totals, by month / source / model / project / reference
     key, top conversations, coverage per source (docs/design.md §10)."""
     total_rows = con.execute(
-        f"""SELECT u.provider, u.model, {_USAGE_COLS} FROM c.usage_records u
-            JOIN c.conversations cv ON cv.id = u.conversation_id {_VISIBLE} GROUP BY 1, 2""").fetchall()
+        f"""SELECT u.provider, u.model, {_USAGE_COLS}, {pricing.band_sql()} AS band FROM c.usage_records u
+            JOIN c.conversations cv ON cv.id = u.conversation_id {_VISIBLE} GROUP BY u.provider, u.model, band""").fetchall()
     totals = K.aggregate(total_rows, pricing)
     by_model = _grouped(con, pricing, "COALESCE(u.provider, '?') || ' / ' || COALESCE(u.model, '?')", order="cost")
     by_source = _grouped(con, pricing, "cv.source", order="cost")
