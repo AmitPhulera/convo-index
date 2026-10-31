@@ -290,3 +290,17 @@ def test_cli_prunes_old_copies(tmp_path, monkeypatch, capsys):
     os.utime(old / "transcript.md", (1_700_000_000, 1_700_000_000))
     assert cli.main(["handoff", "s1", "--review"]) == 0
     assert not old.exists() and len(list((tmp_path / "handoffs").iterdir())) == 1
+
+
+def test_secrets_in_tool_output_are_reported_from_the_transcript_file(tmp_path, monkeypatch, capsys):
+    from convo_index import cli
+    from convo_index import settings as S
+    from tests.conftest import make_settings
+    msgs = [Message(seq=0, role="user", text="deploy it"),
+            Message(seq=1, role="tool", kind=KIND_TOOL_RESULT, text="export AWS_KEY=AKIAABCDEFGHIJKLMNOP")]
+    st = make_settings(tmp_path)
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    _db(tmp_path, msgs).close()
+    assert cli.main(["handoff", "s1", "--review", "--transcript-dir", str(tmp_path / "h")]) == 0
+    out = capsys.readouterr()
+    assert "AKIA" not in out.out and "looks like a secret in the transcript file" in out.err and "AWS access key" in out.err

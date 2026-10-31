@@ -418,7 +418,9 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
 
     `digest_result` (continue only) and `repo` are passed in so the caller decides what runs:
     the digest is an LLM call and repo state runs git. Returns {kind, prompt, problems,
-    secrets, chars, tokens, over_budget, dropped, digest_status}."""
+    secrets, transcript_secrets, chars, tokens, over_budget, dropped, digest_status}, where
+    transcript_secrets are the hits in the transcript file (tool output included) that the
+    prompt itself does not show."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}, not {kind!r}")
     h = X.head(conn, cid)
@@ -456,6 +458,12 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
     sections.append("## What to do\n\n" + CLOSING[kind])
 
     prompt = "\n\n".join(sections) + "\n"
-    return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": find_secrets(prompt),
+    secrets = find_secrets(prompt)
+    try:
+        in_file = find_secrets(Path(transcript_path).read_text(encoding="utf-8")) if transcript_path else []
+    except OSError:
+        in_file = []          # a pointer the caller made up (tests) or a file already removed
+    return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": secrets,
+            "transcript_secrets": [s for s in in_file if s not in secrets],
             "chars": len(prompt), "tokens": len(prompt) // 4, "over_budget": len(prompt) > budget_chars,
             "dropped": dropped, "digest_status": digest_status if kind == "continue" else None}

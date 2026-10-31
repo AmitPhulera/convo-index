@@ -330,6 +330,8 @@ def cmd_handoff(args):
         note.append(f"no handoff note: {out['digest_status']}")
     note += [f"known problem: {p['kind']}: {p['text']}" for p in out["problems"]]
     note += [f"looks like a secret, remove before sending: {s['kind']} {s['sample']}" for s in out["secrets"]]
+    note += [f"looks like a secret in the transcript file, which the prompt points at: {s['kind']} {s['sample']}"
+             for s in out["transcript_secrets"]]
     print("\n".join(note), file=sys.stderr)
     return 0
 
