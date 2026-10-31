@@ -17,6 +17,13 @@ from convo_index.sources.base import resume_command
 from tests.conftest import make_settings
 
 
+def _linux(monkeypatch, systemd):
+    """A Linux host with a working systemd user session, or one with only crontab."""
+    monkeypatch.setattr(SCH, "systemd_user_available", lambda: systemd)
+    monkeypatch.setattr(SCH.shutil, "which", lambda name: {"systemctl": "/usr/bin/systemctl" if systemd else None,
+                                                           "crontab": "/usr/bin/crontab"}.get(name))
+
+
 def _seed(tmp_path, monkeypatch):
     st = make_settings(tmp_path)
     st["paths"]["db"] = str(tmp_path / "convos.db")
@@ -124,11 +131,11 @@ def test_schedule_plans_per_platform_without_touching_the_system(tmp_path, monke
     assert "<string>/opt/bin/convo-index</string>" in plist and "<integer>21</integer>" in plist
     assert f"CONVO_INDEX_CONFIG</key><string>{tmp_path / 'cfg.toml'}" in plist and str(tmp_path / "data" / "refresh.log") in plist
     assert mac["commands"][1][:2] == ["launchctl", "bootstrap"]
-    monkeypatch.setattr(SCH.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+    _linux(monkeypatch, systemd=True)
     lin = SCH.plan(st, hour=6, minute=30, system="Linux", home=tmp_path / "home")
     assert lin["kind"] == "systemd" and {SCH.Path(p).name for p in lin["files"]} == {"convo-index.service", "convo-index.timer"}
     assert "OnCalendar=*-*-* 06:30:00" in "".join(lin["files"].values()) and "ExecStart=/opt/bin/convo-index index" in "".join(lin["files"].values())
-    monkeypatch.setattr(SCH.shutil, "which", lambda name: None)
+    _linux(monkeypatch, systemd=False)
     cron = SCH.plan(st, system="Linux", home=tmp_path / "home")
     assert cron["kind"] == "cron" and cron["crontab"].startswith("0 21 * * * ") and "refresh.log" in cron["crontab"]
     with pytest.raises(ValueError):
@@ -244,7 +251,7 @@ def test_systemd_and_cron_quoting_and_uninstall_reload(tmp_path, monkeypatch):
     monkeypatch.setattr(SCH, "command", lambda sub="index": ["/opt/my tools/convo-index", "index"])
     monkeypatch.setattr(SCH.os, "pathsep", ":")                 # the PATH below is POSIX-shaped, whatever the host
     monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin:/usr/local/bin:/bin")
-    monkeypatch.setattr(SCH.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+    _linux(monkeypatch, systemd=True)
     lin = SCH.plan(st, system="Linux", home=tmp_path / "home")
     service = [c for p, c in lin["files"].items() if p.endswith(".service")][0]
     assert 'ExecStart="/opt/my tools/convo-index" index' in service                        # systemd: double quotes only
@@ -254,7 +261,7 @@ def test_systemd_and_cron_quoting_and_uninstall_reload(tmp_path, monkeypatch):
     SCH.install(st, system="Linux", home=tmp_path / "home")
     SCH.uninstall(st, system="Linux", home=tmp_path / "home")
     assert ran[-1] == ["systemctl", "--user", "daemon-reload"] and ran[-2][:3] == ["systemctl", "--user", "disable"]
-    monkeypatch.setattr(SCH.shutil, "which", lambda name: None)
+    _linux(monkeypatch, systemd=False)
     cron = SCH.plan(st, system="Linux", home=tmp_path / "home")["crontab"]
     assert cron.startswith("0 21 * * * PATH=/usr/local/bin:/usr/bin:/bin ") and "'/opt/my tools/convo-index' index" in cron
 
@@ -322,10 +329,10 @@ def test_schedule_passes_env_through_and_refuses_a_missing_config(tmp_path, monk
     plist = next(iter(mac["files"].values()))
     assert "<key>CODEX_HOME</key>" in plist and str(Path("~/codex home").expanduser().resolve()) in plist
     assert "<key>CONVO_INDEX_DB</key>" in plist and str(tmp_path / "else" / "refresh.log") in plist   # log next to the effective db
-    monkeypatch.setattr(SCH.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+    _linux(monkeypatch, systemd=True)
     service = [c for p, c in SCH.plan(st, system="Linux", home=tmp_path / "home")["files"].items() if p.endswith(".service")][0]
     assert 'Environment="PATH=/usr/bin:/opt/100%%/bin"' in service                  # systemd: %% is a literal percent sign
-    monkeypatch.setattr(SCH.shutil, "which", lambda name: None)
+    _linux(monkeypatch, systemd=False)
     cron = SCH.plan(st, system="Linux", home=tmp_path / "home")["crontab"]
     assert "100\\%" in cron and "CODEX_HOME=" in cron
     st.path = tmp_path / "missing.toml"
@@ -374,13 +381,13 @@ def test_service_plans_the_ui_server_from_login(tmp_path, monkeypatch):
     assert "com.convo-index.serve" in plist and "<string>serve</string>" in plist
     assert "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>" in plist   # restart only after a crash
     assert "StartCalendarInterval" not in plist and mac["log"].endswith("serve.log") and mac["hour"] is None
-    monkeypatch.setattr(SCH.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+    _linux(monkeypatch, systemd=True)
     lin = SCH.plan(st, system="Linux", home=tmp_path / "home", job="serve")
     assert list(lin["files"]) == [str(tmp_path / "home" / ".config" / "systemd" / "user" / "convo-index-serve.service")]
     unit = next(iter(lin["files"].values()))
     assert "Restart=on-failure" in unit and "WantedBy=default.target" in unit and lin["commands"][-1][-1] == "convo-index-serve.service"
     assert SCH.uninstall(st, system="Linux", home=tmp_path / "home", dry_run=True, job="serve")["commands"][0][-1] == "convo-index-serve.service"
-    monkeypatch.setattr(SCH.shutil, "which", lambda name: None)
+    _linux(monkeypatch, systemd=False)
     cron = SCH.plan(st, system="Linux", home=tmp_path / "home", job="serve")["crontab"]
     assert cron.startswith("@reboot ") and "/opt/convo-index serve" in cron
     assert SCH.status(st, system="Darwin", home=tmp_path / "home", job="serve")["installed"] is False
@@ -453,3 +460,32 @@ def test_mcp_streams_are_utf8_whatever_the_console_code_page(tmp_path, monkeypat
     assert mcp.serve(stdin, stdout, st) == 0
     lines = [json.loads(l) for l in raw.getvalue().decode("utf-8").splitlines()]
     assert "\u65e5\u672c\u8a9e" in lines[0]["result"]["content"][0]["text"] and "error" not in lines[1]
+
+
+def test_linux_without_a_user_session_falls_back_and_says_why(tmp_path, monkeypatch, capsys):
+    """systemctl on PATH but no user manager (a container): cron when crontab exists, else
+    nothing to install into, with the command to run by hand."""
+    st = make_settings(tmp_path)
+    monkeypatch.setattr(SCH, "command", lambda sub="index": ["/opt/convo-index", sub])
+    ran = []
+    monkeypatch.setattr(SCH.subprocess, "run", lambda cmd, **k: ran.append(cmd) or type("R", (), {"returncode": 1, "stderr": ""})())
+    which = {"systemctl": "/usr/bin/systemctl", "crontab": "/usr/bin/crontab"}
+    monkeypatch.setattr(SCH.shutil, "which", lambda name: which.get(name))
+    cron = SCH.plan(st, system="Linux", home=tmp_path / "home")
+    assert ran == [["systemctl", "--user", "show-environment"]]                        # asked the user manager
+    assert cron["kind"] == "cron" and "no systemd user session" in cron["reason"] and not cron["files"]
+    del which["crontab"]
+    none = SCH.plan(st, system="Linux", home=tmp_path / "home", job="serve")
+    assert none["kind"] == "none" and none["reason"].endswith(", and there is no crontab") and not none["commands"]
+    assert none["manual"].startswith("nohup /opt/convo-index serve >> ") and none["manual"].endswith(" 2>&1 &")
+    out = SCH.install(st, system="Linux", home=tmp_path / "home", job="serve")
+    assert out["results"] == [] and not (tmp_path / "home" / ".config").exists()          # nothing written
+    monkeypatch.setattr(SCH, "_kind_and_reason", lambda system=None: ("none", "no scheduler here"))
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    assert cli.main(["service", "install"]) == 1
+    err = capsys.readouterr().err
+    assert "no scheduler here" in err and "nohup /opt/convo-index serve" in err
+    monkeypatch.setattr(SCH.subprocess, "run", lambda cmd, **k: (_ for _ in ()).throw(FileNotFoundError(cmd[0])))
+    assert SCH.systemd_user_available() is False                                         # a broken binary is no systemd
+    line = SCH.manual_line(["/opt/convo-index", "serve"], "/d/serve.log", "/my cfg.toml", background=True)
+    assert line == "CONVO_INDEX_CONFIG='/my cfg.toml' nohup /opt/convo-index serve >> /d/serve.log 2>&1 &"   # env before nohup

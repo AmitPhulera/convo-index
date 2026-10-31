@@ -1,6 +1,6 @@
 """Background jobs through the platform's own scheduler — a LaunchAgent on macOS, systemd
-user units on Linux, Task Scheduler tasks on Windows, or crontab lines to paste anywhere
-else (docs/design.md §5).
+user units on Linux, Task Scheduler tasks on Windows, crontab lines to paste anywhere else,
+or (no scheduler at all, e.g. a container) the command to run by hand (docs/design.md §5).
 
 Two jobs: `refresh` (`convo-index index` once a day: `schedule install|uninstall|status`)
 and `serve` (`convo-index serve` kept running from login: `service install|uninstall|status`).
@@ -225,13 +225,41 @@ def windows_task(launcher, hour, minute, description):
 """
 
 
+def systemd_user_available():
+    """True when a systemd user manager answers. The systemctl binary alone is not enough:
+    containers and some SSH logins have it but no user session (no $XDG_RUNTIME_DIR, no bus),
+    and every `systemctl --user` call then fails."""
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        r = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
 def _kind(system=None):
+    return _kind_and_reason(system)[0]
+
+
+def _kind_and_reason(system=None):
+    """The scheduler to use and, when it is not the platform's own, why (in plain words)."""
     system = system or platform.system()
     if system == "Darwin":
-        return "launchd"
+        return "launchd", ""
     if system == "Windows":
-        return "schtasks"
-    return "systemd" if system == "Linux" and shutil.which("systemctl") else "cron"
+        return "schtasks", ""
+    if system == "Linux" and systemd_user_available():
+        return "systemd", ""
+    if system == "Linux" and shutil.which("systemctl"):
+        why = "systemctl is installed but no systemd user session runs here (usual inside containers)"
+    elif system == "Linux":
+        why = "this machine has no systemd"
+    else:
+        why = f"no built-in scheduler support for {system}"
+    if shutil.which("crontab"):
+        return "cron", why
+    return "none", why + ", and there is no crontab"
 
 
 def _uid():
@@ -262,8 +290,9 @@ def plan(settings=None, hour=None, minute=None, system=None, home=None, job="ref
         config_path = Path(config_path).expanduser().resolve()   # launchd/cron run with cwd=/: relative paths would vanish
         if not config_path.exists():
             raise ValueError(f"config file {config_path} does not exist; the job would run on defaults")
-    kind = _kind(system)
-    out = {"kind": kind, "job": job, "hour": hour, "minute": minute, "argv": argv, "log": str(log), "files": {}, "commands": []}
+    kind, reason = _kind_and_reason(system)
+    out = {"kind": kind, "reason": reason, "job": job, "hour": hour, "minute": minute, "argv": argv, "log": str(log),
+           "files": {}, "commands": []}
     if kind == "launchd":
         path = home / "Library" / "LaunchAgents" / f"{spec['label']}.plist"
         out["files"][str(path)] = launchd_plist(argv, hour, minute, log, config_path, label=spec["label"])
@@ -287,9 +316,18 @@ def plan(settings=None, hour=None, minute=None, system=None, home=None, job="ref
         out["commands"] = [["schtasks", "/Create", "/F", "/TN", spec["task"], "/XML", str(xml)]]
         if job == "serve":
             out["commands"].append(["schtasks", "/Run", "/TN", spec["task"]])
-    else:
+    elif kind == "cron":
         out["crontab"] = crontab_line(argv, hour, minute, log, config_path)
+    # how to run it by hand: the only way with kind "none", the fallback when an install fails
+    out["manual"] = manual_line(argv, log, config_path, background=job == "serve")
     return out
+
+
+def manual_line(argv, log, config_path=None, background=False):
+    """The shell line that runs a job by hand, its output appended to the job's log."""
+    env = f"CONVO_INDEX_CONFIG={_sh(config_path)} " if config_path else ""   # before nohup: it runs a command, not a shell
+    run = f"{' '.join(_sh(a) for a in argv)} >> {_sh(str(log))} 2>&1"
+    return f"{env}nohup {run} &" if background else env + run
 
 
 def install(settings=None, hour=None, minute=None, dry_run=False, system=None, home=None, job="refresh"):

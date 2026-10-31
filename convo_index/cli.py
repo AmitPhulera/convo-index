@@ -431,6 +431,11 @@ def _job_cmd(args, job):
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 2
+    if out["kind"] == "none":
+        what = "keep the UI server running" if job == "serve" else "run the daily refresh"
+        print(f"nothing installed: {out['reason']}, so nothing here can {what}.\n"
+              f"run it yourself instead:\n  {out['manual']}", file=sys.stderr)
+        return 1
     if args.dry_run or out["kind"] == "cron":
         for path, content in out["files"].items():
             print(f"--- {path}\n{content}")
