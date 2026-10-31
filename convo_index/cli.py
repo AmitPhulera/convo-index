@@ -501,11 +501,20 @@ def _turn_token_of_running_server(server, settings, seconds=3):
         time.sleep(0.1)
 
 
-def _log_tail(path, lines=5):
+def _log_tail(path, lines=5, window=8192):
+    """The last few lines of a log, reading only its end (a long-lived log can be large)."""
     try:
-        return Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - window))
+            text = f.read().decode("utf-8", errors="replace")
     except OSError:
         return []
+    found = text.splitlines()
+    if size > window and found:
+        found = found[1:]                      # the first line was cut by the seek
+    return found[-lines:]
 
 
 def _attention(items):
