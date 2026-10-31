@@ -58,7 +58,10 @@ CORRECTION_RE = re.compile(
 # Credentials people paste into chats. Marked in the preview for the user to remove before the
 # prompt goes to another provider; never removed silently.
 SECRET_PATTERNS = [
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "private key"),
+    # the whole block: to its END line, or (cut short in a tool's output) over the key's own
+    # lines, which hold only base64 and PEM headers
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+                r"|(?:\n[A-Za-z0-9+/=:,. -]*)*)"), "private key"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key"),
     (re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b|\bgithub_pat_[A-Za-z0-9_]{40,}\b"), "GitHub token"),
     (re.compile(r"\bsk-(ant-|proj-)?[A-Za-z0-9_-]{20,}\b"), "API key"),

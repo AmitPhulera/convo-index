@@ -549,3 +549,14 @@ def test_cli_start_needs_hosted_processing_allowed(tmp_path, monkeypatch, capsys
     assert not (tmp_path / "handoffs").exists()                          # refused before anything is written
     assert cli.main(["handoff", "s1", "--review"]) == 0                  # printing the prompt is still fine
     assert capsys.readouterr().out.startswith("You are reviewing")
+
+
+def test_a_private_key_is_masked_whole_even_when_cut_short():
+    body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="
+    whole = f"before\n-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n{body}\n-----END RSA PRIVATE KEY-----\nafter"
+    text, n = H.mask_secrets(whole)
+    assert n == 1 and "MIIEvQ" not in text and "QUJDREVG" not in text and "END RSA" not in text
+    assert text.startswith("before\n[credential masked: private key]") and text.endswith("\nafter")
+    cut = f"-----BEGIN PRIVATE KEY-----\n{body}\n…[tool text truncated]"            # a tool's output cut mid-key
+    text, n = H.mask_secrets(cut)
+    assert n == 1 and "MIIEvQ" not in text and "QUJDREVG" not in text and "truncated" in text
