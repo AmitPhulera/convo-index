@@ -300,6 +300,9 @@ def cmd_handoff(args):
         print(f"cannot start a session in {args.start} here; choose one of: {', '.join(SB.new_session_targets()) or 'none'}",
               file=sys.stderr)
         return 1
+    if args.start and H.send_refusal(settings):
+        print(f"not starting: {H.send_refusal(settings)}", file=sys.stderr)
+        return 1
     conn = dbm.connect(settings.db_path())
     try:
         try:

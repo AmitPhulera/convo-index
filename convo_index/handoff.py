@@ -99,6 +99,19 @@ def refusal(settings, h):
     return None
 
 
+def send_refusal(settings):
+    """Why a new session may not be started, or None. Starting one sends the prompt and the
+    transcript to that tool's provider, so it needs the same consent as a hosted summary:
+    `[privacy].hosted_processing = allow`. Printing the prompt needs none; pasting it is the
+    user's own act."""
+    state = R.policy_state(settings)
+    if state == "allow":
+        return None
+    return (f"[privacy].hosted_processing = {state}: starting a session sends this conversation to that tool's "
+            "provider" + ("; run `convo-index init` to decide" if state == "ask" else "")
+            + ". Without --start the prompt is printed for you to paste.")
+
+
 def harness_label(m):
     if m.get("role") != "user" or (m.get("kind") or KIND_TEXT) != KIND_TEXT:
         return None

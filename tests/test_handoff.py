@@ -445,7 +445,8 @@ def _start_env(tmp_path, monkeypatch, msgs=None, lines=None):
     from convo_index.sources import base as SB
     from tests.conftest import make_settings
     from tests.test_turns import command
-    st = make_settings(tmp_path, handoff={"models": {"opencode": "opencode-go/deepseek-v4.1-flash"}})
+    st = make_settings(tmp_path, handoff={"models": {"opencode": "opencode-go/deepseek-v4.1-flash"}},
+                       privacy={"hosted_processing": "allow"})
     monkeypatch.setattr(S, "load", lambda *a, **k: st)
     _db(tmp_path, msgs, cwd=str(tmp_path)).close()
     sent = {}
@@ -533,3 +534,17 @@ def test_mask_secrets_replaces_every_match_and_counts_them():
     assert n == 3 and "AKIA" not in text and "ghp_" not in text and "hunter2" not in text
     assert text.startswith("a [credential masked: AWS access key] b [credential masked: GitHub token] c ")
     assert H.mask_secrets("nothing here") == ("nothing here", 0) and H.find_secrets(text) == []
+
+
+@pytest.mark.parametrize("state", ["deny", "ask"])
+def test_cli_start_needs_hosted_processing_allowed(tmp_path, monkeypatch, capsys, state):
+    cli, sent = _start_env(tmp_path, monkeypatch)
+    from convo_index import settings as S
+    S.load()["privacy"]["hosted_processing"] = state
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 1
+    err = capsys.readouterr().err
+    assert f"not starting: [privacy].hosted_processing = {state}" in err and not sent
+    assert ("convo-index init" in err) == (state == "ask")
+    assert not (tmp_path / "handoffs").exists()                          # refused before anything is written
+    assert cli.main(["handoff", "s1", "--review"]) == 0                  # printing the prompt is still fine
+    assert capsys.readouterr().out.startswith("You are reviewing")
