@@ -31,7 +31,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -602,6 +602,13 @@ def recent_model():
     return None
 
 
+# A handoff prompt is a whole conversation: as `run`'s message argument it would exceed Linux's
+# 128 KiB per-argument limit and sit in the process list. It goes in an owner-only file attached
+# with `-f` (opencode reads it itself; verified on 2.2.4 from a directory no rule opens), and
+# the argument is one line.
+ATTACHED_PROMPT = "Follow the instructions in the attached file."
+
+
 def new_session_command(prompt, cwd, *, edits=False, mcp_tools=(), read_dirs=(), model=None):
     """(TurnCommand, None) for a new session seeded with `prompt` (the id comes from the stream,
     see session_id), or (None, None). Raises ValueError when no model can be named."""
@@ -611,7 +618,13 @@ def new_session_command(prompt, cwd, *, edits=False, mcp_tools=(), read_dirs=(),
     if not model:
         raise ValueError("no model for a new opencode session: pass --model provider/model "
                          "(opencode's recent-models list is empty)")
-    return _command(["-m", model], prompt, cwd, edits=edits, read_dirs=read_dirs), None
+    scratch = tempfile.mkdtemp(prefix="convo-index-handoff-")      # the runner removes it when the turn ends
+    path = os.path.join(scratch, "prompt.md")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(prompt)
+    cmd = _command(["-m", model, "-f", path], ATTACHED_PROMPT, cwd, edits=edits, read_dirs=read_dirs)
+    return replace(cmd, scratch=cmd.scratch + (scratch,)), None
 
 
 def session_id(line):

@@ -250,11 +250,15 @@ def test_opencode_edit_turn_allows_edit_and_bash(opencode_on_path):
 def test_opencode_new_session_names_a_model_and_opens_only_the_read_dirs(opencode_on_path, monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     cmd, sid = oc.new_session_command("take over", "/proj", read_dirs=["/data/handoffs/x"], model="opencode-go/m1")
+    attached = cmd.argv[cmd.argv.index("-f") + 1]
     assert sid is None and cmd.argv == ["/opt/bin/opencode", "run", "--standalone", "--format", "json",
-                                        "-m", "opencode-go/m1", "--agent", "plan", "take over"]
+                                        "-m", "opencode-go/m1", "-f", attached, "--agent", "plan", oc.ATTACHED_PROMPT]
+    assert open(attached).read() == "take over" and os.path.dirname(attached) in cmd.scratch   # removed with the turn
+    if os.name != "nt":
+        assert os.stat(attached).st_mode & 0o777 == 0o600
     rules = json.loads(cmd.env["OPENCODE_CONFIG_CONTENT"])["permissions"]
     assert rules[0]["effect"] == "deny" and rules[-1] == {"action": "external_directory", "resource": "/data/handoffs/x/*", "effect": "allow"}
-    assert "--session" not in cmd.argv and cmd.scratch == (cmd.env["XDG_CONFIG_HOME"],)
+    assert "--session" not in cmd.argv and cmd.scratch == (cmd.env["XDG_CONFIG_HOME"], os.path.dirname(attached))
     with pytest.raises(ValueError, match="pass --model"):
         oc.new_session_command("x", "/proj")                         # no recent models yet
     (tmp_path / "state" / "opencode").mkdir(parents=True)
@@ -688,3 +692,10 @@ def test_new_sessions_dispatch_by_source(opencode_on_path, monkeypatch):
     assert base.session_id("codex", "{}") is None
     monkeypatch.setattr(base, "is_windows", lambda: True)
     assert base.new_session_targets() == ["claude_code"]                           # opencode turns are POSIX only
+
+
+def test_a_long_opencode_handoff_prompt_stays_off_the_command_line(opencode_on_path):
+    big = "x" * 300_000 + "😀" * 100_000                                       # well past Linux's 128 KiB per argument
+    cmd, _ = oc.new_session_command(big, "/proj", model="p/m")
+    assert max(len(a.encode()) for a in cmd.argv) < 1000 and big not in cmd.argv
+    assert open(cmd.argv[cmd.argv.index("-f") + 1], encoding="utf-8").read() == big
