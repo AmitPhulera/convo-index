@@ -548,6 +548,12 @@ def test_codex_refuses_names_other_threads_and_missing_rollouts(codex_on_path, r
             base.turn_command(f"codex:{tid}", "x", "/proj", locator=locator)
 
 
+def test_codex_malformed_records_in_the_rollout_are_skipped(codex_on_path, rollout):
+    with open(rollout, "a") as fh:
+        fh.write('["turn_context"]\n3\nnot json\n')
+    assert base.turn_command(f"codex:{CODEX_TID}", "x", "/proj", locator=rollout).argv[-3:] == ["resume", CODEX_TID, "-"]
+
+
 def test_codex_recorded_names_that_could_be_options_are_not_passed(codex_on_path, tmp_path):
     f = write_rollout(tmp_path, provider="--danger", models=("-m",))
     cmd = base.turn_command(f"codex:{CODEX_TID}", "x", "/proj", locator=f)

@@ -447,7 +447,9 @@ def thread_settings(native_id, locator):
                     d = json.loads(raw)
                 except ValueError:
                     continue
-                p = d.get("payload") if isinstance(d, dict) and isinstance(d.get("payload"), dict) else {}
+                if not isinstance(d, dict):
+                    continue                   # a malformed record, which the indexer skips too
+                p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
                 if d.get("type") == "session_meta" and meta_id is None:
                     meta_id, provider = p.get("id"), p.get("model_provider")
                 elif d.get("type") == "turn_context" and isinstance(p.get("model"), str):
