@@ -494,3 +494,16 @@ def test_a_long_prompt_reaches_the_cli_on_linux_too(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
     r = cli.ClaudeCLI().complete(LLMRequest(prompt="x" * 200_000, model="m"))
     assert r.ok and r.data == "got 200000 chars"
+
+
+def test_agy_refuses_a_prompt_its_command_line_cannot_carry(monkeypatch, llm_settings):
+    monkeypatch.setattr(cli.GeminiCLI, "available", classmethod(lambda cls: True))
+    calls = _fake_run(monkeypatch, lambda cmd: _Res(0, json.dumps({"status": "SUCCESS", "response": "ok"})))
+    limit = cli.GeminiCLI.max_prompt_bytes()
+    assert cli.GeminiCLI().complete(LLMRequest(prompt="x" * limit, model="m")).ok
+    r = cli.GeminiCLI().complete(LLMRequest(prompt="é" * (limit // 2 + 1), model="m"))    # 2 bytes each
+    assert not r.ok and r.error == "config" and "does not fit agy's command line" in r.detail and len(calls) == 1
+    llm_settings["llm"]["summary"] = {"backend": "gemini_cli", "model": "m"}
+    assert R.max_prompt_bytes("summary", llm_settings) == limit
+    llm_settings["llm"]["summary"] = {"backend": "claude_cli", "model": "m"}
+    assert R.max_prompt_bytes("summary", llm_settings) is None                          # stdin: no argv limit

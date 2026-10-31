@@ -18,7 +18,7 @@ Envelopes verified on 2026-09-16:
 The prompt goes to Claude Code and Codex on stdin: as an argument it would hit the operating
 system's limit (128 KiB per argument on Linux, 32,767 characters for the whole command line on
 Windows) long before the model's. agy takes it only as an argument (`--print=` reads no stdin),
-so its prompt is bounded by `ARGV_PROMPT_CHARS` (see max_prompt_chars).
+so its prompt is bounded by `GeminiCLI.max_prompt_bytes()`.
 
 The prompt is untrusted text (a transcript), so every call runs with the agent's tools,
 MCP servers and slash commands disabled and from the temp dir, where no project settings or
@@ -124,6 +124,13 @@ class GeminiCLI:
     name = "gemini_cli"
     binary = "agy"
 
+    @staticmethod
+    def max_prompt_bytes():
+        """What `--print=<prompt>` can carry, in UTF-8 bytes (never fewer than the units the OS
+        counts): Linux caps one argument at 128 KiB, Windows the whole command line at 32,767
+        characters, which the model, schema and flags share."""
+        return 28_000 if os.name == "nt" else 120_000
+
     @classmethod
     def available(cls):
         return shutil.which(cls.binary) is not None
@@ -135,6 +142,11 @@ class GeminiCLI:
                "--output-format", "json", "--print-timeout", f"{int(req.timeout)}s"]
         if req.schema is not None:
             cmd += ["--json-schema", json.dumps(req.schema)]
+        size = len((req.marker + req.prompt).encode("utf-8", "surrogatepass"))
+        if size > self.max_prompt_bytes():
+            return LLMResult(ok=False, error="config", backend=self.name,
+                             detail=f"a {size:,}-byte prompt does not fit agy's command line "
+                                    f"(at most {self.max_prompt_bytes():,}; agy reads no prompt from stdin)")
         cmd.append("--print=" + req.marker + req.prompt)
         try:
             res = _run(cmd, req.timeout + 10)
