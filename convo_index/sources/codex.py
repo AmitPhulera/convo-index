@@ -451,7 +451,7 @@ def thread_settings(native_id, locator):
                     continue                   # a malformed record, which the indexer skips too
                 p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
                 if d.get("type") == "session_meta" and meta_id is None:
-                    meta_id, provider = p.get("id"), p.get("model_provider")
+                    meta_id, provider = p.get("id") or p.get("session_id"), p.get("model_provider")   # 0.154 has only session_id
                 elif d.get("type") == "turn_context" and isinstance(p.get("model"), str):
                     model = p["model"]
     except OSError:

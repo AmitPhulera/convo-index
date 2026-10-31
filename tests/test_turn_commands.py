@@ -548,6 +548,14 @@ def test_codex_refuses_names_other_threads_and_missing_rollouts(codex_on_path, r
             base.turn_command(f"codex:{tid}", "x", "/proj", locator=locator)
 
 
+def test_codex_rollout_of_a_release_that_wrote_only_session_id(codex_on_path, tmp_path):
+    from tests.test_codex import TID, default_rollout
+    f = tmp_path / f"rollout-{TID}.jsonl"
+    f.write_text("\n".join(default_rollout("hello")) + "\n")
+    cmd = base.turn_command(f"codex:{TID}", "x", "/proj", locator=str(f))
+    assert cmd.argv[-3:] == ["resume", TID, "-"]
+
+
 def test_codex_malformed_records_in_the_rollout_are_skipped(codex_on_path, rollout):
     with open(rollout, "a") as fh:
         fh.write('["turn_context"]\n3\nnot json\n')
