@@ -250,8 +250,9 @@ function snippetHTML(s) {
 
 // Messages may embed Claude Code markup: slash-command invocations
 // (<command-name>/x</command-name> + args), local-command output, and caveats.
-// Render commands as a compact badge and command output as a labeled block.
-function renderMessageBody(text) {
+// Render commands as a compact badge and command output as a labeled block. `blocks` renders
+// tables, lists and quotes (markdown.js); tool calls and results pass false.
+function renderMessageBody(text, blocks = true) {
   let t = (text || "").replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/g, "");
 
   let badge = "";
@@ -264,25 +265,25 @@ function renderMessageBody(text) {
     t = t.replace(/<command-(name|message|args)>[\s\S]*?<\/command-\1>/g, "");
   }
 
-  const body = formatWithOutputs(t).trim();
+  const body = formatWithOutputs(t, blocks).trim();
   if (badge && body) return `${badge}<div class="cmd-rest">${body}</div>`;
   return badge || body;
 }
 
 // Render <local-command-stdout>/<local-command-stderr> blocks as labeled output
 // panels; format the surrounding text normally.
-function formatWithOutputs(text) {
+function formatWithOutputs(text, blocks) {
   const re = /<local-command-(stdout|stderr)>([\s\S]*?)<\/local-command-\1>/g;
   let out = "", last = 0, m;
   while ((m = re.exec(text))) {
-    out += formatBody(text.slice(last, m.index));
+    out += formatBody(text.slice(last, m.index), blocks);
     const content = m[2].replace(/^\n+|\n+$/g, "");
     out += content
       ? `<div class="cmd-output"><span class="out-tag">${m[1]}</span><pre>${escape(content)}</pre></div>`
       : `<span class="cmd-badge">${m[1]} (empty)</span>`;
     last = m.index + m[0].length;
   }
-  out += formatBody(text.slice(last));
+  out += formatBody(text.slice(last), blocks);
   return out;
 }
 
@@ -348,7 +349,8 @@ function messageHTML(m, prevDate, step) {
   const time = date && date !== prevDate ? `${date} ${clock}` : clock;
   const kind = m.kind || "text";
   const harness = harnessLabel(m);
-  const folded = (cls, open) => `<details${cls ? ` class="${cls}"` : ""}${open ? " open" : ""}><summary>${escape(firstLine(m.text).slice(0, 140))}</summary>${renderMessageBody(m.text)}</details>`;
+  const prose = !harness && kind !== "tool_call" && kind !== "tool_result";   // tool output keeps its `- ` and `|` lines
+  const folded = (cls, open) => `<details${cls ? ` class="${cls}"` : ""}${open ? " open" : ""}><summary>${escape(firstLine(m.text).slice(0, 140))}</summary>${renderMessageBody(m.text, prose)}</details>`;
   let body;
   if (harness || kind === "tool_call" || kind === "tool_result" || kind === "thinking") body = folded("", false);
   else if (step) body = folded("step-text", !document.body.classList.contains("hide-steps"));
