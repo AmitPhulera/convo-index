@@ -414,6 +414,18 @@ def test_harness_done_and_error_events_feed_the_terminal_event():
     assert last["kind"] == "error" and last["message"] == "no credits" and last["exit_code"] == 0
 
 
+def test_a_done_after_an_error_is_the_harness_recovering():
+    # pi reports a failed request, retries it and then succeeds: the last verdict is the outcome
+    r = turns.TurnRunner(refresh=ok_refresh)
+    t = r.start("claude_code:s1", command([{"line": '{"kind": "error", "message": "503 overloaded"}'},
+                                           {"line": '{"kind": "done", "cost_usd": 0.1}'}]), translate)
+    assert drain(r, t)[-1]["kind"] == "done"
+    t = r.start("claude_code:s2", command([{"line": '{"kind": "done", "cost_usd": 0.1}'},
+                                           {"line": '{"kind": "error", "message": "truncated"}'}]), translate)
+    last = drain(r, t)[-1]
+    assert last["kind"] == "error" and last["message"] == "truncated"
+
+
 def test_replay_from_an_offset_and_the_bounded_buffer(monkeypatch):
     monkeypatch.setattr(turns, "EVENT_LIMIT", 5)
     r = turns.TurnRunner()
