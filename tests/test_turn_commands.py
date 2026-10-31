@@ -672,3 +672,19 @@ def test_codex_last_activity_is_the_rollout_mtime(rollout, tmp_path):
     os.utime(rollout, (then, then))
     assert abs(base.last_activity(f"codex:{CODEX_TID}", rollout) - then) < 2
     assert base.last_activity(f"codex:{CODEX_TID}", str(tmp_path / "gone.jsonl")) is None
+
+
+def test_new_sessions_dispatch_by_source(opencode_on_path, monkeypatch):
+    bins = {"claude": "/opt/bin/claude", "opencode": "/opt/bin/opencode", "pi": "/opt/bin/pi"}
+    monkeypatch.setattr(base.shutil, "which", bins.get)   # one shutil module behind every adapter
+    assert base.new_session_targets() == ["claude_code", "opencode"]     # pi resumes, but cannot start one yet
+    cmd, sid = base.new_session_command("claude_code", "go", "/proj", read_dirs=["/d"])
+    assert cmd.argv[1:3] == ["--session-id", sid]
+    cmd, sid = base.new_session_command("opencode", "go", "/proj", model="p/m")
+    assert sid is None and "-m" in cmd.argv
+    assert base.new_session_command("codex", "go", "/proj") == (None, None)
+    assert base.session_id("opencode", '{"sessionID": "ses_1"}') == "ses_1"
+    assert base.session_id("opencode", '{"sessionID": "../../etc"}') is None      # never a path or an option
+    assert base.session_id("codex", "{}") is None
+    monkeypatch.setattr(base, "is_windows", lambda: True)
+    assert base.new_session_targets() == ["claude_code"]                           # opencode turns are POSIX only
