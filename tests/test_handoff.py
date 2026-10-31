@@ -253,3 +253,40 @@ def test_a_relative_transcript_dir_gives_an_absolute_pointer(tmp_path, monkeypat
     monkeypatch.chdir(tmp_path)
     path = H.write_transcript(conn, "claude_code:s1", "rel")
     assert path.is_absolute() and path == (tmp_path / "rel" / "transcript.md").resolve()
+
+
+def test_copies_go_with_their_conversation_and_expire(tmp_path, monkeypatch):
+    from convo_index import server
+    db = tmp_path / "t.db"
+    monkeypatch.setattr(server, "_db", lambda: db)
+    _db(tmp_path).close()
+    root = tmp_path / "handoffs"
+    mine, neighbour = root / "claude_code-s1-20261031-120000", root / "claude_code-s1-b-20261031-120000"
+    for d in (mine, neighbour):
+        d.mkdir(parents=True)
+        (d / "transcript.md").write_text("plaintext")
+    server.handle_delete("claude_code:s1")
+    assert not mine.exists() and neighbour.exists()             # `s1` does not take `s1-b`'s copies
+    t = 1_700_000_000
+    os.utime(neighbour / "transcript.md", (t, t))
+    fresh = H.copy_dir(db, "claude_code:s2")
+    fresh.mkdir()
+    (fresh / "transcript.md").write_text("x")
+    (root / "not-a-copy").mkdir()
+    H.prune_copies(db, now=t + 31 * 86400)
+    assert not neighbour.exists() and fresh.exists() and (root / "not-a-copy").exists()
+
+
+def test_cli_prunes_old_copies(tmp_path, monkeypatch, capsys):
+    from convo_index import cli
+    from convo_index import settings as S
+    from tests.conftest import make_settings
+    st = make_settings(tmp_path)
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    _db(tmp_path).close()
+    old = tmp_path / "handoffs" / "claude_code-other-20260101-000000"
+    old.mkdir(parents=True)
+    (old / "transcript.md").write_text("x")
+    os.utime(old / "transcript.md", (1_700_000_000, 1_700_000_000))
+    assert cli.main(["handoff", "s1", "--review"]) == 0
+    assert not old.exists() and len(list((tmp_path / "handoffs").iterdir())) == 1

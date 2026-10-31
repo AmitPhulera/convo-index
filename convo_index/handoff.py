@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from convo_index import export as X
@@ -162,6 +164,48 @@ def repo_state(cwd, max_lines=40):
             "status": cap(_git(cwd, "status", "--short")),
             "diff_stat": cap(_git(cwd, "diff", "--stat", "HEAD")),
             "log": cap(_git(cwd, "log", "--oneline", "-10"))}
+
+
+# Each handoff's transcript copy lives in handoffs/<id>-<stamp>/ next to the database. They are
+# plaintext copies like the archive's, so they go when their conversation is deleted and
+# expire after COPY_DAYS.
+COPY_DAYS = 30
+_COPY_STAMP = r"\d{8}-\d{6}"
+
+
+def _copy_name(cid):
+    return cid.replace(":", "-")
+
+
+def copy_dir(db_path, cid):
+    """A new directory for one handoff's transcript copy."""
+    return Path(db_path).parent / "handoffs" / f"{_copy_name(cid)}-{time.strftime('%Y%m%d-%H%M%S')}"
+
+
+def _copies(db_path):
+    root = Path(db_path).parent / "handoffs"
+    return [p for p in root.iterdir() if p.is_dir() and re.search(f"-{_COPY_STAMP}$", p.name)] if root.is_dir() else []
+
+
+def remove_copies(db_path, cid):
+    """Delete every transcript copy of `cid` (the whole name is matched: `a` must not take
+    `a-b`'s copies). Raises OSError when one cannot be removed."""
+    rx = re.compile(re.escape(_copy_name(cid)) + f"-{_COPY_STAMP}")
+    for p in _copies(db_path):
+        if rx.fullmatch(p.name):
+            shutil.rmtree(p)
+
+
+def prune_copies(db_path, days=COPY_DAYS, now=None):
+    """Delete copies not touched for `days`. Best effort: a copy that cannot go stays for the
+    next run."""
+    cutoff = (now or time.time()) - days * 86400
+    for p in _copies(db_path):
+        try:
+            if max((f.stat().st_mtime for f in p.iterdir()), default=p.stat().st_mtime) < cutoff:
+                shutil.rmtree(p)
+        except OSError:
+            pass
 
 
 def write_transcript(conn, cid, directory, settings=None):

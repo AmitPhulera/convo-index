@@ -287,7 +287,6 @@ def cmd_handoff(args):
     """Print the prompt that seeds a new session in another harness: paste it there. What the
     preview would show beside it (known problems, credential-looking strings, size) goes to
     stderr, so stdout is only the prompt."""
-    import time
     from convo_index import settings as S
     from convo_index import db as dbm
     from convo_index import export as X
@@ -316,8 +315,8 @@ def cmd_handoff(args):
             else:
                 print("writing the handoff note with the summary backend…", file=sys.stderr)
                 d, status = H.digest(X.messages(conn, cid), h["title"] or "", settings)
-        where = Path(args.transcript_dir).expanduser() if args.transcript_dir else \
-            settings.db_path().parent / "handoffs" / f"{cid.replace(':', '-')}-{time.strftime('%Y%m%d-%H%M%S')}"
+        H.prune_copies(settings.db_path())
+        where = Path(args.transcript_dir).expanduser() if args.transcript_dir else H.copy_dir(settings.db_path(), cid)
         transcript = H.write_transcript(conn, cid, where, settings)
         out = H.build(conn, cid, kind, digest_result=d, digest_status=status, transcript_path=transcript,
                       repo=H.repo_state(h["cwd"]))
