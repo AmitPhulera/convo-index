@@ -157,8 +157,8 @@ and Opencode stay in force). Anything the tool would normally ask about is denie
 - **Read-only** (the default): `Read`/`Glob`/`Grep` for Claude Code, the `plan` agent for
   Opencode, `read`/`grep`/`find`/`ls` for pi. No shell and no MCP servers.
 - **Edit** (`"edits": true`): adds the file-editing tools, confined to the conversation's
-  directory (Claude Code by `--restricted`, Opencode by its `external_directory` permission
-  staying denied), **the shell**, and for Claude Code **the MCP tools on your allowlist**.
+  directory for Claude Code (by `--restricted`) and Opencode (by its `external_directory`
+  permission staying denied) but not for pi (below), **the shell**, and for Claude Code **the MCP tools on your allowlist**.
   None of these ask before running: a shell command from the browser can do whatever your
   user account can, and an allowlisted MCP tool can act on the service behind it (send,
   post, create). The allowlist is edited with the Tools button in the message box and kept
