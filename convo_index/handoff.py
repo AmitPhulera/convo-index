@@ -5,7 +5,7 @@ a brief with an LLM digest of the assistant side; `review` (a second opinion) ge
 conversation's own words and no digest, so the reviewer is not anchored on the original
 agent's framing. Both carry facts gathered without an LLM (where, when, repo state, known
 problems), every user message verbatim, and a pointer to the full transcript on disk. Nothing
-here runs a harness: the server shows the prompt for the user to edit and send.
+here runs a harness: `convo-index handoff` prints the prompt for the user to paste.
 """
 from __future__ import annotations
 
