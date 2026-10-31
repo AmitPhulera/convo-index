@@ -1314,6 +1314,7 @@ async function startHandoff(c) {
 async function followHandoff(c, turnId, target, kind) {
   const h = { turnId, controller: new AbortController(), seen: 0, text: "", bubble: null, newId: null, finished: false, target, kind };
   handoffStream = h;
+  $("handoff-live").innerHTML = "";            // an earlier run's output, or this one's before a replay
   $("handoff-preview").hidden = true;
   $("handoff-start").hidden = true;
   $("handoff-prepare").disabled = true;
