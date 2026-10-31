@@ -491,3 +491,20 @@ def test_cli_start_reports_a_failed_session_and_an_unknown_target(tmp_path, monk
     assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 0
     err = capsys.readouterr().err
     assert "new conversation" not in err and dbm.links_for(dbm.connect(tmp_path / "t.db"), "claude_code:s1") == []
+
+
+def test_start_session_brings_an_older_database_up_to_the_link_table(tmp_path, monkeypatch):
+    from convo_index import turns
+    from convo_index.sources import base as SB
+    from tests.test_turns import command, drain
+    _db(tmp_path).close()
+    conn = dbm.connect(tmp_path / "t.db")
+    conn.execute("DROP TABLE conversation_links")                       # as a database made before v8
+    conn.execute("DELETE FROM schema_migrations WHERE version = 8")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(SB, "new_session_command", lambda *a, **k: (command([{"line": json.dumps({"sessionID": "ses_9"})}]), None))
+    runner = turns.TurnRunner()
+    turn, state = H.start_session(runner, tmp_path / "t.db", "claude_code:s1", "opencode", "p", str(tmp_path), kind="review")
+    assert drain(runner, turn)[-1]["kind"] == "done"
+    assert dbm.links_for(dbm.connect(tmp_path / "t.db"), "claude_code:s1")[0]["id"] == "opencode:ses_9"

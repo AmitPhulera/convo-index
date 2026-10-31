@@ -525,6 +525,11 @@ def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=
                                     read_dirs=tuple(read_dirs), model=model)
     if cmd is None:
         raise LookupError(f"{target} cannot start a session here: not installed, or no headless mode on this platform")
+    conn = dbm.connect(db_path)
+    try:
+        dbm.init_schema(conn, db_path)      # the link table, on a database no newer command has opened yet
+    finally:
+        conn.close()
     state = {"id": None}
     probe = f"{target}:x"            # turn_events picks the adapter from the source part only
 
