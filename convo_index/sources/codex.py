@@ -28,6 +28,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,7 +36,8 @@ from pathlib import Path
 from convo_index.config import CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX
 from convo_index.model import (Conversation, Message, ToolCall, UsageRecord, KIND_TEXT, KIND_THINKING,
                                KIND_TOOL_CALL, KIND_TOOL_RESULT, FIDELITY_FULL, FIDELITY_PARTIAL, split_id)
-from convo_index.sources.base import SourceRef, UnreadableSource, shell_quote
+from convo_index.sources import base as sources
+from convo_index.sources.base import SourceRef, TurnCommand, UnreadableSource, shell_quote
 
 SOURCE = "codex"
 PARSER_VERSION = 2       # part of the change key: bump when parsing changes so indexed threads re-ingest once
@@ -382,3 +384,162 @@ class CodexAdapter:
 def resume_command(conversation_id, cwd):
     _, native = split_id(conversation_id)
     return f"codex resume {shell_quote(native)}"
+
+
+# --- Browser turns (sources.base turn protocol) ----------------------------------------------
+#
+# `codex exec resume <id> -` runs one more turn of a thread and appends it to the same rollout,
+# so `codex resume <id>` in a terminal afterwards sees it. Codex runs model-generated shell
+# commands in its own sandbox: Read-only (`-s read-only`) can read but not write, Edit
+# (`-s workspace-write`) can write in the project and the temporary directories; neither has
+# network access. `approval_policy = "never"` means anything that would ask (an MCP tool, a
+# command outside the sandbox) fails and the model is told so.
+#
+# Verified on 0.166.0. `--ignore-user-config` drops config.toml (MCP servers, profiles, the
+# `notify` program, trusted projects), but several surfaces load without it: ChatGPT apps (an
+# MCP server whose read tools run without asking), plugins, skills (the project's
+# `.agents/skills` too), the project's AGENTS.md, multi-agent tools and web search. Each is
+# switched off below; with these flags a fresh thread's context holds only the permissions
+# note, the environment and the user's own `$CODEX_HOME/AGENTS.md`. Unknown feature names and
+# unknown `-c` keys are refused (`--strict-config`), so an upgrade that renames one fails the
+# turn rather than reopening the surface.
+#
+# A resumed thread keeps neither its model nor its provider (with the user's config ignored,
+# Codex falls back to its defaults and refuses a thread recorded with another provider), so
+# both are read from the rollout and passed back.
+
+TURNS_ON_WINDOWS = False      # Codex's Windows sandbox is not verified; turns are not offered there
+CLOSED_FEATURES = ["apps", "plugins", "remote_plugin", "hooks", "computer_use", "browser_use", "browser_use_external",
+                   "in_app_browser", "image_generation", "multi_agent", "tool_suggest", "skill_mcp_dependency_install",
+                   "memories", "goals"]
+TURN_FLAGS = (["exec", "--json",
+               "--strict-config",          # an unknown -c key or feature name is an error, not ignored
+               "--ignore-user-config",     # no config.toml: MCP servers, profiles, notify, project trust
+               "--ignore-rules",           # no user or project execpolicy .rules
+               "--skip-git-repo-check"]    # the conversation's directory need not be a repository
+              + [a for f in CLOSED_FEATURES for a in ("--disable", f)]
+              + ["-c", "project_doc_max_bytes=0",          # no project AGENTS.md
+                 "-c", "skills.include_instructions=false",  # no skill catalog (user or project)
+                 "-c", 'web_search="disabled"',
+                 "-c", 'approval_policy="never"'])         # anything that would ask is refused
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*")    # a model or provider name, never an option
+TURN_TEXT_LIMIT = 400
+
+
+def launcher():
+    """argv prefix that starts Codex without a shell in between, or None when it is not installed."""
+    return None if sources.is_windows() else sources.npm_launcher("codex")
+
+
+def thread_settings(native_id, locator):
+    """(model_provider, model) recorded in the rollout: the provider from `session_meta`, the
+    model from the last `turn_context`. Raises ValueError when the file is gone or its
+    `session_meta` names another thread."""
+    provider = model = None
+    meta_id = None
+    try:
+        with open(locator, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                if '"session_meta"' not in raw and '"turn_context"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                p = d.get("payload") if isinstance(d, dict) and isinstance(d.get("payload"), dict) else {}
+                if d.get("type") == "session_meta" and meta_id is None:
+                    meta_id, provider = p.get("id"), p.get("model_provider")
+                elif d.get("type") == "turn_context" and isinstance(p.get("model"), str):
+                    model = p["model"]
+    except OSError:
+        meta_id = None
+    if meta_id != native_id:
+        raise ValueError("the Codex rollout is gone or no longer holds this thread; refresh the index")
+    ok = lambda v: v if isinstance(v, str) and MODEL_RE.fullmatch(v) else None   # noqa: E731
+    return ok(provider), ok(model)
+
+
+def turn_command(native_id, prompt, cwd, *, edits=False, mcp_tools=(), locator=None):
+    """`mcp_tools` is ignored: MCP servers live in the config file a turn does not load. Raises
+    ValueError for an id that is not a UUID (`resume` would look a name up) or a rollout that
+    does not hold this thread."""
+    prefix = launcher()
+    if prefix is None:
+        return None
+    if not UUID_RE.fullmatch(native_id) or not locator or not os.path.isabs(locator):
+        raise ValueError("the Codex rollout is gone or no longer holds this thread; refresh the index")
+    provider, model = thread_settings(native_id, locator)
+    argv = prefix + TURN_FLAGS
+    if provider:
+        argv += ["-c", f'model_provider="{provider}"']
+    if model:
+        argv += ["-m", model]
+    argv += ["-s", "workspace-write" if edits else "read-only", "-C", cwd, "resume", native_id, "-"]
+    return TurnCommand(argv=argv, cwd=cwd, stdin=prompt)
+
+
+def _turn_clip(value, limit=TURN_TEXT_LIMIT):
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _item_events(item, started):
+    """Events for one `item.started` / `item.completed` of `codex exec --json`."""
+    t = item.get("type")
+    if t == "agent_message" and not started and isinstance(item.get("text"), str) and item["text"]:
+        return [{"kind": "text", "text": item["text"]}]
+    if t == "command_execution":
+        if started:
+            return [{"kind": "tool", "name": "shell", "input": _turn_clip(item.get("command") or "")}]
+        failed = item.get("status") != "completed" or item.get("exit_code") not in (0, None)
+        out = item.get("aggregated_output") or ""
+        if failed and item.get("exit_code") is not None:
+            out = f"exit {item['exit_code']}\n{out}"
+        return [{"kind": "tool_result", "text": _turn_clip(out), "error": failed}]
+    if t == "mcp_tool_call":
+        name = f"{item.get('server')}.{item.get('tool')}"
+        if started:
+            return [{"kind": "tool", "name": name, "input": _turn_clip(item.get("arguments") or {})}]
+        err = item.get("error") if isinstance(item.get("error"), dict) else None
+        if err or item.get("status") == "failed":
+            return [{"kind": "tool_result", "text": _turn_clip((err or {}).get("message") or "failed"), "error": True}]
+        return [{"kind": "tool_result", "text": _turn_clip(item.get("result") or ""), "error": False}]
+    if t == "file_change" and not started:
+        changes = [c for c in item.get("changes") or [] if isinstance(c, dict)]
+        listing = "\n".join(f"{c.get('kind')} {c.get('path')}" for c in changes)
+        return [{"kind": "tool", "name": "edit", "input": _turn_clip(listing)},
+                {"kind": "tool_result", "text": item.get("status") or "", "error": item.get("status") != "completed"}]
+    if t == "web_search" and not started:
+        return [{"kind": "tool", "name": "web_search", "input": _turn_clip(item.get("query") or "")}]
+    return []                    # reasoning, todo lists, and non-fatal `error` items (warnings)
+
+
+def turn_events(line):
+    """Events for one line of `codex exec --json`. Agent messages, shell commands, MCP calls and
+    file changes are kept; reasoning and warnings (items of type "error", such as a model
+    switch notice) are dropped. `turn.completed` is the verdict, `turn.failed` an error; a
+    top-level `error` (a stream retry notice, or the failure that turn.failed repeats) is shown
+    as a text line so a reconnect does not fail the turn."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(d, dict):
+        return []
+    t = d.get("type")
+    if t in ("item.started", "item.completed") and isinstance(d.get("item"), dict):
+        return _item_events(d["item"], t == "item.started")
+    if t == "turn.completed":
+        return [{"kind": "done", "cost_usd": None}]
+    if t == "turn.failed":
+        err = d.get("error") if isinstance(d.get("error"), dict) else {}
+        return [{"kind": "error", "message": _turn_clip(err.get("message") or "turn failed", 2000)}]
+    if t == "error" and isinstance(d.get("message"), str):
+        return [{"kind": "text", "text": f"[codex: {_turn_clip(d['message'], 300)}]"}]
+    return []
+
+
+def last_activity(native_id, locator):
+    """mtime of the rollout, which Codex appends to while a thread is live."""
+    return os.stat(locator).st_mtime

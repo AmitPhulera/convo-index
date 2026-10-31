@@ -6,10 +6,10 @@ from convo_index.sources import base
 
 
 def test_sources_without_a_turn_module_are_unsupported():
-    assert base.supports_turns("codex:abc") is False
-    assert base.turn_command("codex:abc", "hi", "/x") is None
-    assert base.turn_events("codex:abc", '{"type": "text"}') == []
-    assert base.last_activity("codex:abc", "/nowhere") is None
+    assert base.supports_turns("antigravity:abc") is False
+    assert base.turn_command("antigravity:abc", "hi", "/x") is None
+    assert base.turn_events("antigravity:abc", '{"type": "text"}') == []
+    assert base.last_activity("antigravity:abc", "/nowhere") is None
 
 
 def test_registered_sources_are_supported(monkeypatch):
@@ -17,7 +17,8 @@ def test_registered_sources_are_supported(monkeypatch):
     assert base.supports_turns("claude_code:0f1e2d3c-1234-4abc-8def-0123456789ab") is True
     assert base.supports_turns("opencode:ses_abc123") is True
     assert base.supports_turns("pi:01a0aaaa-1111-7222-8333-444455556666") is True
-    assert base.turn_launcher("codex:abc") is None
+    assert base.supports_turns("codex:01a19103-50dd-7390-8c13-8e6bb121ad2f") is True
+    assert base.turn_launcher("antigravity:abc") is None
 
 
 @pytest.mark.parametrize("native", ["", "a b", "x;rm -rf /", "$(id)", "id'quote", "é", "a/b", "`x`", "-x", "--help", "."])
