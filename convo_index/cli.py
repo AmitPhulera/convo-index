@@ -375,7 +375,7 @@ def _start_handoff(args, settings, cid, h, kind, out, transcript):
     from convo_index.sources.base import resume_command
     if args.prompt_file:
         try:
-            prompt = Path(args.prompt_file).expanduser().read_text(encoding="utf-8")
+            prompt = H.point_at(Path(args.prompt_file).expanduser().read_text(encoding="utf-8"), transcript)
         except OSError as e:
             print(f"cannot read {args.prompt_file}: {e.strerror or e}", file=sys.stderr)
             return 1

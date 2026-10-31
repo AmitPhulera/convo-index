@@ -166,6 +166,15 @@ def mask_secrets(text):
     return text, count
 
 
+_TRANSCRIPT_POINTER_RE = re.compile(r"(is in `)([^`\n]*transcript\.md)(`)")
+
+
+def point_at(prompt, transcript_path):
+    """`prompt` naming `transcript_path` as its full transcript. A prompt printed by an earlier
+    run and edited names that run's copy, which the new session is not allowed to read."""
+    return _TRANSCRIPT_POINTER_RE.sub(lambda m: m.group(1) + str(transcript_path) + m.group(3), prompt or "")
+
+
 def find_secrets(text):
     """[{kind, sample}] for each credential-looking match, the sample shortened so the
     preview can point at it without repeating it."""

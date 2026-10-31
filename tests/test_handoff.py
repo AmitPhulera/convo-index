@@ -560,3 +560,17 @@ def test_a_private_key_is_masked_whole_even_when_cut_short():
     cut = f"-----BEGIN PRIVATE KEY-----\n{body}\n…[tool text truncated]"            # a tool's output cut mid-key
     text, n = H.mask_secrets(cut)
     assert n == 1 and "MIIEvQ" not in text and "QUJDREVG" not in text and "truncated" in text
+
+
+def test_an_edited_prompt_points_at_the_copy_this_run_opens(tmp_path, monkeypatch, capsys):
+    cli, sent = _start_env(tmp_path, monkeypatch)
+    assert cli.main(["handoff", "s1", "--review", "--transcript-dir", str(tmp_path / "first")]) == 0
+    printed = capsys.readouterr().out
+    assert str(tmp_path / "first" / "transcript.md") in printed
+    edited = tmp_path / "edited.md"
+    edited.write_text(printed.replace("Give a second opinion", "Give a short second opinion"))
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review", "--prompt-file", str(edited)]) == 0
+    opened = sent["read_dirs"][0] / "transcript.md"
+    assert f"is in `{opened}`" in sent["prompt"] and str(tmp_path / "first") not in sent["prompt"]
+    assert "Give a short second opinion" in sent["prompt"]
+    assert H.point_at("no pointer here", "/x/transcript.md") == "no pointer here"
