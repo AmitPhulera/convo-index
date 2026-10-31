@@ -413,6 +413,18 @@ def test_missing_harness_binary_is_424(site, monkeypatch):
     assert got == 424 and "not installed" in out["error"]
 
 
+def test_a_session_the_harness_cannot_continue_is_412(site, monkeypatch):
+    seen = {}
+
+    def refuse(cid, prompt, cwd, **kw):
+        seen.update(kw)
+        raise ValueError("the session file no longer holds this session")
+    monkeypatch.setattr(server, "turn_command", refuse)
+    got, out = request(site, "POST", f"/api/conversation/{CID}/turn", {"prompt": "x"})
+    assert got == 412 and "no longer holds" in out["error"]
+    assert seen["locator"] == str(site.transcript)          # the indexed file reaches the adapter
+
+
 def test_edits_position_is_passed_through(site):
     captured = site.tmp / "argv.txt"
     status, body = start(site, [{"argv_to": str(captured)}] + claude_lines()[1:], edits=True)

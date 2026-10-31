@@ -431,7 +431,7 @@ def mcp_servers():
     return {k: v for k, v in servers.items() if isinstance(v, dict)} if isinstance(servers, dict) else {}
 
 
-def turn_command(native_id, prompt, cwd, *, edits=False, mcp_tools=()):
+def turn_command(native_id, prompt, cwd, *, edits=False, mcp_tools=(), locator=None):
     prefix = launcher()
     if prefix is None:
         return None

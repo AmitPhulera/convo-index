@@ -100,8 +100,10 @@ def resume_command(conversation_id: str, cwd: str | None) -> str | None:
 # module-level functions; the registry below names the modules so adding a harness is one
 # entry plus those functions:
 #
-#   turn_command(native_id, prompt, cwd, *, edits) -> TurnCommand | None
-#       The process to run. None when this platform cannot launch it safely.
+#   turn_command(native_id, prompt, cwd, *, edits, mcp_tools, locator) -> TurnCommand | None
+#       The process to run. None when this platform cannot launch it safely; ValueError when
+#       the session cannot be continued (its file gone or holding another session). `locator`
+#       is the indexed source_ref, for a harness that resumes by file rather than by id.
 #   turn_events(line) -> list[dict]
 #       Events for one stdout line: {"kind": "text", "text"}, {"kind": "tool", "name", "input"},
 #       {"kind": "tool_result", "text", "error"}, {"kind": "denied", "name", "input"},
@@ -181,7 +183,7 @@ def supports_turns(conversation_id: str) -> bool:
 
 
 def turn_command(conversation_id: str, prompt: str, cwd: str, *, edits: bool = False,
-                 mcp_tools: tuple[str, ...] = ()) -> TurnCommand | None:
+                 mcp_tools: tuple[str, ...] = (), locator: str | None = None) -> TurnCommand | None:
     """The harness invocation for one more turn, or None when the source has no headless
     mode here. `mcp_tools` is the allowlist an Edit-mode turn may call (turn_tools); a harness
     that cannot load MCP servers ignores it. Raises ValueError for a native id that must never
@@ -192,7 +194,8 @@ def turn_command(conversation_id: str, prompt: str, cwd: str, *, edits: bool = F
     mod, native = _turn_module(conversation_id)
     if mod is None or not supports_turns(conversation_id):
         return None
-    return mod.turn_command(native, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools) if edits else ())
+    return mod.turn_command(native, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools) if edits else (),
+                            locator=locator)
 
 
 def turn_launcher(conversation_id: str) -> list[str] | None:
