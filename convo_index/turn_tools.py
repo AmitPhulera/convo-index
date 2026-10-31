@@ -9,6 +9,7 @@ without approval."""
 import json
 import os
 import re
+import tempfile
 
 from convo_index import settings as CFG
 
@@ -60,15 +61,21 @@ def validate(entries, servers):
 
 
 def save(entries, servers, settings=None):
-    """Validate and write the list (owner-only). Returns what was stored."""
+    """Validate and write the list (owner-only). Returns what was stored. The new list goes to a
+    private temporary file that replaces the store in one step, so concurrent saves (the server
+    is threaded) leave one of them whole, never a mix of both."""
     entries = validate(entries, servers)
     path = store_path(settings)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump({"mcp_tools": entries}, fh, indent=2)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".turn-tools-", suffix=".json")   # 0600
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"mcp_tools": entries}, fh, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return entries

@@ -2,6 +2,7 @@
 store that others could write."""
 import json
 import os
+import threading
 
 import pytest
 
@@ -38,6 +39,18 @@ def test_save_writes_a_private_store_that_load_reads_back(tmp_path):
     if os.name != "nt":
         assert path.stat().st_mode & 0o777 == 0o600
     assert TT.load(st) == ["mcp__atlassian__getJiraIssue"]
+
+
+def test_concurrent_saves_leave_one_whole_list(tmp_path):
+    # before the store was replaced atomically, about a third of such rounds left invalid JSON
+    st = make_settings(tmp_path)
+    lists = [[f"mcp__atlassian__t{i}_{'x' * (40 * i)}"] for i in range(8)]
+    for _ in range(25):
+        threads = [threading.Thread(target=TT.save, args=(entries, SERVERS, st)) for entries in lists]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        assert TT.load(st) in lists
+    assert [p.name for p in TT.store_path(st).parent.iterdir() if p.name.startswith(".turn-tools-")] == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
