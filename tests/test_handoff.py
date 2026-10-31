@@ -313,7 +313,9 @@ def test_secrets_in_tool_output_are_reported_from_the_transcript_file(tmp_path, 
     _db(tmp_path, msgs).close()
     assert cli.main(["handoff", "s1", "--review", "--transcript-dir", str(tmp_path / "h")]) == 0
     out = capsys.readouterr()
-    assert "AKIA" not in out.out and "looks like a secret in the transcript file" in out.err and "AWS access key" in out.err
+    assert "AKIA" not in out.out and "masked 1 credential-looking string(s) in the transcript file" in out.err
+    text = (tmp_path / "h" / "transcript.md").read_text()
+    assert "AKIAABCDEFGHIJKLMNOP" not in text and "export AWS_KEY=[credential masked: AWS access key]" in text
 
 
 def test_the_budget_counts_each_message_as_rendered(tmp_path):
@@ -475,13 +477,16 @@ def test_cli_start_refuses_secrets_unless_told_and_sends_an_edited_prompt(tmp_pa
     msgs = [Message(seq=0, role="user", text="use key AKIAABCDEFGHIJKLMNOP to deploy")]
     cli, sent = _start_env(tmp_path, monkeypatch, msgs)
     assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 1
-    assert "not starting: the prompt or the transcript file holds" in capsys.readouterr().err and not sent
+    assert "not starting: the prompt holds" in capsys.readouterr().err and not sent
     edited = tmp_path / "edited.md"
     edited.write_text("Review the deploy script. The key was removed.")
-    assert cli.main(["handoff", "s1", "--start", "opencode", "--review", "--prompt-file", str(edited)]) == 1   # transcript still has it
-    capsys.readouterr()
-    assert cli.main(["handoff", "s1", "--start", "opencode", "--review", "--prompt-file", str(edited), "--ignore-secrets"]) == 0
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review", "--prompt-file", str(edited)]) == 0   # the copy is masked
     assert sent["prompt"] == "Review the deploy script. The key was removed." and sent["edits"] is False
+    copy = sent["read_dirs"][0] / "transcript.md"
+    assert "AKIAABCDEFGHIJKLMNOP" not in copy.read_text() and "[credential masked: AWS access key]" in copy.read_text()
+    sent.clear()
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review", "--ignore-secrets"]) == 0
+    assert "AKIAABCDEFGHIJKLMNOP" in sent["prompt"]                      # told to: the prompt goes as it is
 
 
 def test_cli_start_reports_a_failed_session_and_an_unknown_target(tmp_path, monkeypatch, capsys):
@@ -521,3 +526,10 @@ def test_a_failed_link_write_is_reported_and_the_session_still_finishes(tmp_path
     out = capsys.readouterr()
     assert out.out == "Taking over.\n" and "not linked to claude_code:s1: database is locked" in out.err
     assert "reviews claude_code:s1" not in out.err
+
+
+def test_mask_secrets_replaces_every_match_and_counts_them():
+    text, n = H.mask_secrets("a AKIAABCDEFGHIJKLMNOP b ghp_" + "x" * 36 + " c password=hunter2hunter2 d")
+    assert n == 3 and "AKIA" not in text and "ghp_" not in text and "hunter2" not in text
+    assert text.startswith("a [credential masked: AWS access key] b [credential masked: GitHub token] c ")
+    assert H.mask_secrets("nothing here") == ("nothing here", 0) and H.find_secrets(text) == []

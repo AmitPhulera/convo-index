@@ -348,8 +348,8 @@ def cmd_handoff(args):
     if len(out["problems"]) > H.MAX_PROBLEMS:
         note.append(f"known problems: {len(out['problems']) - H.MAX_PROBLEMS} earlier ones not listed")
     note += [f"looks like a secret, remove before sending: {s['kind']} {s['sample']}" for s in out["secrets"]]
-    note += [f"looks like a secret in the transcript file, which the prompt points at: {s['kind']} {s['sample']}"
-             for s in out["transcript_secrets"]]
+    if out["transcript_masked"]:
+        note.append(f"masked {out['transcript_masked']} credential-looking string(s) in the transcript file")
     print("\n".join(note), file=sys.stderr)
     if args.start:
         return _start_handoff(args, settings, cid, h, kind, out, transcript)
@@ -376,13 +376,12 @@ def _start_handoff(args, settings, cid, h, kind, out, transcript):
         except OSError as e:
             print(f"cannot read {args.prompt_file}: {e.strerror or e}", file=sys.stderr)
             return 1
-        # all of the transcript file: transcript_secrets leaves out what the generated prompt showed
-        secrets = H.find_secrets(prompt) + H.find_secrets(transcript.read_text(encoding="utf-8"))
+        secrets = H.find_secrets(prompt)
     else:
-        prompt, secrets = out["prompt"], out["secrets"] + out["transcript_secrets"]
-    if secrets and not args.ignore_secrets:
-        print("not starting: the prompt or the transcript file holds what looks like a credential (listed above). "
-              "Edit the prompt (print it without --start, then pass --prompt-file), or pass --ignore-secrets.", file=sys.stderr)
+        prompt, secrets = out["prompt"], out["secrets"]
+    if secrets and not args.ignore_secrets:       # the transcript copy is masked; the prompt is yours to fix
+        print("not starting: the prompt holds what looks like a credential (listed above). Print it without "
+              "--start, remove it, and pass the result with --prompt-file; or pass --ignore-secrets.", file=sys.stderr)
         return 1
     t = settings["ui"]["turns"]
     runner = TURNS.TurnRunner(timeout=int(t.get("timeout_seconds") or 1200), max_concurrent=1, refresh=_ingest_only)

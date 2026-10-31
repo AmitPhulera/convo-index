@@ -137,6 +137,19 @@ def known_problems(msgs):
     return out
 
 
+MASK = "[credential masked: {kind}]"
+
+
+def mask_secrets(text):
+    """(text, count) with every credential-looking string replaced by a MASK marker. The
+    transcript copy is masked as it is written: nobody reviews it before the target reads it."""
+    count = 0
+    for rx, kind in SECRET_PATTERNS:
+        text, n = rx.subn(MASK.format(kind=kind), text or "")
+        count += n
+    return text, count
+
+
 def find_secrets(text):
     """[{kind, sample}] for each credential-looking match, the sample shortened so the
     preview can point at it without repeating it."""
@@ -221,10 +234,12 @@ def prune_copies(db_path, days=COPY_DAYS, now=None):
 
 def write_transcript(conn, cid, directory, settings=None):
     """The full conversation, tools included, as Markdown in `directory` (readable by this
-    user only). The prompt names the file so the target reads detail on demand."""
+    user only), credentials masked. The prompt names the file so the target reads detail on
+    demand."""
     md = X.as_markdown(conn, cid, settings, include_tools=True)
     if md is None:
         return None
+    md, _ = mask_secrets(md)
     directory = Path(directory).expanduser().resolve()   # the target harness starts elsewhere
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = directory / "transcript.md"
@@ -449,9 +464,8 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
 
     `digest_result` (continue only) and `repo` are passed in so the caller decides what runs:
     the digest is an LLM call and repo state runs git. Returns {kind, prompt, problems,
-    secrets, transcript_secrets, chars, tokens, over_budget, dropped, digest_status}, where
-    transcript_secrets are the hits in the transcript file (tool output included) that the
-    prompt itself does not show."""
+    secrets, transcript_masked, chars, tokens, over_budget, dropped, digest_status}, where
+    transcript_masked counts the credentials masked in the transcript file."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}, not {kind!r}")
     h = X.head(conn, cid)
@@ -494,11 +508,10 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
     prompt = "\n\n".join(sections) + "\n"
     secrets = find_secrets(prompt)
     try:
-        in_file = find_secrets(Path(transcript_path).read_text(encoding="utf-8")) if transcript_path else []
+        masked = Path(transcript_path).read_text(encoding="utf-8").count(MASK.split("{")[0]) if transcript_path else 0
     except OSError:
-        in_file = []          # a pointer the caller made up (tests) or a file already removed
-    return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": secrets,
-            "transcript_secrets": [s for s in in_file if s not in secrets],
+        masked = 0            # a pointer the caller made up (tests) or a file already removed
+    return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": secrets, "transcript_masked": masked,
             "chars": len(prompt), "tokens": len(prompt) // 4, "over_budget": len(prompt) > budget_chars,
             "dropped": dropped, "digest_status": digest_status if kind == "continue" else None}
 
