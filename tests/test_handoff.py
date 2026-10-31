@@ -346,3 +346,23 @@ def test_a_fence_in_a_commit_subject_stays_inside_the_block(tmp_path):
     repo = _git_repo(tmp_path / "repo", subject="fix ``` in docs")
     p = H._repo(H.repo_state(str(repo)))
     assert p[p.index("git log --oneline -10:"):].startswith("git log --oneline -10:\n````\n")
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX modes; root ignores them")
+def test_cli_reports_an_unwritable_transcript_dir_before_any_llm_call(tmp_path, monkeypatch, fake_llm, capsys):
+    from convo_index import cli
+    from convo_index import settings as S
+    from tests.conftest import make_settings
+    st = make_settings(tmp_path, llm={"summary": {"backend": "claude_cli", "model": "m"}}, privacy={"hosted_processing": "allow"})
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    _db(tmp_path).close()
+    f = fake_llm({"goal": "g"})
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    os.chmod(ro, 0o500)
+    try:
+        assert cli.main(["handoff", "s1", "--transcript-dir", str(ro / "sub")]) == 1
+    finally:
+        os.chmod(ro, 0o700)
+    out = capsys.readouterr()
+    assert "cannot write the transcript to" in out.err and out.out == "" and f.calls == []
