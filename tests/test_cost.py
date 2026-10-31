@@ -20,6 +20,7 @@ def test_seed_pricing_loads_and_prices_known_models(tmp_path):
     assert abs(est - (10 + 1 + 5)) < 1e-9
     # Opus 5.5: cache reads at 0.05x input (not 0.1x), 1-hour writes at 2x
     assert p.rates("claude-opus-5-5") == {"input": 4.0, "output": 20.0, "cache_read": 0.20, "cache_write": 5.0, "cache_write_1h": 8.0}
+    assert p.rates("claude-sonnet-5-5") == {"input": 2.0, "output": 10.0, "cache_read": 0.10, "cache_write": 2.5, "cache_write_1h": 4.0}
 
 
 def test_user_pricing_file_overrides_and_extends(tmp_path, monkeypatch):
