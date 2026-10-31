@@ -306,6 +306,15 @@ def test_opencode_last_activity_is_the_session_row_not_the_file(tmp_path):
     assert base.last_activity("opencode:ses_1", f"sqlite:{tmp_path / 'none.db'}#ses_1") is None
 
 
+def test_opencode_turn_names_the_sessions_own_model(opencode_on_path, tmp_path):
+    db = tmp_path / "opencode.db"
+    make_opencode_v2_db(db)
+    cmd = base.turn_command("opencode:ses_1", "again", "/proj", locator=f"sqlite:{db}#ses_1")
+    assert cmd.argv[cmd.argv.index("--session") + 1:cmd.argv.index("--session") + 4] == ["ses_1", "-m", "ollama/qwen3.8:27b-mlx"]
+    for locator in [None, f"sqlite:{db}#ses_other", f"sqlite:{tmp_path / 'none.db'}#ses_1"]:
+        assert "-m" not in base.turn_command("opencode:ses_1", "again", "/proj", locator=locator).argv
+
+
 def test_opencode_last_activity_reads_the_1x_layout_too(tmp_path):
     db = tmp_path / "old.db"
     make_opencode_db(db)

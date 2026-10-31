@@ -21,13 +21,20 @@ class _Res:
 
 
 def _fake_run(monkeypatch, fn):
-    """fn(cmd) -> _Res | None (None = timeout)."""
-    recorded = []
+    """fn(cmd) -> _Res | None (None = timeout). The stdin of each call is in `.stdin`."""
+    recorded = _Calls()
     def run(cmd, timeout, stdin=None):
         recorded.append(cmd)
+        recorded.stdin.append(stdin)
         return fn(cmd)
     monkeypatch.setattr(cli, "_run", run)
     return recorded
+
+
+class _Calls(list):
+    def __init__(self):
+        super().__init__()
+        self.stdin = []
 
 
 # ---------------------------------------------------------------- base helpers
@@ -76,7 +83,8 @@ def test_claude_cli_parses_envelope_and_usage(monkeypatch):
     assert (r.usage.input_uncached, r.usage.cache_write, r.usage.cache_read, r.usage.output) == (10, 8292, 13971, 86)
     assert r.usage.reported_cost_usd == 0.0194
     cmd = cmds[0]
-    assert cmd[:3] == ["claude", "-p", "--model"] and "--json-schema" in cmd and cmd[-1].startswith("MARK P")
+    assert cmd[:3] == ["claude", "-p", "--model"] and "--json-schema" in cmd
+    assert cmds.stdin[0] == "MARK P" and not any("MARK P" in a for a in cmd)       # the prompt travels on stdin
 
 
 def test_claude_cli_failures_are_classified(monkeypatch):
@@ -149,8 +157,9 @@ def test_codex_parses_event_stream_and_writes_strict_schema(monkeypatch, tmp_pat
                                                        "cache_write_input_tokens": 0, "output_tokens": 21,
                                                        "reasoning_output_tokens": 5}}]
         return _Res(0, "\n".join(json.dumps(e) for e in events))
-    _fake_run(monkeypatch, run)
+    calls = _fake_run(monkeypatch, run)
     r = cli.CodexCLI().complete(LLMRequest(prompt="P", model="gpt-5.6-luna", schema=SCHEMA))
+    assert calls.stdin == ["P"] and "P" not in seen["cmd"]
     assert r.ok and r.data == {"category": "a"} and r.usage.provider == "openai"
     assert (r.usage.input_uncached, r.usage.cache_read, r.usage.output, r.usage.reasoning) == (12000, 256, 21, 5)
     assert seen["schema"]["additionalProperties"] is False
@@ -473,3 +482,28 @@ def test_replacing_an_api_key_changes_the_usability_signature(monkeypatch):
     sig = R.usability_signature(custom)
     monkeypatch.setenv("MY_KEY", "y")
     assert R.usability_signature(custom) != sig                     # api_key_env is respected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a POSIX stand-in script on PATH")
+def test_a_long_prompt_reaches_the_cli_on_linux_too(monkeypatch, tmp_path):
+    """Linux refuses one argument over 128 KiB (E2BIG); the handoff digest sends ~200k chars."""
+    fake = tmp_path / "claude"
+    fake.write_text("#!/usr/bin/env python3\nimport json, sys\nn = len(sys.stdin.read())\n"
+                    "print(json.dumps({'type': 'result', 'is_error': False, 'result': f'got {n} chars'}))\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    r = cli.ClaudeCLI().complete(LLMRequest(prompt="x" * 200_000, model="m"))
+    assert r.ok and r.data == "got 200000 chars"
+
+
+def test_agy_refuses_a_prompt_its_command_line_cannot_carry(monkeypatch, llm_settings):
+    monkeypatch.setattr(cli.GeminiCLI, "available", classmethod(lambda cls: True))
+    calls = _fake_run(monkeypatch, lambda cmd: _Res(0, json.dumps({"status": "SUCCESS", "response": "ok"})))
+    limit = cli.GeminiCLI.max_prompt_bytes()
+    assert cli.GeminiCLI().complete(LLMRequest(prompt="x" * limit, model="m")).ok
+    r = cli.GeminiCLI().complete(LLMRequest(prompt="é" * (limit // 2 + 1), model="m"))    # 2 bytes each
+    assert not r.ok and r.error == "config" and "does not fit agy's command line" in r.detail and len(calls) == 1
+    llm_settings["llm"]["summary"] = {"backend": "gemini_cli", "model": "m"}
+    assert R.max_prompt_bytes("summary", llm_settings) == limit
+    llm_settings["llm"]["summary"] = {"backend": "claude_cli", "model": "m"}
+    assert R.max_prompt_bytes("summary", llm_settings) is None                          # stdin: no argv limit

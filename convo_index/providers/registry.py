@@ -70,6 +70,14 @@ def usability_signature(spec, settings=None):
             f"|{credential_stamp(backend, spec)}")
 
 
+def max_prompt_bytes(job, settings=None):
+    """The largest prompt, in UTF-8 bytes, the job's backend can be handed, or None when only
+    the model's window bounds it."""
+    llm = make_llm((settings or S.load()).llm_job(job))
+    limit = getattr(llm, "max_prompt_bytes", None)
+    return limit() if limit else None
+
+
 def make_llm(spec):
     """Instantiate the backend named in a job spec, or None when unconfigured/unknown."""
     backend = (spec or {}).get("backend") or ""

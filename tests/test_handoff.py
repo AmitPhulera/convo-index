@@ -366,3 +366,25 @@ def test_cli_reports_an_unwritable_transcript_dir_before_any_llm_call(tmp_path, 
         os.chmod(ro, 0o700)
     out = capsys.readouterr()
     assert "cannot write the transcript to" in out.err and out.out == "" and f.calls == []
+
+
+def test_the_digest_fits_a_backend_that_carries_less(fake_llm, llm_settings, monkeypatch):
+    from convo_index.providers import registry
+    msgs = [{"seq": i, "role": "user" if i % 2 == 0 else "assistant", "kind": "text", "text": f"m{i} " + "é" * 2000}
+            for i in range(60)]
+    msgs[-1]["text"] = "LAST-STATE the tests pass now"
+    monkeypatch.setattr(registry, "max_prompt_bytes", lambda job, settings=None: 30_000)
+    f = fake_llm({"goal": "g"})
+    d, status = H.digest(msgs, "T", llm_settings)
+    sent = f.calls[0]["prompt"]
+    assert status == "ok" and d["cut"] and len(sent.encode()) <= 30_000
+    assert "LAST-STATE" in sent and "m0 " in sent                       # both ends kept
+    monkeypatch.setattr(registry, "max_prompt_bytes", lambda job, settings=None: None)
+    f = fake_llm({"goal": "g"})
+    H.digest(msgs, "T", llm_settings)
+    assert len(f.calls[0]["prompt"]) > 100_000                            # no limit: the full window
+
+
+def test_repo_state_reads_utf8_whatever_the_locale(tmp_path):
+    repo = _git_repo(tmp_path / "repo", subject="Ánimo: fix the café menu")   # Á is C3 81; cp1252 has no 0x81
+    assert "Ánimo: fix the café menu" in H.repo_state(str(repo))["log"]

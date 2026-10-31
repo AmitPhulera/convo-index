@@ -146,8 +146,10 @@ def find_secrets(text):
 
 def _git(cwd, *args, timeout=5):
     try:
-        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout,
-                           stdin=subprocess.DEVNULL)
+        # git writes UTF-8 (and raw bytes for a message without an encoding header); the locale's
+        # code page (Windows) would fail on some of them
+        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout.rstrip() if r.returncode == 0 else None
@@ -276,12 +278,23 @@ def _why(res, timeout):
     return _quote(first, 200)
 
 
-def _digest_transcript(convo):
-    """(transcript, cut): role-prefixed, the middle left out past the digest window."""
+def _utf8(text):
+    return len(text.encode("utf-8", "surrogatepass"))
+
+
+def _digest_transcript(convo, max_bytes=None):
+    """(transcript, cut): role-prefixed, the middle left out past the digest window, or past
+    `max_bytes` (UTF-8) when the backend can carry less. Head and tail keep their proportions."""
     full = "\n\n".join(f"{m['role'].upper()}: {m['text']}" for m in convo)
-    if len(full) <= DIGEST_HEAD_CHARS + DIGEST_TAIL_CHARS:
-        return full, False
-    return full[:DIGEST_HEAD_CHARS] + "\n\n…[middle of the transcript left out]…\n\n" + full[-DIGEST_TAIL_CHARS:], True
+    head, tail = DIGEST_HEAD_CHARS, DIGEST_TAIL_CHARS
+    while True:
+        if len(full) <= head + tail:
+            text, cut = full, False
+        else:
+            text, cut = full[:head] + "\n\n…[middle of the transcript left out]…\n\n" + full[-tail:], True
+        if max_bytes is None or _utf8(text) <= max_bytes or head + tail < 100:
+            return text, cut
+        head, tail = head * 9 // 10, tail * 9 // 10
 
 
 def digest(msgs, title="", settings=None, timeout=90):
@@ -293,8 +306,10 @@ def digest(msgs, title="", settings=None, timeout=90):
              for m in msgs if (m.get("kind") or KIND_TEXT) in (KIND_TEXT, KIND_TOOL_CALL) and harness_label(m) is None]
     if not any((m.get("kind") or KIND_TEXT) == KIND_TEXT for m in convo):
         return None, "nothing to digest"
-    transcript, cut = _digest_transcript(convo)
-    prompt = _DIGEST_PROMPT + f"Title: {title}\n\n" + transcript
+    head = _DIGEST_PROMPT + f"Title: {title}\n\n"
+    limit = R.max_prompt_bytes("summary", settings)      # agy takes the prompt as one argument
+    transcript, cut = _digest_transcript(convo, None if limit is None else limit - _utf8(head) - 64)
+    prompt = head + transcript
     for _ in range(2):   # a malformed answer is often a one-off; anything else is not retried
         res = R.complete("summary", prompt, schema=DIGEST_SCHEMA, settings=settings, max_output_tokens=1500,
                          max_input_chars=len(prompt), timeout=timeout)
