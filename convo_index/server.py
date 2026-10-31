@@ -16,7 +16,7 @@ from urllib.parse import urlparse, urlsplit, parse_qs, unquote
 
 from convo_index.config import STATIC_DIR
 from convo_index.sources.base import (resume_command, supports_turns, turn_command, turn_events, last_activity,
-                                      turn_launcher)
+                                      turn_launcher, new_session_targets)
 from convo_index.indexer import EXIT_LOCKED, cwd_excluded
 from convo_index import turns as TURNS
 from convo_index.lock import index_lock, IndexLocked
@@ -30,6 +30,7 @@ from convo_index.sources import claude_code as CC
 from convo_index import tags as T
 from convo_index import references as REF
 from convo_index import cost as K
+from convo_index import export as X
 from convo_index import handoff as HO
 from convo_index import vectors as V
 
@@ -242,6 +243,10 @@ def handle_conversation(conversation_id):
         refs = REF.references_for(conn, conversation_id) if dbm._table_exists(conn, "references_") else []
         related = REF.related_for(conn, conversation_id) if dbm._table_exists(conn, "references_") else []
         usage = K.usage_for_conversation(conn, conversation_id, K.load(CFG.load())) if dbm._table_exists(conn, "usage_records") else {}
+        links = dbm.links_for(conn, conversation_id)
+        for link in links:                     # a new session is linked before the index has read it
+            row = conn.execute("SELECT title FROM conversations WHERE id=?", (link["id"],)).fetchone()
+            link["title"] = row[0] if row else None
     finally:
         conn.close()
     return json.dumps({
@@ -257,7 +262,8 @@ def handle_conversation(conversation_id):
         "active_turn": (lambda t: t.snapshot() if t else None)(_runner().active(conversation_id)),
         "edit_mcp_tools": len(TT.load()) if head[7] == "claude_code" else 0,   # how many the Tools button shows
         "hidden": hidden, "summary": summary, "tags": tag_detail, "usage": usage,
-        "references": refs, "related": related,
+        "references": refs, "related": related, "links": links,
+        "handoff_targets": handoff_targets() if CFG.load()["ui"]["turns"].get("enabled", True) else [],
         "messages": [{"role": m[0], "kind": m[1] or "text", "ts": m[2], "text": m[3]} for m in msgs],
     })
 
@@ -473,11 +479,8 @@ MAX_TURN_BODY = 1024 * 1024
 PROMPT_FORBIDDEN = {chr(c) for c in range(32)} - {"\n", "\r", "\t"}
 
 
-def turn_preconditions(conversation_id, prompt, edits, cfg=None):
-    """Everything that must hold before a harness is spawned. Returns (conversation_id, command,
-    locator);
-    raises TurnRefused with the status and the message the UI shows verbatim."""
-    cfg = cfg or CFG.load()
+def _check_turn_request(cfg, prompt, edits):
+    """What every harness start needs from the request itself; raises TurnRefused."""
     if not cfg["ui"]["turns"].get("enabled", True):
         raise TURNS.TurnRefused(403, "browser turns are disabled in settings ([ui.turns] enabled = false)")
     if not isinstance(prompt, str) or not prompt.strip():
@@ -490,6 +493,14 @@ def turn_preconditions(conversation_id, prompt, edits, cfg=None):
         raise TURNS.TurnRefused(400, "prompt is not valid Unicode text") from None
     if not isinstance(edits, bool):
         raise TURNS.TurnRefused(400, "edits must be a JSON boolean")
+
+
+def turn_preconditions(conversation_id, prompt, edits, cfg=None):
+    """Everything that must hold before a harness is spawned. Returns (conversation_id, command,
+    locator);
+    raises TurnRefused with the status and the message the UI shows verbatim."""
+    cfg = cfg or CFG.load()
+    _check_turn_request(cfg, prompt, edits)
     conn = dbm.connect(_db())
     try:
         conversation_id = dbm.resolve_id(conn, conversation_id)
@@ -588,6 +599,112 @@ def handle_turn_stop(turn_id):
         return 404, json.dumps({"error": "no such turn"})
     stopped = bool(_runner().stop(turn_id))
     return 200, json.dumps({"ok": True, "stopped": stopped, **turn.snapshot()})
+
+
+# --- Handoffs ------------------------------------------------------------------------------------
+# A handoff is prepared, then started. Preparing writes the transcript copy and builds the prompt
+# (with the digest for `continue`, an LLM call of up to a minute or two); the page shows it for
+# the user to edit. Starting runs the new session on the turn runner. The copy's directory stays
+# on the server under a random preview id, so the page never names a path the session may read.
+
+HANDOFF_PREVIEWS = {}         # preview id -> {"from", "kind", "dir", "at"}
+PREVIEW_TTL = 3600
+_previews_lock = threading.Lock()
+
+
+def handoff_targets():
+    """Tools a handoff can start a session in here: a headless new-session mode and installed."""
+    return [t for t in new_session_targets() if turn_launcher(f"{t}:x") is not None]
+
+
+def _handoff_source(conversation_id, cfg):
+    """The conversation's head when it may be handed off; raises TurnRefused otherwise."""
+    if not cfg["ui"]["turns"].get("enabled", True):
+        raise TURNS.TurnRefused(403, "browser turns are disabled in settings ([ui.turns] enabled = false)")
+    conn = dbm.connect(_db())
+    try:
+        h = X.head(conn, dbm.resolve_id(conn, conversation_id))
+    finally:
+        conn.close()
+    if h is None:
+        raise TURNS.TurnRefused(404, "conversation not found")
+    why = HO.refusal(cfg, h)
+    if why:
+        raise TURNS.TurnRefused(403, why)
+    return h
+
+
+def handle_handoff_preview(conversation_id, body):
+    """POST /api/conversation/<id>/handoff {kind}: (status, json) with the prompt to edit."""
+    if not isinstance(body, dict) or body.get("kind") not in HO.KINDS:
+        return 400, json.dumps({"error": f"kind must be one of {', '.join(HO.KINDS)}"})
+    kind, cfg = body["kind"], CFG.load()
+    try:
+        h = _handoff_source(conversation_id, cfg)
+    except TURNS.TurnRefused as e:
+        return e.status, json.dumps({"error": str(e)})
+    db = _db()
+    HO.prune_copies(db)
+    conn = dbm.connect(db)
+    try:
+        transcript = HO.write_transcript(conn, h["id"], HO.copy_dir(db, h["id"]), cfg)
+        msgs = X.messages(conn, h["id"])
+    finally:
+        conn.close()
+    d, status = HO.digest(msgs, h["title"] or "", cfg) if kind == "continue" else (None, None)   # no connection held meanwhile
+    conn = dbm.connect(db)
+    try:
+        out = HO.build(conn, h["id"], kind, digest_result=d, digest_status=status, transcript_path=transcript,
+                       repo=HO.repo_state(h["cwd"]))
+    finally:
+        conn.close()
+    pid = secrets.token_urlsafe(16)
+    with _previews_lock:
+        now = time.time()
+        for k in [k for k, p in HANDOFF_PREVIEWS.items() if now - p["at"] > PREVIEW_TTL]:
+            del HANDOFF_PREVIEWS[k]
+        HANDOFF_PREVIEWS[pid] = {"from": h["id"], "kind": kind, "dir": transcript.parent, "at": now}
+    keep = ("prompt", "problems", "secrets", "transcript_masked", "tokens", "over_budget", "dropped", "digest_status")
+    return 200, json.dumps({"preview_id": pid, "kind": kind, **{k: out[k] for k in keep},
+                            "targets": handoff_targets(), "send_refusal": HO.send_refusal(cfg)})
+
+
+def handle_handoff_start(body):
+    """POST /api/handoff/start {preview_id, target, prompt, edits, ignore_secrets}: (status, json)
+    with the turn's snapshot; its stream names the new conversation in a `session` event."""
+    if not isinstance(body, dict):
+        return 400, json.dumps({"error": "body must be a JSON object"})
+    with _previews_lock:
+        p = HANDOFF_PREVIEWS.get(body.get("preview_id"))
+    if p is None or time.time() - p["at"] > PREVIEW_TTL:
+        return 404, json.dumps({"error": "the prepared prompt has expired; prepare it again"})
+    target, prompt, edits = body.get("target"), body.get("prompt"), body.get("edits", False)
+    cfg = CFG.load()
+    try:
+        _check_turn_request(cfg, prompt, edits)
+        if target not in handoff_targets():
+            raise TURNS.TurnRefused(400, f"cannot start a session in {target!r} here; choose one of: "
+                                         f"{', '.join(handoff_targets()) or 'none'}")
+        h = _handoff_source(p["from"], cfg)
+        why = HO.send_refusal(cfg)
+        if why:
+            raise TURNS.TurnRefused(403, why.replace(" Without --start the prompt is printed for you to paste.", ""))
+        if not h["cwd"] or not os.path.isdir(h["cwd"]):
+            raise TURNS.TurnRefused(412, f"the conversation's directory no longer exists: {h['cwd'] or '(none recorded)'}")
+        if (h["metadata"] or {}).get("cwd_source") not in (None, "summaries"):
+            raise TURNS.TurnRefused(412, "the conversation's directory was inferred, not recorded")
+        if HO.find_secrets(prompt) and body.get("ignore_secrets") is not True:
+            raise TURNS.TurnRefused(409, "the prompt holds what looks like a credential: remove it, or confirm sending it anyway")
+        turn, _ = HO.start_session(_runner(), _db(), h["id"], target, prompt, h["cwd"], kind=p["kind"], edits=edits,
+                                   mcp_tools=tuple(TT.load(cfg)) if edits else (), read_dirs=(p["dir"],),
+                                   model=HO.session_model(cfg, target))
+    except TURNS.TurnRefused as e:
+        return e.status, json.dumps({"error": str(e)})
+    except ValueError as e:                        # opencode with no model to name
+        return 412, json.dumps({"error": str(e)})
+    except LookupError as e:
+        return 424, json.dumps({"error": str(e)})
+    return 200, json.dumps(turn.snapshot())
 
 
 # Browser-facing guard (any web page can reach a localhost port): every request must name this
@@ -804,6 +921,18 @@ class Handler(BaseHTTPRequestHandler):
                 except BodyTooLarge as e:
                     return self._send(413, json.dumps({"error": str(e)}))
                 return self._send(*handle_turn_tools_save(body))
+            if path == "/api/handoff/start" or (path.startswith("/api/conversation/") and path.endswith("/handoff")):
+                if self._turns_refused():
+                    return
+                try:
+                    body = self._json_body()
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return self._send(400, json.dumps({"error": "invalid json"}))
+                except BodyTooLarge as e:
+                    return self._send(413, json.dumps({"error": str(e)}))
+                if path == "/api/handoff/start":
+                    return self._send(*handle_handoff_start(body))
+                return self._send(*handle_handoff_preview(_segment(path[:-len("/handoff")], "/api/conversation/"), body))
             if path.startswith("/api/conversation/") and path.endswith("/turn"):
                 if self._turns_refused():
                     return

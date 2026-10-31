@@ -412,6 +412,7 @@ def test_start_session_links_once_the_harness_reports_its_session(tmp_path, monk
                                   kind="review", edits=True, read_dirs=["/d"], model="p/m")
     events = drain(runner, turn)
     assert state["id"] == "opencode:ses_new1" and any(e.get("text") == "on it" for e in events) and events[-1]["kind"] == "done"
+    assert [e for e in events if e["kind"] == "session"] == [{"kind": "session", "id": "opencode:ses_new1", "linked": True}]
     assert seen["edits"] is False and seen["read_dirs"] == ("/d",) and seen["model"] == "p/m"   # a review never edits
     conn = dbm.connect(tmp_path / "t.db")
     assert dbm.links_for(conn, "claude_code:s1") == [{"id": "opencode:ses_new1", "relation": "review_of", "direction": "to"}]

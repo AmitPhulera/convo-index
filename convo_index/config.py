@@ -53,6 +53,9 @@ SUMMARY_TAIL_CHARS = 5000
 CLASSIFY_PROMPT_PREFIX = "Classify this developer conversation"
 # Same idea for the summarizer prompt.
 SUMMARY_PROMPT_PREFIX = "You are summarizing a coding-assistant conversation transcript"
+# The other way round for a handoff: its new session is headless too (`claude -p`), and these
+# openings of its prompt mark it as a real conversation to index, linked to the original.
+HANDOFF_PROMPT_PREFIXES = ("You are taking over a coding conversation", "You are reviewing a coding conversation")
 
 # Jira-style ticket key pattern.
 TICKET_RE = r"\b[A-Z]{2,}-\d+\b"

@@ -695,3 +695,65 @@ def test_an_edit_turn_gets_the_allowlist_and_a_read_only_turn_does_not(site, mcp
     sse_events(site, body["turn_id"])
     argv = captured.read_text(encoding="utf-8").splitlines()
     assert "--mcp-config" not in argv and "--allowedTools" not in argv and "--safe-mode" in argv
+
+
+# ---- handoffs ---------------------------------------------------------------------------------
+
+def handoff(site, path, body, token=True):
+    headers = {server.TURN_TOKEN_HEADER: server.turn_token()} if token else {}
+    return request(site, "POST", path, body, headers=headers, token=False)
+
+
+def test_a_handoff_is_prepared_then_started_and_links_the_new_conversation(site):
+    status, prep = handoff(site, f"/api/conversation/{CID}/handoff", {"kind": "review"})
+    assert status == 200 and prep["prompt"].startswith("You are reviewing") and prep["digest_status"] is None
+    assert "claude_code" in prep["targets"] and "hosted_processing = ask" in prep["send_refusal"]
+    body = {"preview_id": prep["preview_id"], "target": "claude_code", "prompt": prep["prompt"], "edits": True}
+    status, refused = handoff(site, "/api/handoff/start", body)
+    assert status == 403 and "hosted_processing = ask" in refused["error"] and "--start" not in refused["error"]
+    site.settings["privacy"]["hosted_processing"] = "allow"
+    new = "9a8b7c6d-1234-4abc-8def-0123456789ab"
+    os.environ["FAKE_HARNESS"] = json.dumps([{"argv_to": str(site.tmp / "argv.txt")},
+                                             {"line": json.dumps({"type": "system", "subtype": "init", "session_id": new})}]
+                                            + claude_lines("second opinion: looks fine")[1:])
+    status, snap = handoff(site, "/api/handoff/start", body)
+    assert status == 200 and snap["turn_id"] and snap["edits"] is False             # a review never edits
+    events, _ = sse_events(site, snap["turn_id"])
+    assert {"kind": "session", "id": f"claude_code:{new}", "linked": True} in events
+    assert {"kind": "text", "text": "second opinion: looks fine"} in events and events[-1]["kind"] == "done"
+    argv = (site.tmp / "argv.txt").read_text().splitlines()
+    assert len(argv[argv.index("--session-id") + 1]) == 36 and "--add-dir" in argv     # our id; the copy's directory, from the server
+    copy_dir = argv[argv.index("--add-dir") + 1]
+    assert (Path(copy_dir) / "transcript.md").exists() and Path(copy_dir).parent.name == "handoffs"
+    status, conv = request(site, "GET", f"/api/conversation/{CID}")
+    assert conv["links"] == [{"id": f"claude_code:{new}", "relation": "review_of", "direction": "to", "title": None}]
+    assert "claude_code" in conv["handoff_targets"]
+
+
+def test_handoff_requests_are_guarded_and_checked(site):
+    assert handoff(site, f"/api/conversation/{CID}/handoff", {"kind": "review"}, token=False)[0] == 403
+    assert handoff(site, f"/api/conversation/{CID}/handoff", {"kind": "fork"})[0] == 400
+    assert handoff(site, "/api/conversation/claude_code:nope/handoff", {"kind": "review"})[0] == 404
+    status, body = handoff(site, "/api/handoff/start", {"preview_id": "made-up", "target": "claude_code", "prompt": "x"})
+    assert status == 404 and "prepare it again" in body["error"]
+    site.settings["privacy"]["hosted_processing"] = "allow"
+    pid = handoff(site, f"/api/conversation/{CID}/handoff", {"kind": "continue"})[1]["preview_id"]
+    start = lambda **kw: handoff(site, "/api/handoff/start", {"preview_id": pid, "target": "claude_code", "prompt": "go", **kw})
+    assert start(target="codex")[0] == 400
+    assert start(prompt="use AKIAABCDEFGHIJKLMNOP")[0] == 409                        # a credential needs confirming
+    assert start(prompt="bad \x00 prompt")[0] == 400
+    os.environ["FAKE_HARNESS"] = json.dumps(claude_lines("ok"))
+    status, snap = start(prompt="use AKIAABCDEFGHIJKLMNOP", ignore_secrets=True)
+    assert status == 200
+    sse_events(site, snap["turn_id"])
+    site.settings["sources"]["claude_code"] = {"enabled": False, "exclude_cwd": []}
+    status, body = handoff(site, f"/api/conversation/{CID}/handoff", {"kind": "review"})
+    assert status == 403 and "disabled" in body["error"]
+
+
+def test_a_continue_preview_carries_the_note_or_says_why_not(site, monkeypatch):
+    from convo_index import handoff as HO
+    monkeypatch.setattr(HO, "digest", lambda msgs, title, settings: (None, "the summary backend did not answer within 90 s"))
+    status, prep = handoff(site, f"/api/conversation/{CID}/handoff", {"kind": "continue"})
+    assert status == 200 and prep["digest_status"].startswith("the summary backend did not answer")
+    assert "None could be written (the summary backend did not answer" in prep["prompt"]
