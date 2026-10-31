@@ -118,7 +118,8 @@ function blockMarkdown(escaped) {
     if (isTableStart(lines, i)) {
       const rows = [line, lines[i + 1]];
       i += 2;
-      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) rows.push(lines[i++]);
+      // rows run to a blank line, a line without a bar, or the start of another block (GFM)
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim() && !blockStart(lines, i)) rows.push(lines[i++]);
       flush(); out.push({ html: tableHTML(rows) });
     } else if (MD_RULE.test(line)) {
       flush(); out.push({ html: "<hr>" }); i++;

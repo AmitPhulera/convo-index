@@ -51,6 +51,12 @@ def test_bars_in_prose_or_without_a_separator_row_are_not_a_table():
     assert b == "| a | b |\n| c | d |"
 
 
+def test_a_table_ends_where_another_block_starts():
+    (html,) = render("| Key |\n| --- |\n| value |\n## Run a | b | c\n- item | x")
+    assert html.count("<tr>") == 2
+    assert '</table></div><strong class="md-h">Run a | b | c</strong><ul><li>item | x</li></ul>' in html
+
+
 def test_rows_are_padded_to_the_header_and_inline_markdown_works_in_cells():
     (html,) = render("| a | b |\n|---|---|\n| **x** |")
     assert "<tr><td><strong>x</strong></td><td></td></tr>" in html
