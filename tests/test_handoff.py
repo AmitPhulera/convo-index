@@ -304,3 +304,11 @@ def test_secrets_in_tool_output_are_reported_from_the_transcript_file(tmp_path, 
     assert cli.main(["handoff", "s1", "--review", "--transcript-dir", str(tmp_path / "h")]) == 0
     out = capsys.readouterr()
     assert "AKIA" not in out.out and "looks like a secret in the transcript file" in out.err and "AWS access key" in out.err
+
+
+def test_the_budget_counts_each_message_as_rendered(tmp_path):
+    msgs = [Message(seq=0, role="user", text="go")] + [
+        Message(seq=i, role="assistant", text="a" * 60) for i in range(1, 2001)]
+    conn = _db(tmp_path, msgs)
+    out = H.build(conn, "claude_code:s1", "review", budget_chars=100_000)
+    assert not out["over_budget"] and out["dropped"] > 0 and "go" in out["prompt"]

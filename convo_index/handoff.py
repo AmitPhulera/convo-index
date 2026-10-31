@@ -387,15 +387,21 @@ def _exchange(msgs, kind):
     return keep
 
 
+def _cost(text):
+    """What one message adds to the prompt: its fenced text, the "**Assistant (n).**" label and
+    the blank line before the next one."""
+    return len(_block(text)) + 24
+
+
 def _fit(exchange, budget):
-    """Drop assistant messages, oldest first, until the exchange fits `budget` characters.
-    User messages are never dropped. Returns (exchange, dropped count)."""
-    size = sum(len(t) for _, t in exchange)
+    """Drop assistant messages, oldest first, until the rendered exchange fits `budget`
+    characters. User messages are never dropped. Returns (exchange, dropped count)."""
+    size = sum(_cost(t) for _, t in exchange)
     dropped, out = 0, list(exchange)
     i = 0
     while size > budget and i < len(out):
         if out[i][0] == "assistant":
-            size -= len(out[i][1])
+            size -= _cost(out[i][1])
             out[i] = ("assistant", None)
             dropped += 1
         i += 1
