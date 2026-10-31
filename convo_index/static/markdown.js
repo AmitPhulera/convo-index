@@ -34,6 +34,7 @@ function inlineMarkdown(escaped) {
 const MD_LIST = /^( *)([-*+]|\d{1,9}[.)])[ \t]+(.*)$/;
 const MD_RULE = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
 const MD_QUOTE = /^ {0,3}&gt; ?(.*)$/;                 // `>` arrives escaped
+const MD_QUOTE_DEPTH = 8;                              // deeper quotes render as text, not recursion
 const MD_HEADING = /^ {0,3}#{1,6}[ \t]/;
 const MD_TABLE_SEP = /^[ \t]*\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/;
 
@@ -106,8 +107,8 @@ function blockStart(lines, i) {
 
 // `escaped` is HTML-escaped text without fenced code. Prose keeps its line breaks (the
 // message body is pre-wrap); blank lines next to a block are dropped, the block's own
-// margins space it.
-function blockMarkdown(escaped) {
+// margins space it. `depth` counts enclosing quotes.
+function blockMarkdown(escaped, depth = 0) {
   const lines = escaped.split("\n");
   const out = [];          // {html} for blocks, {text: [lines]} for prose
   let prose = [];
@@ -126,7 +127,8 @@ function blockMarkdown(escaped) {
     } else if (MD_QUOTE.test(line)) {
       const inner = [];
       while (i < lines.length && MD_QUOTE.test(lines[i])) inner.push(lines[i++].match(MD_QUOTE)[1]);
-      flush(); out.push({ html: `<blockquote>${blockMarkdown(inner.join("\n"))}</blockquote>` });
+      const body = depth < MD_QUOTE_DEPTH ? blockMarkdown(inner.join("\n"), depth + 1) : inlineMarkdown(inner.join("\n"));
+      flush(); out.push({ html: `<blockquote>${body}</blockquote>` });
     } else if (MD_LIST.test(line)) {
       const items = [];
       while (i < lines.length) {

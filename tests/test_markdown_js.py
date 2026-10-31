@@ -91,6 +91,11 @@ def test_task_items_quotes_rules_and_strikethrough():
     assert "<hr><del>old</del> new" in html
 
 
+def test_deeply_nested_quotes_render_without_exhausting_the_stack():
+    (html,) = render("> " * 5000 + "text")
+    assert html.count("<blockquote>") == 9 and "text" in html
+
+
 def test_a_heading_ends_a_list():
     (html,) = render("- a\n## Next")
     assert squash(html) == '<ul><li>a</li></ul><strong class="md-h">Next</strong>'
