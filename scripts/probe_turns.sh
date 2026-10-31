@@ -45,7 +45,8 @@ if [ "$which" = codex ] || [ "$which" = all ]; then
   ctid=$(echo "Reply with exactly: PROBE-ONE" | codex exec --json --ignore-user-config --skip-git-repo-check --disable apps \
            -c project_doc_max_bytes=0 -s read-only -C "$proj" - 2>/dev/null \
          | python3 -c 'import json, sys; print(next((json.loads(l)["thread_id"] for l in sys.stdin if "thread.started" in l), ""))')
-  cfile=$(python3 -c 'import glob, os, sys; from convo_index.sources import codex; print(next(iter(glob.glob(os.path.join(str(codex.codex_home()), "sessions", "*", "*", "*", "*" + sys.argv[1] + ".jsonl"))), ""))' "$ctid")
+  cfile=""
+  [ -z "$ctid" ] || cfile=$(python3 -c 'import glob, os, sys; from convo_index.sources import codex; print(next(iter(glob.glob(os.path.join(str(codex.codex_home()), "sessions", "*", "*", "*", "*" + sys.argv[1] + ".jsonl"))), ""))' "$ctid")
 fi
 
 cat > AGENTS.md <<MD
