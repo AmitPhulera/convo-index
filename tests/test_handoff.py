@@ -228,3 +228,21 @@ def test_the_digest_reads_the_middle_of_a_long_conversation(fake_llm, llm_settin
     conn = _db(tmp_path)
     p = H.build(conn, "claude_code:s1", "continue", digest_result=d, digest_status="ok")["prompt"]
     assert "the middle was too long to include" in p
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes and symlinks")
+def test_transcript_file_is_private_even_over_an_existing_file_or_symlink(tmp_path):
+    conn = _db(tmp_path)
+    d = tmp_path / "out"
+    d.mkdir()
+    (d / "transcript.md").write_text("old")
+    os.chmod(d / "transcript.md", 0o644)
+    path = H.write_transcript(conn, "claude_code:s1", d)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600 and "[Bash]" in path.read_text()
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    path.unlink()
+    path.symlink_to(victim)
+    H.write_transcript(conn, "claude_code:s1", d)
+    assert victim.read_text() == "keep me" and not path.is_symlink()
+    assert sorted(p.name for p in d.iterdir()) == ["transcript.md"]       # no temp file left behind

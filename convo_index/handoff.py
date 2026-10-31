@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 from convo_index import export as X
@@ -172,9 +173,16 @@ def write_transcript(conn, cid, directory, settings=None):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = directory / "transcript.md"
-    fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(md)
+    # a new 0600 file renamed over the name: an existing file's mode is not inherited and a
+    # symlink planted at the name is replaced, never written through
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".transcript-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(md)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
     return path
 
 
