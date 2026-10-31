@@ -594,3 +594,15 @@ def test_cli_says_when_nothing_was_linked(tmp_path, monkeypatch, capsys):
     cli, _ = _start_env(tmp_path, monkeypatch, lines=["no session here"])
     assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 0
     assert "the tool never reported its session, so nothing was linked" in capsys.readouterr().err
+
+
+def test_the_refresh_after_a_session_has_a_time_limit(monkeypatch):
+    import subprocess
+    from convo_index import cli
+
+    def slow(*a, **k):
+        assert k["timeout"] == cli.INGEST_TIMEOUT
+        raise subprocess.TimeoutExpired(a[0], k["timeout"])
+    monkeypatch.setattr(subprocess, "run", slow)
+    out = cli._ingest_only()
+    assert out["ok"] is False and out["busy"] is False and "run convo-index index" in out["error"]

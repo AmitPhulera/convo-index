@@ -359,11 +359,18 @@ def cmd_handoff(args):
     return 0
 
 
+INGEST_TIMEOUT = 600     # seconds: the session's end waits for this refresh
+
+
 def _ingest_only():
     """The refresh a browser turn runs after the harness exits: ingest, no LLM jobs."""
     import subprocess
     from convo_index.indexer import EXIT_LOCKED
-    res = subprocess.run([sys.executable, "-m", "convo_index.indexer", "--no-jobs"], capture_output=True, text=True, check=False)
+    try:
+        res = subprocess.run([sys.executable, "-m", "convo_index.indexer", "--no-jobs"], capture_output=True, text=True,
+                             check=False, timeout=INGEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "busy": False, "error": f"indexing took over {INGEST_TIMEOUT} s; run convo-index index"}
     return {"ok": res.returncode == 0, "busy": res.returncode == EXIT_LOCKED, "error": (res.stderr or "")[-500:]}
 
 
@@ -411,8 +418,13 @@ def _start_handoff(args, settings, cid, h, kind, out, transcript):
                 print(f"✗ {ev.get('name') or 'tool'}: not allowed in this mode", file=sys.stderr)
     except KeyboardInterrupt:
         runner.stop(turn.id)
-        for _, ev in runner.events(turn.id):
-            last = ev if ev is not None else last
+        print("stopping… (Ctrl-C again to leave now)", file=sys.stderr)
+        try:
+            for _, ev in runner.events(turn.id):
+                last = ev if ev is not None else last
+        except KeyboardInterrupt:          # the refresh after a session can take a while
+            print("left before the session finished; it is indexed on the next refresh", file=sys.stderr)
+            return 130
     ok = bool(last) and last["kind"] == "done"
     if not ok and last:
         print(f"the session failed: {last.get('message') or 'unknown error'}", file=sys.stderr)
