@@ -146,8 +146,10 @@ def find_secrets(text):
 
 def _git(cwd, *args, timeout=5):
     try:
-        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout,
-                           stdin=subprocess.DEVNULL)
+        # git writes UTF-8 (and raw bytes for a message without an encoding header); the locale's
+        # code page (Windows) would fail on some of them
+        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout.rstrip() if r.returncode == 0 else None
