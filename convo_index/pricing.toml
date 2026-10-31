@@ -13,7 +13,8 @@
 revision = "2026-09-16"
 sources = ["https://platform.claude.com/docs/en/about-claude/pricing",
            "https://developers.openai.com/api/docs/pricing",
-           "https://ai.google.dev/gemini-api/docs/pricing"]
+           "https://ai.google.dev/gemini-api/docs/pricing",
+           "https://api-docs.deepseek.com/quick_start/pricing"]
 
 # Providers whose models run locally: every model is priced at 0 and counts as priced.
 zero_cost_providers = ["ollama", "lmstudio", "llamacpp", "local"]
@@ -91,6 +92,11 @@ zero_cost_providers = ["ollama", "lmstudio", "llamacpp", "local"]
 "gemini-2.5-flash"       = { input = 0.3,  output = 2.5,  cache_read = 0.03 }
 "gemini-2.5-flash-lite"  = { input = 0.1,  output = 0.4,  cache_read = 0.01 }
 
+# DeepSeek (added 2026-10-31). Off-peak rates: peak hours (01:00-04:00 and 06:00-10:00 UTC,
+# Monday-Friday, except Chinese public holidays) bill everything at 2x. input = cache miss,
+# cache_read = cache hit; no separate cache-write charge, so cache_write falls back to input.
+"deepseek-flash"  = { input = 0.15, output = 0.6,  cache_read = 0.003 }
+"deepseek-v4-pro" = { input = 0.66, output = 1.98, cache_read = 0.022 }
 
 [aliases]
 # dated Anthropic ids -> the priced id
@@ -113,3 +119,6 @@ zero_cost_providers = ["ollama", "lmstudio", "llamacpp", "local"]
 "gpt-4.1-mini-2025-04-14"    = "gpt-4.1-mini"
 "gemini-3.8-flash-low"       = "gemini-3.8-flash"
 "gemini-3.8-flash-high"      = "gemini-3.8-flash"
+# DeepSeek: OpenCode names the Flash model by version; the retired v4 Flash is served at the Flash price
+"deepseek-v4.1-flash"        = "deepseek-flash"
+"deepseek-v4-flash"          = "deepseek-flash"

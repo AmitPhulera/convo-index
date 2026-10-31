@@ -24,6 +24,8 @@ def test_seed_pricing_loads_and_prices_known_models(tmp_path):
     assert p.rates("gpt-6.1-sol") == {"input": 2.0, "output": 10.0, "cache_read": 0.10, "cache_write": 2.5, "cache_write_1h": 2.5}
     assert p.rates("gpt-6.1-terra")["cache_read"] == 0.05                # short-context rates (<= 272k)
     assert p.rates("gemini-4-argon")["input"] == 2.0                      # rate in force until 2026-12-01
+    assert p.rates("deepseek-v4.1-flash") == p.rates("deepseek-flash")   # OpenCode's name -> DeepSeek's id
+    assert p.rates("deepseek-flash") == {"input": 0.15, "output": 0.6, "cache_read": 0.003, "cache_write": 0.15, "cache_write_1h": 0.15}
 
 
 def test_user_pricing_file_overrides_and_extends(tmp_path, monkeypatch):
