@@ -484,9 +484,9 @@ Claude Code, Opencode and Codex can query the archive. It respects the same excl
 returns `fidelity` and `source` on every hit.
 
 **Browser turns.** The UI server can continue a conversation in its own tool. The source
-adapter supplies `turn_command(native_id, prompt, cwd, edits, mcp_tools)` (argv with fixed closing flags,
-the validated session id and nothing else conversation-derived; the prompt on stdin where the
-tool reads it), `turn_events(line)` (its stream translated to `text`, `tool`, `tool_result`,
+adapter supplies `turn_command(native_id, prompt, cwd, edits, mcp_tools, locator)` (argv with fixed closing flags,
+the validated session id, or for pi the indexed session file after its header was checked
+against the id, and nothing else conversation-derived; the prompt on stdin where the tool reads it), `turn_events(line)` (its stream translated to `text`, `tool`, `tool_result`,
 `denied`, `done`, `error`) and `last_activity(native_id, locator)`. `turns.TurnRunner` owns the
 process: one per conversation, a global cap, its own process group (ended on timeout, stop,
 server exit and after the harness returns), stdout and stderr drained concurrently into
