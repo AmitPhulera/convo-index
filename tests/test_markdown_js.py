@@ -96,6 +96,11 @@ def test_deeply_nested_quotes_render_without_exhausting_the_stack():
     assert html.count("<blockquote>") == 9 and "text" in html
 
 
+def test_windows_line_endings_still_make_tables_and_lists():
+    (html,) = render("| a | b |\r\n|---|---|\r\n| 1 | 2 |\r\n\r\n- x\r\n- y")
+    assert "<td>1</td><td>2</td>" in html and squash(html).endswith("<ul><li>x</li><li>y</li></ul>")
+
+
 def test_a_heading_ends_a_list():
     (html,) = render("- a\n## Next")
     assert squash(html) == '<ul><li>a</li></ul><strong class="md-h">Next</strong>'

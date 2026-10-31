@@ -109,7 +109,7 @@ function blockStart(lines, i) {
 // message body is pre-wrap); blank lines next to a block are dropped, the block's own
 // margins space it. `depth` counts enclosing quotes.
 function blockMarkdown(escaped, depth = 0) {
-  const lines = escaped.split("\n");
+  const lines = escaped.split(/\r\n?|\n/);            // a transcript written on Windows has CRLF
   const out = [];          // {html} for blocks, {text: [lines]} for prose
   let prose = [];
   const flush = () => { if (prose.length) out.push({ text: prose }); prose = []; };
