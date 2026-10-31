@@ -43,6 +43,20 @@ def test_claude_read_only_turn_closes_every_surface_and_sends_the_prompt_on_stdi
     assert base.turn_launcher("claude_code:abc") == ["/opt/bin/claude"]
 
 
+def test_claude_new_session_keeps_the_closing_flags_and_opens_only_the_read_dirs(claude_on_path, claude_mcp):
+    cmd, sid = cc.new_session_command("take over", "/proj", read_dirs=["/data/handoffs/x"], model="claude-sonnet-5-5")
+    assert cmd.argv == ["/opt/bin/claude", "--session-id", sid,
+                        "-p", "--output-format", "stream-json", "--verbose", "--safe-mode", "--restricted",
+                        "--strict-mcp-config", "--disable-slash-commands", "--permission-prompts", "none",
+                        "--tools", "Read,Glob,Grep", "--add-dir", "/data/handoffs/x", "--model", "claude-sonnet-5-5"]
+    assert cmd.stdin == "take over" and len(sid) == 36 and "--resume" not in cmd.argv
+    edit, sid2 = cc.new_session_command("go on", "/proj", edits=True, read_dirs=["/d"])
+    assert sid2 != sid and edit.argv[1:3] == ["--session-id", sid2] and edit.argv[-2:] == ["--add-dir", "/d"]
+    assert "Bash" in edit.argv[edit.argv.index("--tools") + 1] and "--safe-mode" not in edit.argv
+    init = json.dumps({"type": "system", "subtype": "init", "session_id": sid})
+    assert cc.session_id(init) == sid and cc.session_id('{"type": "assistant"}') is None and cc.session_id("nope") is None
+
+
 def test_claude_read_only_turn_ignores_the_mcp_allowlist(claude_on_path, claude_mcp):
     cmd = base.turn_command("claude_code:abc", "what changed?", "/proj", mcp_tools=("mcp__atlassian__*",))
     assert "--safe-mode" in cmd.argv and "--mcp-config" not in cmd.argv and "Bash" not in " ".join(cmd.argv)

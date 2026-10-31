@@ -13,6 +13,7 @@ import json
 import os
 import re
 import tempfile
+import uuid
 from pathlib import Path
 
 from convo_index.config import PROJECTS_DIR, CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX
@@ -432,15 +433,44 @@ def mcp_servers():
 
 
 def turn_command(native_id, prompt, cwd, *, edits=False, mcp_tools=(), locator=None):
+    return _command(["--resume", native_id], prompt, cwd, edits=edits, mcp_tools=mcp_tools)
+
+
+# A handoff starts a new session with the same closing flags. The id is ours (`--session-id`),
+# so the link to the original can be written before the harness answers. `--restricted`
+# confines Read to the cwd; each of `read_dirs` (the transcript copy's directory) is opened
+# with `--add-dir` and nothing else outside is. Verified on 2.1.316: the init event echoes the
+# id, and Read opens a file in an added directory under the read-only flags.
+
+def new_session_command(prompt, cwd, *, edits=False, mcp_tools=(), read_dirs=(), model=None):
+    """(TurnCommand, native id) for a new session seeded with `prompt`, or (None, None)."""
+    native_id = str(uuid.uuid4())
+    extra = [a for d in read_dirs for a in ("--add-dir", str(d))] + (["--model", model] if model else [])
+    cmd = _command(["--session-id", native_id], prompt, cwd, edits=edits, mcp_tools=mcp_tools, extra=extra)
+    return (cmd, native_id) if cmd else (None, None)
+
+
+def session_id(line):
+    """The session id an init event reports, or None."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(d, dict) and d.get("type") == "system" and isinstance(d.get("session_id"), str):
+        return d["session_id"]
+    return None
+
+
+def _command(session, prompt, cwd, *, edits, mcp_tools, extra=()):
     prefix = launcher()
     if prefix is None:
         return None
     if not edits:
-        return TurnCommand(argv=prefix + ["--resume", native_id] + TURN_FLAGS + ["--tools", READ_TOOLS], cwd=cwd, stdin=prompt)
+        return TurnCommand(argv=prefix + session + TURN_FLAGS + ["--tools", READ_TOOLS] + list(extra), cwd=cwd, stdin=prompt)
     servers = mcp_servers()
     chosen = [p for p in (turn_tools.split(e, servers) for e in mcp_tools) if p]   # a server removed since is skipped
     allowed = ["Bash"] + [f"mcp__{server}" if tool == "*" else f"mcp__{server}__{tool}" for server, tool in chosen]
-    argv = prefix + ["--resume", native_id] + EDIT_FLAGS + ["--tools", EDIT_TOOLS, "--permission-mode", "acceptEdits"]
+    argv = prefix + session + EDIT_FLAGS + ["--tools", EDIT_TOOLS, "--permission-mode", "acceptEdits"]
     scratch = ()
     if chosen:
         # the specs can carry headers with tokens: an owner-only directory the runner removes
@@ -450,7 +480,7 @@ def turn_command(native_id, prompt, cwd, *, edits=False, mcp_tools=(), locator=N
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump({"mcpServers": {server: servers[server] for server, _ in chosen}}, fh)
         argv += ["--mcp-config", config]
-    argv += ["--allowedTools", ",".join(allowed)]
+    argv += ["--allowedTools", ",".join(allowed)] + list(extra)
     return TurnCommand(argv=argv, cwd=cwd, stdin=prompt, scratch=scratch)
 
 
