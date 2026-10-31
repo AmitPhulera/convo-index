@@ -375,6 +375,19 @@ a.badge.ticket:hover { text-decoration: underline; }
 .msg-body pre code { background: none; padding: 0; }
 .msg-body .md-h { display: block; margin: 10px 0 2px; font-size: 14px; }
 .msg-body .md-h:first-child { margin-top: 0; }
+.msg-body .md-table { overflow-x: auto; margin: 8px 0; white-space: normal; }
+.msg-body table { border-collapse: collapse; font-size: 13.5px; line-height: 1.45; }
+.msg-body th, .msg-body td { border: 1px solid var(--border); padding: 5px 10px; text-align: left; vertical-align: top; }
+.msg-body th { background: var(--surface-2); font-weight: 600; }
+.msg-body .md-c { text-align: center; }
+.msg-body .md-r { text-align: right; }
+.msg-body ul, .msg-body ol { white-space: normal; margin: 6px 0; padding-left: 22px; }
+.msg-body li + li { margin-top: 3px; }
+.msg-body li > ul, .msg-body li > ol { margin: 3px 0; }
+.msg-body .md-task { list-style: none; margin-left: -20px; }
+.msg-body .md-task input { margin: 0 6px 0 0; vertical-align: -1px; }
+.msg-body blockquote { margin: 8px 0; padding: 2px 12px; border-left: 3px solid var(--border); color: var(--text-2); }
+.msg-body hr { border: 0; border-top: 1px solid var(--border); margin: 12px 0; }
 .msg.tool_call .msg-body, .msg.tool_result .msg-body, .msg.thinking .msg-body { background: transparent; border-style: dashed; color: var(--text-2); font-size: 13px; padding: 6px 12px; }
 .msg.harness .msg-body { background: transparent; border-style: dashed; border-color: var(--warn); color: var(--text-2); font-size: 13px; padding: 6px 12px; }
 .msg.harness .role-tag { color: var(--warn); } .msg.harness .role-tag::before { background: var(--warn); }
