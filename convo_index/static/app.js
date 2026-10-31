@@ -1154,7 +1154,8 @@ function detachHandoff() {
 }
 
 function handoffHTML(c) {
-  const opts = c.handoff_targets.map(t => `<option value="${escape(t)}"${t !== c.source ? " selected" : ""}>${escape(sourceLabel(t))}</option>`).join("");
+  const first = c.handoff_targets.find(t => t !== c.source) || c.handoff_targets[0];   // another tool, when there is one
+  const opts = c.handoff_targets.map(t => `<option value="${escape(t)}"${t === first ? " selected" : ""}>${escape(sourceLabel(t))}</option>`).join("");
   return `<div class="handoff-panel" id="handoff-panel" hidden>
     <div class="handoff-head"><strong>Hand off</strong>
       <span class="hint">A new session in another tool starts from a prompt built from this conversation. You can edit the prompt first.</span></div>
