@@ -377,6 +377,15 @@ def test_up_runs_init_services_and_the_first_index(tmp_path, monkeypatch, capsys
     assert "nohup convo-index serve >> /l 2>&1 &" in attention
     assert "CONVO_INDEX_CONFIG=/c.toml convo-index index" in attention                # the plan's command, config kept
     assert "convo-index is at" in out.split("Needs your attention:")[0]
+    log = tmp_path / "serve.log"
+    log.write_text("x" * 9000 + "\nstarting\nOSError: [Errno 98] Address already in use\n")
+    monkeypatch.setattr(SCH, "log_path", lambda settings, job="refresh": log)
+    monkeypatch.setattr(cli, "_wait_for_port", lambda host, port, seconds=15: False)
+    assert cli.main(["up", "--no-open", "--no-schedule"]) == 1             # the session server never came up
+    attention = capsys.readouterr().out.split("Needs your attention:")[1]
+    assert "will not start again" not in attention                          # no "restart it later" next to "it is not running"
+    assert "Address already in use" in attention and "x" * 100 not in attention   # only the end of the log
+    assert attention.rstrip().endswith("nohup convo-index serve >> /l 2>&1 &")    # how to start it once fixed
     monkeypatch.setattr(SCH, "uninstall", lambda settings, dry_run=False, job="refresh", **k:
                         {"kind": "schtasks", "results": [{"cmd": ["schtasks"], "ok": False, "stderr": "Access is denied"}]})
     assert cli.main(["service", "uninstall"]) == 1                       # a failed deregistration is a failure

@@ -525,10 +525,14 @@ def _attention(items):
     if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
         head = f"\033[1;33m{head}\033[0m"
     print(f"\n{head}")
-    for n, (text, cmds) in enumerate(items, 1):
+    for n, (text, cmds, *then) in enumerate(items, 1):
         print(f"  {n}. {text}")
         for c in cmds:
             print(f"       {c}")
+        for more, more_cmds in then:           # a second step of the same item
+            print(f"     {more}")
+            for c in more_cmds:
+                print(f"       {c}")
 
 
 def cmd_up(args):
@@ -550,6 +554,7 @@ def cmd_up(args):
     settings = S.load(use_cache=False)
     print()
     problems, todo, told = [], [], set()
+    restart, start = None, "convo-index serve"   # the "start it again" item, and the command that starts it
     for job, skip in (("serve", args.no_serve), ("refresh", args.no_schedule)):
         if skip:
             continue
@@ -575,11 +580,13 @@ def cmd_up(args):
             SCH.start_detached(out)
             print(f"{name}: running for this session only")
             if out["kind"] == "cron":
-                todo.append(("The UI server will not start again after a reboot. If cron runs on this machine, "
-                             "add this line with `crontab -e`:", [out["crontab"]]))
+                restart = ("The UI server will not start again after a reboot. If cron runs on this machine, "
+                           "add this line with `crontab -e`:", [out["crontab"]])
             else:
-                todo.append(("The UI server will not start again after this machine or container restarts. "
-                             "Start it again with:", [out["manual"]]))
+                restart = ("The UI server will not start again after this machine or container restarts. "
+                           "Start it again with:", [out["manual"]])
+            start = out["manual"]
+            todo.append(restart)
         else:
             print(f"{name}: not scheduled")
             if out["kind"] == "cron":
@@ -616,9 +623,13 @@ def cmd_up(args):
             print(f"UI server: did not answer at {url} within 15 s", file=sys.stderr)
             problems.append("serve")
             tail = _log_tail(log)
-            todo.append((f"The UI server is not running. Its log ({log}) ends with:" if tail else
-                         f"The UI server is not running and wrote nothing to {log}. Try it in the foreground:",
-                         tail or ["convo-index serve"]))
+            if restart:                        # "start it again after a restart" would contradict this item
+                todo.remove(restart)
+            if tail:
+                todo.append((f"The UI server is not running. Its log ({log}) ends with:", tail,
+                             ("After fixing that, start it with:", [start])))
+            else:
+                todo.append((f"The UI server is not running and wrote nothing to {log}. Start it with:", [start]))
     _attention(todo)
     if problems:
         return rc or 1
