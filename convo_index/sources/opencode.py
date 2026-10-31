@@ -550,15 +550,41 @@ def turn_config_home():
     return tempfile.mkdtemp(prefix="convo-index-opencode-")
 
 
+def session_model(native_id, locator):
+    """"provider/model" of the session's last request, or None. A turn names it: with the turn's
+    empty configuration home opencode would otherwise fall back to a default model, which a
+    workspace's privacy settings may refuse ("This Go model trains on request data", 2.2.4)."""
+    if not locator or not locator.startswith("sqlite:") or "#" not in locator:
+        return None
+    db_path, _, session_id = locator[len("sqlite:"):].rpartition("#")
+    if session_id != native_id:
+        return None
+    try:
+        conn = _connect_ro(db_path)
+    except sqlite3.Error:
+        return None
+    try:
+        loaded = load_session(conn, session_id, db_path)
+    except (sqlite3.Error, RuntimeError, UnreadableSource):
+        return None
+    finally:
+        conn.close()
+    usage = [u for u in (loaded[0].usage if loaded else []) if u.provider and u.model]
+    return f"{usage[-1].provider}/{usage[-1].model}" if usage else None
+
+
 def turn_command(native_id, prompt, cwd, *, edits=False, mcp_tools=(), locator=None):
     """`mcp_tools` is ignored: a turn's configuration home is empty, so no MCP server loads.
-    The session is resumed by id (`locator` points into the shared database)."""
+    The session is resumed by id (`locator` points into the shared database), with its own
+    model when the database names one."""
     prefix = launcher()
     if prefix is None:
         return None
     if prompt.startswith("-"):
         prompt = " " + prompt
-    argv = prefix + RUN_FLAGS + ["--session", native_id] + ([] if edits else ["--agent", "plan"]) + [prompt]
+    model = session_model(native_id, locator)
+    argv = (prefix + RUN_FLAGS + ["--session", native_id] + (["-m", model] if model else [])
+            + ([] if edits else ["--agent", "plan"]) + [prompt])
     home = turn_config_home()
     env = {"XDG_CONFIG_HOME": home,                   # no global opencode.json, plugins, agents, commands
            "OPENCODE_DISABLE_CLAUDE_CODE": "1",       # nor ~/.claude and project .claude instructions
