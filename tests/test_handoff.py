@@ -5,6 +5,7 @@ import subprocess
 from convo_index import db as dbm
 from convo_index import handoff as H
 from convo_index.model import Conversation, Message, KIND_TOOL_CALL, KIND_TOOL_RESULT, KIND_THINKING
+from convo_index.providers.base import LLMResult
 
 
 def _msgs():
@@ -82,3 +83,25 @@ def test_repo_state_reads_git_and_is_none_elsewhere(tmp_path):
     assert state["branch"] == "main" and "a.txt" in state["status"] and "first commit" in state["log"]
     assert "a.txt" in state["diff_stat"]
     assert H.repo_state(str(tmp_path / "plain")) is None and H.repo_state(None) is None
+
+
+def test_digest_uses_the_summary_job_and_reports_failure(fake_llm, llm_settings):
+    msgs = [m.__dict__ for m in _msgs()]
+    f = fake_llm({"goal": " g ", "decisions": ["d", ""], "state": "s", "unfinished": [], "next_step": "n",
+                  "unverified_claims": ["c"]})
+    d, status = H.digest(msgs, "T", llm_settings)
+    assert status == "ok" and d["goal"] == "g" and d["decisions"] == ["d"] and d["unverified_claims"] == ["c"]
+    call = f.calls[0]
+    assert call["job"] == "summary" and call["timeout"] == 90 and "be brief" not in call["prompt"]
+    assert "[Bash]" in call["prompt"] and "2 failed" not in call["prompt"] and "Do not touch the CLI flags." in call["prompt"]
+    fake_llm(LLMResult(ok=False, error="provider", detail="429 rate limited\nretry later"))
+    assert H.digest(msgs, "T", llm_settings) == (None, "429 rate limited")
+    f = fake_llm(LLMResult(ok=False, error="malformed", detail='{"goal": "half an ans'), {"goal": "g"})
+    assert H.digest(msgs, "T", llm_settings)[1] == "ok" and len(f.calls) == 2       # retried once
+    f = fake_llm(*[LLMResult(ok=False, error="malformed", detail='{"goal": "half')] * 3)
+    assert H.digest(msgs, "T", llm_settings) == (None, "the summary backend's answer was not the expected JSON")
+    assert len(f.calls) == 2
+    f = fake_llm(LLMResult(ok=False, error="timeout"), {"goal": "g"})
+    assert H.digest(msgs, "T", llm_settings) == (None, "the summary backend did not answer within 90 s")
+    assert len(f.calls) == 1                                                        # a timeout is not retried
+
