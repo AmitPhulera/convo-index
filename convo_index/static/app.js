@@ -1153,8 +1153,9 @@ document.addEventListener("keydown", e => {
   const typing = tag === "input" || tag === "textarea" || tag === "select" || e.target.isContentEditable;
   // Chrome clears an <input type=search> on Escape; blur instead so the query survives.
   if (e.key === "Escape") {
-    const filters = $("filters-panel");
-    if (!filters.hidden && (!typing || filters.contains(e.target))) setFiltersOpen(false, true);   // the panel first
+    const filters = $("filters-panel"), tools = $("tools-panel");
+    if (tools && !tools.hidden && (!typing || tools.contains(e.target))) toggleToolsPanel(false);   // an open panel first
+    else if (!filters.hidden && (!typing || filters.contains(e.target))) setFiltersOpen(false, true);
     else if (typing) { e.preventDefault(); e.target.blur(); }
     else if (NARROW.matches && $("detail").classList.contains("details-open")) toggleDetailsPanel(false);   // the drawer first
     else closeDetail();
