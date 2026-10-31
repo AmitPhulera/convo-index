@@ -131,14 +131,18 @@ def test_transcript_file_is_private_and_complete(tmp_path):
     assert H.write_transcript(conn, "claude_code:nope", tmp_path / "scratch") is None
 
 
-def test_repo_state_reads_git_and_is_none_elsewhere(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+def _git_repo(path, subject="first commit"):
+    path.mkdir()
+    git = ["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@example.com"]
     subprocess.run(git + ["init", "-q", "-b", "main"], check=True)
-    (repo / "a.txt").write_text("one\n")
+    (path / "a.txt").write_text("one\n")
     subprocess.run(git + ["add", "a.txt"], check=True)
-    subprocess.run(git + ["commit", "-q", "-m", "first commit"], check=True)
+    subprocess.run(git + ["commit", "-q", "-m", subject], check=True)
+    return path
+
+
+def test_repo_state_reads_git_and_is_none_elsewhere(tmp_path):
+    repo = _git_repo(tmp_path / "repo")
     (repo / "a.txt").write_text("two\n")
     state = H.repo_state(str(repo))
     assert state["branch"] == "main" and "a.txt" in state["status"] and "first commit" in state["log"]
@@ -322,3 +326,12 @@ def test_known_problems_keep_the_most_recent(tmp_path):
     section = out["prompt"][out["prompt"].index("## Known problems"):out["prompt"].index("## The user's messages")]
     assert section.count("- tool error:") == H.MAX_PROBLEMS and "attempt 1000" in section and "attempt 950\n" not in section
     assert "(950 earlier ones left out" in section and len(out["problems"]) == 1000
+
+
+def test_a_failing_git_command_is_not_shown_as_a_clean_tree(tmp_path):
+    repo = _git_repo(tmp_path / "repo")
+    (repo / ".git" / "index").write_bytes(b"not an index")
+    state = H.repo_state(str(repo))
+    p = H._repo(state)
+    assert state["status"] is None and "git status --short:\n(unavailable" in p
+    assert "first commit" in p                                            # the log still reads

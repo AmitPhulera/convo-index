@@ -158,7 +158,9 @@ def repo_state(cwd, max_lines=40):
         return None
 
     def cap(text):
-        lines = (text or "").splitlines()
+        if text is None:
+            return None          # git failed or timed out: not the same as no output
+        lines = text.splitlines()
         return "\n".join(lines[:max_lines] + ([f"… {len(lines) - max_lines} more lines"] if len(lines) > max_lines else []))
 
     return {"branch": _git(cwd, "rev-parse", "--abbrev-ref", "HEAD"),
@@ -351,7 +353,8 @@ def _repo(state):
     parts = [f"Branch now: {state['branch'] or '?'}"]
     for label, key in (("git status --short", "status"), ("git diff --stat HEAD", "diff_stat"), ("git log --oneline -10", "log")):
         body = state.get(key)
-        parts.append(f"{label}:\n" + (f"```\n{body}\n```" if body else "(nothing)"))
+        parts.append(f"{label}:\n" + ("(unavailable: git failed or did not answer)" if body is None else
+                                       f"```\n{body}\n```" if body else "(nothing)"))
     return "\n\n".join(parts)
 
 
