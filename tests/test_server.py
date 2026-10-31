@@ -111,6 +111,24 @@ def test_handle_config_exposes_labels_and_ticket_url(monkeypatch, tmp_path):
     assert data["ticket_url"].endswith("{key}")
 
 
+
+def test_start_command_follows_the_login_service(monkeypatch):
+    from convo_index import schedule as SCH
+    monkeypatch.setattr(SCH, "status", lambda **k: {"installed": True})
+    assert server.start_command() == "convo-index service install"
+    assert json.loads(server.handle_config())["start_command"] == "convo-index service install"
+    for installed in (False, None):                  # None: cron, where nothing says if it is there
+        monkeypatch.setattr(SCH, "status", lambda installed=installed, **k: {"installed": installed})
+        assert server.start_command() == "convo-index serve"
+
+
+def test_start_command_falls_back_when_the_service_check_fails(monkeypatch):
+    from convo_index import schedule as SCH
+    def boom(**k):
+        raise ValueError("config file does not exist")
+    monkeypatch.setattr(SCH, "status", boom)
+    assert server.start_command() == "convo-index serve"
+
 def test_semantic_search_disabled_on_fingerprint_mismatch(tmp_path, monkeypatch):
     real_embed = server.embed
     _seed(tmp_path / "t.db", monkeypatch)
