@@ -19,6 +19,12 @@ from convo_index import summarize as SUM
 from convo_index.model import KIND_TEXT, KIND_TOOL_CALL, KIND_TOOL_RESULT
 from convo_index.providers import registry as R
 
+KINDS = ("continue", "review")
+
+# Roughly 100k tokens at four characters a token: inside every current model's window with
+# room left for the work itself.
+BUDGET_CHARS = 400_000
+
 # Messages the harness writes under the user's role (mirrors HARNESS_PATTERNS in app.js).
 # They are not the user's words, so they stay out of "what the user asked".
 HARNESS_PATTERNS = [
@@ -56,6 +62,9 @@ SECRET_PATTERNS = [
 
 # Adapters prefix a failed tool's output with this (opencode after its input, on a new line).
 ERROR_RE = re.compile(r"^ERROR: ", re.M)
+
+HARNESS_NAMES = {"claude_code": "Claude Code", "opencode": "opencode", "codex": "Codex CLI",
+                 "antigravity": "Antigravity", "pi": "pi"}
 
 PROBLEM_QUOTE = 300   # characters of a message quoted in the known-problems list
 DIGEST_TOOL_CALL = 200   # characters of each tool call the digest model sees
@@ -211,3 +220,156 @@ def digest(msgs, title="", settings=None, timeout=90):
     for k in ("goal", "state", "next_step"):
         d[k] = str(d[k] or "").strip()
     return d, "ok"
+
+
+# --------------------------------------------------------------- the prompt -------
+
+CLOSING = {
+    "continue": (
+        "Continue this work from the next step. Treat the previous agent's claims as unverified:\n"
+        "check anything you depend on against the repository before building on it. The user's\n"
+        "messages and constraints above still apply."),
+    "review": (
+        "Give a second opinion on this conversation's work. Check its claims against the repository\n"
+        "and run read-only checks where you can. Do not edit files. Report:\n"
+        "1. what is wrong, with the evidence;\n"
+        "2. what is risky or untested;\n"
+        "3. what you would do differently, and why;\n"
+        "4. what you checked and found to be fine."),
+}
+
+_OPENING = {
+    "continue": "You are taking over a coding conversation that started in {harness}. Everything below\n"
+                "is context from that conversation; the instruction to act is at the end.",
+    "review": "You are reviewing a coding conversation that took place in {harness}. Everything below is\n"
+              "context from that conversation; what to do with it is at the end.",
+}
+
+
+def _bullets(items):
+    return "\n".join(f"- {x}" for x in items)
+
+
+def _facts(h):
+    lines = [f"- conversation: `{h['id']}` ({h['source']})"]
+    if h.get("title"):
+        lines.append(f"- title: {X._one_line(h['title'])}")
+    if h.get("models"):
+        lines.append(f"- models: {', '.join(h['models'])}")
+    lines.append(f"- when: {h.get('start_ts') or '?'} → {h.get('end_ts') or '?'}")
+    if h.get("cwd"):
+        lines.append(f"- working directory: {h['cwd']}" + (f" (branch {h['git_branch']} at the time)" if h.get("git_branch") else ""))
+    return "\n".join(lines)
+
+
+def _repo(state):
+    parts = [f"Branch now: {state['branch'] or '?'}"]
+    for label, key in (("git status --short", "status"), ("git diff --stat HEAD", "diff_stat"), ("git log --oneline -10", "log")):
+        body = state.get(key)
+        parts.append(f"{label}:\n" + (f"```\n{body}\n```" if body else "(nothing)"))
+    return "\n\n".join(parts)
+
+
+def _digest_md(d):
+    out = [f"**Goal.** {d['goal']}"] if d.get("goal") else []
+    if d.get("decisions"):
+        out.append("**Decisions so far.**\n" + _bullets(d["decisions"]))
+    if d.get("state"):
+        out.append(f"**Where it stands.** {d['state']}")
+    if d.get("unfinished"):
+        out.append("**Unfinished.**\n" + _bullets(d["unfinished"]))
+    if d.get("next_step"):
+        out.append(f"**Next step.** {d['next_step']}")
+    if d.get("unverified_claims"):
+        out.append("**Reported by the previous agent, not verified.**\n" + _bullets(d["unverified_claims"]))
+    return "\n\n".join(out)
+
+
+def _block(text):
+    fence = X._fence(text)
+    return f"{fence}\n{text}\n{fence}"
+
+
+def _exchange(msgs, kind):
+    """The conversation's own words as (role, text): every user message, plus the assistant's
+    prose for a review. Tool calls, tool output, thinking and harness messages are left out:
+    the transcript file has them."""
+    keep = []
+    for m in msgs:
+        if _is_user_words(m):
+            keep.append(("user", m["text"] or ""))
+        elif kind == "review" and m.get("role") == "assistant" and (m.get("kind") or KIND_TEXT) == KIND_TEXT and (m.get("text") or "").strip():
+            keep.append(("assistant", m["text"]))
+    return keep
+
+
+def _fit(exchange, budget):
+    """Drop assistant messages, oldest first, until the exchange fits `budget` characters.
+    User messages are never dropped. Returns (exchange, dropped count)."""
+    size = sum(len(t) for _, t in exchange)
+    dropped, out = 0, list(exchange)
+    i = 0
+    while size > budget and i < len(out):
+        if out[i][0] == "assistant":
+            size -= len(out[i][1])
+            out[i] = ("assistant", None)
+            dropped += 1
+        i += 1
+    return [e for e in out if e[1] is not None], dropped
+
+
+def _exchange_md(exchange, dropped):
+    parts = []
+    if dropped:
+        parts.append(f"({dropped} earlier assistant message{'s' if dropped != 1 else ''} left out to fit; "
+                     "they are in the transcript file.)")
+    for n, (role, text) in enumerate(exchange, 1):
+        parts.append(f"**{'User' if role == 'user' else 'Assistant'} ({n}).**\n{_block(text)}")
+    return "\n\n".join(parts)
+
+
+def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript_path=None,
+          repo=None, budget_chars=BUDGET_CHARS):
+    """The seed prompt and what the preview shows beside it, or None for an unknown id.
+
+    `digest_result` (continue only) and `repo` are passed in so the caller decides what runs:
+    the digest is an LLM call and repo state runs git. Returns {kind, prompt, problems,
+    secrets, chars, tokens, over_budget, dropped, digest_status}."""
+    if kind not in KINDS:
+        raise ValueError(f"kind must be one of {', '.join(KINDS)}, not {kind!r}")
+    h = X.head(conn, cid)
+    if h is None:
+        return None
+    msgs = X.messages(conn, cid)
+    problems = known_problems(msgs)
+    harness = HARNESS_NAMES.get(h["source"], h["source"])
+
+    sections = [_OPENING[kind].format(harness=harness), "## Where and when\n\n" + _facts(h)]
+    if repo:
+        sections.append("## The repository now\n\n" + _repo(repo))
+    if kind == "continue":
+        if digest_result:
+            sections.append("## Handoff note (written by a model from the transcript)\n\n" + _digest_md(digest_result))
+        else:
+            sections.append("## Handoff note\n\nNone could be written" + (f" ({digest_status})" if digest_status else "")
+                            + ". Work from the user's messages, the repository and the transcript file.")
+    if problems:
+        sections.append("## Known problems (found mechanically in the transcript)\n\n"
+                        + _bullets(f"{p['kind']}: {p['text']}" for p in problems))
+
+    # what the exchange may use: the budget less every other section, with room for the
+    # headings, the transcript pointer and the per-message labels and fences
+    fixed = sum(len(s) for s in sections) + len(CLOSING[kind]) + 2000
+    exchange, dropped = _fit(_exchange(msgs, kind), max(0, budget_chars - fixed))
+    title = "## The user's messages, verbatim" if kind == "continue" else "## The conversation (tool calls and output left out)"
+    sections.append(f"{title}\n\n" + (_exchange_md(exchange, dropped) or "(none)"))
+    if transcript_path:
+        sections.append("## Full transcript\n\n"
+                        f"Every message, tool calls and their output included, is in `{transcript_path}`.\n"
+                        "Read the parts you need instead of guessing.")
+    sections.append("## What to do\n\n" + CLOSING[kind])
+
+    prompt = "\n\n".join(sections) + "\n"
+    return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": find_secrets(prompt),
+            "chars": len(prompt), "tokens": len(prompt) // 4, "over_budget": len(prompt) > budget_chars,
+            "dropped": dropped, "digest_status": digest_status if kind == "continue" else None}
