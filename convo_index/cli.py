@@ -328,7 +328,9 @@ def cmd_handoff(args):
             f"transcript: {transcript}"]
     if out["digest_status"] and out["digest_status"] != "ok":
         note.append(f"no handoff note: {out['digest_status']}")
-    note += [f"known problem: {p['kind']}: {p['text']}" for p in out["problems"]]
+    note += [f"known problem: {p['kind']}: {p['text']}" for p in out["problems"][-H.MAX_PROBLEMS:]]
+    if len(out["problems"]) > H.MAX_PROBLEMS:
+        note.append(f"known problems: {len(out['problems']) - H.MAX_PROBLEMS} earlier ones not listed")
     note += [f"looks like a secret, remove before sending: {s['kind']} {s['sample']}" for s in out["secrets"]]
     note += [f"looks like a secret in the transcript file, which the prompt points at: {s['kind']} {s['sample']}"
              for s in out["transcript_secrets"]]

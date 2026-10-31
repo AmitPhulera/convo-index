@@ -312,3 +312,13 @@ def test_the_budget_counts_each_message_as_rendered(tmp_path):
     conn = _db(tmp_path, msgs)
     out = H.build(conn, "claude_code:s1", "review", budget_chars=100_000)
     assert not out["over_budget"] and out["dropped"] > 0 and "go" in out["prompt"]
+
+
+def test_known_problems_keep_the_most_recent(tmp_path):
+    msgs = [Message(seq=0, role="user", text="fix the build")] + [
+        Message(seq=i, role="tool", kind=KIND_TOOL_RESULT, text=f"ERROR: build failed attempt {i}") for i in range(1, 1001)]
+    conn = _db(tmp_path, msgs)
+    out = H.build(conn, "claude_code:s1", "continue")
+    section = out["prompt"][out["prompt"].index("## Known problems"):out["prompt"].index("## The user's messages")]
+    assert section.count("- tool error:") == H.MAX_PROBLEMS and "attempt 1000" in section and "attempt 950\n" not in section
+    assert "(950 earlier ones left out" in section and len(out["problems"]) == 1000

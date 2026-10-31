@@ -71,6 +71,7 @@ HARNESS_NAMES = {"claude_code": "Claude Code", "opencode": "opencode", "codex": 
                  "antigravity": "Antigravity", "pi": "pi"}
 
 PROBLEM_QUOTE = 300   # characters of a message quoted in the known-problems list
+MAX_PROBLEMS = 50     # the most recent ones; a session looping on a failing build has hundreds
 DIGEST_TOOL_CALL = 200   # characters of each tool call the digest model sees
 
 # The digest's own window, much wider than the summary job's 9k + 5k: a session handed off
@@ -448,8 +449,11 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
             sections.append("## Handoff note\n\nNone could be written" + (f" ({digest_status})" if digest_status else "")
                             + ". Work from the user's messages, the repository and the transcript file.")
     if problems:
+        shown = problems[-MAX_PROBLEMS:]
+        more = f"\n- ({len(problems) - len(shown)} earlier ones left out; the transcript file has them)" \
+            if len(problems) > len(shown) else ""
         sections.append("## Known problems (found mechanically in the transcript)\n\n"
-                        + _bullets(f"{p['kind']}: {p['text']}" for p in problems))
+                        + _bullets(f"{p['kind']}: {p['text']}" for p in shown) + more)
 
     # what the exchange may use: the budget less every other section, with room for the
     # headings, the transcript pointer and the per-message labels and fences
