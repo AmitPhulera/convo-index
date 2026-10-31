@@ -1,6 +1,7 @@
 """Shared fixtures. Tests never reach a real LLM, embedder or network: settings default to
 no LLM backend, and the embedder is replaced per test where vectors matter."""
 import copy
+import hashlib
 
 import pytest
 
@@ -62,3 +63,22 @@ def fake_llm(monkeypatch):
         monkeypatch.setattr(registry, "complete", f)
         return f
     return install
+
+
+def _real_config_state():
+    from convo_index import config as C
+    path = C.user_dir("config") / "convo-index" / "config.toml"
+    try:
+        return path, hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return path, None
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _the_users_config_is_never_touched():
+    """A test that writes to the real default config location empties the developer's own
+    configuration. Fail the run if the file is not exactly as it was."""
+    path, before = _real_config_state()
+    yield
+    after = _real_config_state()[1]
+    assert after == before, f"a test changed {path}: give it its own XDG_CONFIG_HOME (tmp_path)"

@@ -494,6 +494,7 @@ def test_linux_without_a_user_session_falls_back_and_says_why(tmp_path, monkeypa
     ps = SCH.manual_line([r"C:\Tools\convo-index.exe", "serve"], r"C:\d\serve.log", r"C:\Users\o'b\cfg.toml",
                          background=True, windows=True)
     assert ps == r"$env:CONVO_INDEX_CONFIG = 'C:\Users\o''b\cfg.toml'; & 'C:\Tools\convo-index.exe' 'serve'"   # PowerShell
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))                      # the default place, but not the user's
     cfg = SCH.C.user_dir("config") / "convo-index" / "config.toml"
     cfg.parent.mkdir(parents=True, exist_ok=True); cfg.write_text("")
     st.path = cfg                                                                       # loaded from the default place
