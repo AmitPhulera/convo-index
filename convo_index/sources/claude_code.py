@@ -100,6 +100,19 @@ def blocks_in_order(content):
     return out
 
 
+_HANDOFF_TITLE_RE = re.compile(r"^- title: (.+)$", re.M)
+
+
+def handoff_title(prompt):
+    """"Continued: <title>" / "Second opinion: <title>" for a handoff's session, whose prompt
+    opens with HANDOFF_PROMPT_PREFIXES and names the original's title; else None."""
+    for prefix, label in zip(HANDOFF_PROMPT_PREFIXES, ("Continued", "Second opinion"), strict=True):
+        if (prompt or "").startswith(prefix):
+            m = _HANDOFF_TITLE_RE.search(prompt)
+            return f"{label}: {m.group(1).strip()}" if m else label
+    return None
+
+
 def clean_prompt(text):
     """Strip <command-message>/<command-name> wrapper tags, keep the slash command/body."""
     lines = []
@@ -256,7 +269,7 @@ def parse_conversation(path, text=None):
                                      "uuid": nid, "model": model, "tool_call": tc})
                     seq += 1
     if not title:
-        title = first_prompt or session_id
+        title = handoff_title(first_prompt) or first_prompt or session_id
     return {
         "session_id": session_id,
         "cwd": cwd,
