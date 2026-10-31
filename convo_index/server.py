@@ -102,6 +102,19 @@ def handle_sources():
         conn.close()
 
 
+def start_command():
+    """What to run to start the server again once the UI has stopped it. With the login
+    service installed, `service install` registers it again and starts it under the service
+    manager (a clean stop is not restarted on its own); otherwise `serve` runs it in front."""
+    from convo_index import schedule as SCH
+    try:
+        if SCH.status(job="serve")["installed"]:
+            return "convo-index service install"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return "convo-index serve"
+
+
 def handle_config():
     """What the UI needs from settings: category labels, ticket link template."""
     cfg = CFG.load()
@@ -116,6 +129,7 @@ def handle_config():
                        "ticket_url": cfg["references"]["ticket_url"],
                        "config_path": str(cfg.path) if cfg.path else None,
                        "windows": os.name == "nt",
+                       "start_command": start_command(),
                        "semantic_search": ok, "semantic_reason": reason})
 
 

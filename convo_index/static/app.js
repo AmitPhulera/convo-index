@@ -9,6 +9,7 @@ let searchSeq = 0;            // ignore responses that arrive out of order
 
 let TICKET_URL = "https://example.atlassian.net/browse/{key}";
 let TAG_GROUPS = {};
+let START_CMD = "convo-index serve";   // how to start the server again after Stop (from /api/config)
 let WINDOWS = false;          // the server's platform: decides how the resume command is quoted          // {group: {exclusive, description, tags: [{name, description}]}}
 let tagFiltersFromUrl = [];   // ["workspace:globex", ...]
 const SOURCE_LABELS = { claude_code: "Claude Code", opencode: "Opencode", codex: "Codex", antigravity: "Antigravity", pi: "pi" };
@@ -62,7 +63,7 @@ function updateFilterState() {
   if (projectFilter) active.unshift({ label: "Project " + shortPath(projectFilter), remove: () => { projectFilter = null; updateFilterState(); runSearch(); } });
   const box = $("active-filters");
   box.innerHTML = active.map((f, i) =>
-    `<button type="button" class="active-chip" data-i="${i}" aria-label="Remove filter ${escape(f.label)}">${escape(f.label)}${ICON.close}</button>`).join("");
+    `<button type="button" class="active-chip" data-i="${i}" aria-label="Remove filter ${escape(f.label)}" title="Remove this filter">${escape(f.label)}${ICON.close}</button>`).join("");
   box.querySelectorAll(".active-chip").forEach(b => b.addEventListener("click", () => active[Number(b.dataset.i)].remove()));
   $("filter-count").textContent = active.length ? String(active.length) : "";
   $("filters-toggle").classList.toggle("on", active.length > 0);
@@ -81,6 +82,8 @@ async function loadConfig() {
   const cfg = await res.json();
   TICKET_URL = cfg.ticket_url || TICKET_URL;
   WINDOWS = !!cfg.windows;
+  START_CMD = cfg.start_command || START_CMD;
+  updateStopButton();
   TAG_GROUPS = cfg.tag_groups || {};
   const box = $("tag-filters");
   box.innerHTML = Object.entries(TAG_GROUPS).map(([g, spec]) =>
@@ -550,7 +553,7 @@ async function openDetail(id, cardEl) {
   ].join("");
   detail.className = open ? "details-open" : "";
   detail.innerHTML = `<div class="detail-bar">
-      <button class="btn ghost icon-only" id="detail-back" aria-label="Back to results">${ICON.back}</button>
+      <button class="btn ghost icon-only" id="detail-back" aria-label="Back to results" title="Back to the results (Esc)">${ICON.back}</button>
       <div class="detail-head">
         <h2 class="detail-title" title="${escape(c.title)}">${escape(c.title)}</h2>
         <div class="meta-line">${meta}${flags}</div>
@@ -572,7 +575,7 @@ async function openDetail(id, cardEl) {
         ${c.turns_supported ? composerHTML(c) : ""}
       </div>
       <aside class="details-panel" id="details-panel" aria-label="Conversation details">
-        <div class="panel-head"><h2>Details</h2><button class="btn ghost icon-only" id="details-close" type="button" aria-label="Close details">${ICON.close}</button></div>
+        <div class="panel-head"><h2>Details</h2><button class="btn ghost icon-only" id="details-close" type="button" aria-label="Close details" title="Close the details panel">${ICON.close}</button></div>
         ${section(`Continue in ${WINDOWS ? "PowerShell" : "the terminal"}`, resume ? `<div class="resume">
           <code class="resume-cmd" title="${escape(resume)}">${escape(resume)}</code>
           <button class="btn copy-btn" data-cmd="${escape(resume)}" onclick="copyCmd(this)">${ICON.copy}<span class="label">Copy</span></button>
@@ -1497,11 +1500,11 @@ function takeTurnToken() {
 function updateStopButton() {
   const btn = $("stop-server");
   btn.disabled = !turnToken;
-  btn.title = turnToken ? "Stop the convo-index server"
+  btn.title = turnToken ? `Stop the convo-index server. Start it again with \`${START_CMD}\``
     : "To stop the server here, open the UI through the URL `convo-index serve` or `up` prints (or run `convo-index stop`)";
 }
 $("stop-server").addEventListener("click", async () => {
-  if (!confirm("Stop the convo-index server? Running browser turns end. Start it again with `convo-index serve`.")) return;
+  if (!confirm(`Stop the convo-index server? Running browser turns end, and this page stops working until you start it again with \`${START_CMD}\`.`)) return;
   const btn = $("stop-server");
   btn.disabled = true;
   try {
@@ -1512,13 +1515,28 @@ $("stop-server").addEventListener("click", async () => {
       btn.disabled = false;
       return;
     }
-    document.body.innerHTML = `<main class="server-stopped"><h1>Server stopped</h1>
-      <p>Start it again with <code>convo-index serve</code>, or it starts at your next login if the service is installed.</p></main>`;
+    showStoppedBanner();
   } catch (e) {
     showError("Could not stop the server: " + e);
     btn.disabled = false;
   }
 });
+
+// After Stop the page stays as it was, to read; a banner over the top bar gives the command
+// that starts the server again.
+function showStoppedBanner() {
+  $("refresh").disabled = true;
+  $("stop-server").title = "The server is stopped";
+  const banner = document.createElement("div");
+  banner.className = "stopped-banner";
+  banner.setAttribute("role", "alert");
+  banner.innerHTML = `<span><strong>Server stopped.</strong> Start it again with</span>
+    <code>${escape(START_CMD)}</code>
+    <button class="btn copy-btn" type="button" data-cmd="${escape(START_CMD)}" title="Copy the command">${ICON.copy}<span class="label">Copy</span></button>
+    <span class="hint">then reload this page.</span>`;
+  banner.querySelector(".copy-btn").addEventListener("click", e => copyCmd(e.currentTarget));
+  document.body.prepend(banner);
+}
 
 // Back/forward and hand-edited hashes open the named conversation; an empty hash closes it.
 window.addEventListener("hashchange", () => {
