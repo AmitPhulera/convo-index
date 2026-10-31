@@ -247,6 +247,24 @@ def test_opencode_edit_turn_allows_edit_and_bash(opencode_on_path):
     assert base.turn_launcher("opencode:ses_abc") == ["/opt/bin/opencode"]
 
 
+def test_opencode_new_session_names_a_model_and_opens_only_the_read_dirs(opencode_on_path, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    cmd, sid = oc.new_session_command("take over", "/proj", read_dirs=["/data/handoffs/x"], model="opencode-go/m1")
+    assert sid is None and cmd.argv == ["/opt/bin/opencode", "run", "--standalone", "--format", "json",
+                                        "-m", "opencode-go/m1", "--agent", "plan", "take over"]
+    rules = json.loads(cmd.env["OPENCODE_CONFIG_CONTENT"])["permissions"]
+    assert rules[0]["effect"] == "deny" and rules[-1] == {"action": "external_directory", "resource": "/data/handoffs/x/*", "effect": "allow"}
+    assert "--session" not in cmd.argv and cmd.scratch == (cmd.env["XDG_CONFIG_HOME"],)
+    with pytest.raises(ValueError, match="pass --model"):
+        oc.new_session_command("x", "/proj")                         # no recent models yet
+    (tmp_path / "state" / "opencode").mkdir(parents=True)
+    (tmp_path / "state" / "opencode" / "model.json").write_text(json.dumps(
+        {"recent": [{"providerID": "opencode-go", "modelID": "deepseek-v4.1-flash"}, {"providerID": "x", "modelID": "y"}]}))
+    cmd, _ = oc.new_session_command("x", "/proj", edits=True)
+    assert cmd.argv[cmd.argv.index("-m") + 1] == "opencode-go/deepseek-v4.1-flash" and "--agent" not in cmd.argv
+    assert oc.session_id('{"type": "step_start", "sessionID": "ses_1"}') == "ses_1" and oc.session_id("[]") is None
+
+
 def test_opencode_prompt_is_one_argv_element(opencode_on_path):
     cmd = base.turn_command("opencode:ses_abc", "a; rm -rf / $(x) `y`", "/proj")
     assert cmd.argv[-1] == "a; rm -rf / $(x) `y`"
