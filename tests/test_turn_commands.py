@@ -309,3 +309,135 @@ def test_opencode_last_activity_reads_the_1x_layout_too(tmp_path):
     db = tmp_path / "old.db"
     make_opencode_db(db)
     assert base.last_activity("opencode:ses_1", f"sqlite:{db}#ses_1") is not None
+
+
+# ---- pi ---------------------------------------------------------------------------------------
+
+from convo_index.sources import pi   # noqa: E402
+from tests.test_pi import SID as PI_SID, write_session as write_pi_session   # noqa: E402
+
+
+@pytest.fixture
+def pi_on_path(monkeypatch):
+    monkeypatch.setattr(base.shutil, "which", lambda name: "/opt/bin/pi" if name == "pi" else None)
+    monkeypatch.setattr(base, "is_windows", lambda: False)
+
+
+@pytest.fixture
+def pi_file(tmp_path):
+    return str(write_pi_session(tmp_path / "sessions" / "--proj--"))
+
+
+def test_pi_read_only_turn_resumes_the_file_with_read_tools_and_the_prompt_on_stdin(pi_on_path, pi_file):
+    cmd = base.turn_command(f"pi:{PI_SID}", "what changed?", "/proj", locator=pi_file)
+    assert cmd.argv[0] == "/opt/bin/pi" and cmd.cwd == "/proj" and cmd.stdin == "what changed?"
+    assert "what changed?" not in cmd.argv
+    for flag in ["-p", "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates", "--no-context-files",
+                 "--no-themes", "--no-approve", "--offline"]:
+        assert flag in cmd.argv
+    assert cmd.argv[cmd.argv.index("--mode") + 1] == "json"
+    assert cmd.argv[cmd.argv.index("--session") + 1] == pi_file          # by file: no fork question on stdin
+    assert cmd.argv[cmd.argv.index("--tools") + 1] == "read,grep,find,ls"
+
+
+def test_pi_edit_turn_adds_edits_and_shell_but_no_mcp(pi_on_path, pi_file):
+    cmd = base.turn_command(f"pi:{PI_SID}", "fix it", "/proj", edits=True, mcp_tools=("mcp__atlassian__*",), locator=pi_file)
+    assert cmd.argv[cmd.argv.index("--tools") + 1] == "read,grep,find,ls,edit,write,bash"
+    assert "--no-mcp" in cmd.argv and not any("mcp__" in a for a in cmd.argv)
+
+
+def test_pi_refuses_a_session_file_that_is_gone_or_holds_another_session(pi_on_path, pi_file, tmp_path):
+    other = str(write_pi_session(tmp_path / "other", name="x.jsonl"))
+    for locator in [None, str(tmp_path / "gone.jsonl"), "relative.jsonl", other]:
+        sid = PI_SID if locator != other else "0f1e2d3c-1234-4abc-8def-0123456789ab"
+        with pytest.raises(ValueError, match="no longer holds"):
+            base.turn_command(f"pi:{sid}", "x", "/proj", locator=locator)
+
+
+def test_pi_missing_binary_means_no_command(monkeypatch, pi_file):
+    monkeypatch.setattr(base.shutil, "which", lambda name: None)
+    assert base.turn_command(f"pi:{PI_SID}", "x", "/proj", locator=pi_file) is None
+    assert base.turn_launcher(f"pi:{PI_SID}") is None
+
+
+def test_pi_windows_npm_shim_is_bypassed_for_node(monkeypatch, tmp_path):
+    shim = tmp_path / "pi.cmd"
+    script = tmp_path / "node_modules" / "@earendil-works" / "pi-coding-agent" / "dist" / "bundle" / "cli.js"
+    script.parent.mkdir(parents=True)
+    script.write_text("// entry")
+    shim.write_text('@ECHO off\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  '
+                    '"%dp0%\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*\r\n')
+    monkeypatch.setattr(base, "is_windows", lambda: True)
+    monkeypatch.setattr(base.shutil, "which", lambda name: {"pi": str(shim), "node": "C:\\node\\node.exe"}.get(name))
+    assert base.supports_turns(f"pi:{PI_SID}")
+    assert base.turn_launcher(f"pi:{PI_SID}") == ["C:\\node\\node.exe", str(script)]
+
+
+# Captured from pi 1.4.0 `--mode json` (streaming deltas, the system and user messages and most
+# of each message's fields dropped; paths shortened).
+PI_USAGE = {"input": 1317, "output": 35, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 1352,
+            "cost": {"input": 0.001, "output": 0.002, "cacheRead": 0, "cacheWrite": 0, "total": 0.003}}
+PI_ASSISTANT_1 = {"role": "assistant", "provider": "ollama", "model": "flint:40b-a2b-qat-int4", "usage": PI_USAGE,
+                  "stopReason": "toolUse",
+                  "content": [{"type": "thinking", "thinking": "Let me read both.", "thinkingSignature": "reasoning"},
+                              {"type": "toolCall", "id": "call_sce8utoy", "name": "read", "arguments": {"path": "note.txt"}},
+                              {"type": "toolCall", "id": "call_cleuv6bk", "name": "read", "arguments": {"path": "missing.txt"}}]}
+PI_ASSISTANT_2 = {"role": "assistant", "provider": "ollama", "model": "flint:40b-a2b-qat-int4", "usage": PI_USAGE,
+                  "stopReason": "stop",
+                  "content": [{"type": "thinking", "thinking": "No bash tool.", "thinkingSignature": "reasoning"},
+                              {"type": "text", "text": "note.txt says hello; missing.txt does not exist; no bash tool."}]}
+PI_STREAM = [
+    {"type": "session", "version": 3, "id": "4b72a124-c133-4526-ab9e-b92764ae3b9e", "cwd": "/proj"},
+    {"type": "agent_start"},
+    {"type": "turn_start"},
+    {"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": "Use the read tool"}]}},
+    {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 1, "delta": "P"}},
+    {"type": "message_end", "message": PI_ASSISTANT_1},
+    {"type": "tool_execution_start", "toolCallId": "call_sce8utoy", "toolName": "read", "args": {"path": "note.txt"}},
+    {"type": "tool_execution_end", "toolCallId": "call_sce8utoy", "toolName": "read",
+     "result": {"content": [{"type": "text", "text": "hello from probe\n"}]}, "isError": False},
+    {"type": "message_end", "message": {"role": "toolResult", "toolCallId": "call_sce8utoy", "toolName": "read",
+                                        "content": [{"type": "text", "text": "hello from probe\n"}], "isError": False}},
+    {"type": "message_end", "message": {"role": "toolResult", "toolCallId": "call_cleuv6bk", "toolName": "read",
+                                        "content": [{"type": "text", "text": "ENOENT: no such file or directory, access '/proj/missing.txt'"}],
+                                        "details": {}, "isError": True}},
+    {"type": "turn_end", "message": PI_ASSISTANT_1},
+    {"type": "message_end", "message": PI_ASSISTANT_2},
+    {"type": "agent_end", "messages": [{"role": "user", "content": [{"type": "text", "text": "Use the read tool"}]},
+                                       PI_ASSISTANT_1, PI_ASSISTANT_2]},
+    {"type": "agent_settled", "aborted": False},
+]
+
+
+def test_pi_stream_is_translated_and_noise_dropped():
+    events = [e for line in PI_STREAM for e in base.turn_events(f"pi:{PI_SID}", json.dumps(line))]
+    assert [e["kind"] for e in events] == ["tool", "tool", "tool_result", "tool_result", "text", "done"]
+    assert events[0] == {"kind": "tool", "name": "read", "input": '{"path": "note.txt"}'}
+    assert events[2] == {"kind": "tool_result", "text": "hello from probe\n", "error": False}
+    assert events[3]["error"] is True and events[3]["text"].startswith("ENOENT")
+    assert events[4]["text"].startswith("note.txt says hello")
+    assert events[5] == {"kind": "done", "cost_usd": pytest.approx(0.006), "turns": 2}
+
+
+def test_pi_failed_request_is_an_error_though_pi_exits_0():
+    failed = {"role": "assistant", "content": [], "provider": "ollama", "model": "nosuchmodel-xyz", "stopReason": "error",
+              "errorMessage": "404: {\"message\":\"model 'nosuchmodel-xyz' not found\"}",
+              "usage": {"input": 0, "output": 0, "cost": {"total": 0}}}
+    assert pi.turn_events(json.dumps({"type": "message_end", "message": failed})) == [
+        {"kind": "error", "message": "404: {\"message\":\"model 'nosuchmodel-xyz' not found\"}"}]
+    assert pi.turn_events(json.dumps({"type": "agent_end", "messages": []})) == [{"kind": "done", "cost_usd": None, "turns": 0}]
+    assert pi.turn_events("not json") == [] and pi.turn_events("[1]") == [] and pi.turn_events('{"type": "message_end"}') == []
+
+
+def test_pi_long_tool_input_is_clipped():
+    line = json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [
+        {"type": "toolCall", "name": "write", "arguments": {"content": "x" * 5000}}]}})
+    (ev,) = pi.turn_events(line)
+    assert len(ev["input"]) <= pi.TURN_TEXT_LIMIT + 1 and ev["input"].endswith("…")
+
+
+def test_pi_last_activity_is_the_session_file_mtime(pi_file, tmp_path):
+    then = time.time() - 600
+    os.utime(pi_file, (then, then))
+    assert abs(base.last_activity(f"pi:{PI_SID}", pi_file) - then) < 2
+    assert base.last_activity(f"pi:{PI_SID}", str(tmp_path / "gone.jsonl")) is None

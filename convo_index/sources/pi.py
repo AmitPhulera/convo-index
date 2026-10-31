@@ -23,7 +23,8 @@ from pathlib import Path
 
 from convo_index.model import (Conversation, Message, ToolCall, UsageRecord, KIND_TEXT, KIND_THINKING,
                                KIND_TOOL_CALL, KIND_TOOL_RESULT, FIDELITY_FULL, FIDELITY_PARTIAL, split_id)
-from convo_index.sources.base import SourceRef, UnreadableSource, read_snapshot, shell_quote
+from convo_index.sources import base as sources
+from convo_index.sources.base import SourceRef, TurnCommand, UnreadableSource, read_snapshot, shell_quote
 
 TOOL_TEXT_LIMIT = 4000
 SOURCE = "pi"
@@ -425,3 +426,99 @@ def resume_command(conversation_id, cwd):
     """Shell command to continue this conversation in pi."""
     _, native = split_id(conversation_id)
     return f"pi --session {shell_quote(native)}"
+
+
+# --- Browser turns (sources.base turn protocol) ----------------------------------------------
+#
+# `pi -p --session <file>` runs one more turn of a session and appends it to the same file, so
+# `pi --session <id>` in a terminal afterwards sees it. The session is named by its file, not
+# its id: resuming by id from a directory other than the session's own makes pi ask on stdin
+# whether to fork, and the prompt waiting there answers "no", so the run ends with status 0 and
+# no output. The prompt travels on stdin, which pi reads to its end.
+#
+# pi has no permission prompts and no sandbox: the tools named by --tools are the whole policy,
+# and its read tools are not confined to the project directory. Verified on 1.4.0: with the
+# flags below the system prompt lists only the named tools, no MCP server, extension, skill,
+# prompt template or AGENTS.md/CLAUDE.md is loaded, and bash is absent in Read-only.
+
+TURNS_ON_WINDOWS = True       # the prompt goes through stdin; npm's pi.cmd is bypassed for node
+TURN_FLAGS = ["-p", "--mode", "json",
+              "--no-extensions",          # no extension discovery, installed packages or built-in extensions
+              "--no-mcp",                 # no MCP servers and no MCP tools
+              "--no-skills", "--no-prompt-templates", "--no-themes",
+              "--no-context-files",       # no AGENTS.md or CLAUDE.md, global or in the project
+              "--no-approve",             # project-local .pi files are not trusted for this run
+              "--offline"]                # no update checks or other startup network calls
+READ_TOOLS = "read,grep,find,ls"
+EDIT_TOOLS = "read,grep,find,ls,edit,write,bash"
+TURN_TEXT_LIMIT = 400         # chars of a tool input/result shown in a turn event
+
+
+def launcher():
+    """argv prefix that starts pi without a shell in between, or None when it is not installed."""
+    return sources.npm_launcher("pi")
+
+
+def turn_command(native_id, prompt, cwd, *, edits=False, mcp_tools=(), locator=None):
+    """`mcp_tools` is ignored: --no-mcp loads no server. Raises ValueError when the indexed file
+    is gone or its header names another session."""
+    prefix = launcher()
+    if prefix is None:
+        return None
+    if not locator or not os.path.isabs(locator) or not os.path.isfile(locator) or header_id(locator) != native_id:
+        raise ValueError("the pi session file is gone or no longer holds this session; refresh the index")
+    argv = prefix + TURN_FLAGS + ["--session", locator, "--tools", EDIT_TOOLS if edits else READ_TOOLS]
+    return TurnCommand(argv=argv, cwd=cwd, stdin=prompt)
+
+
+def _turn_clip(value, limit=TURN_TEXT_LIMIT):
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _cost(messages):
+    """Total reported cost of the assistant messages of one run, None when none reports one."""
+    costs = [m["usage"]["cost"].get("total") for m in messages
+             if isinstance(m, dict) and m.get("role") == "assistant" and isinstance(m.get("usage"), dict)
+             and isinstance(m["usage"].get("cost"), dict)]
+    costs = [c for c in costs if isinstance(c, (int, float)) and not isinstance(c, bool)]
+    return sum(costs) if costs else None
+
+
+def turn_events(line):
+    """Events for one `--mode json` line of `pi -p`. Whole messages are read from `message_end`
+    (assistant text and tool calls, tool results; thinking is dropped) and the run's cost from
+    `agent_end`; the streaming deltas, tool execution updates and session header are dropped. A
+    failed request is an assistant message with stopReason "error" (pi still exits 0)."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(d, dict):
+        return []
+    if d.get("type") == "agent_end":
+        messages = d.get("messages") if isinstance(d.get("messages"), list) else []
+        return [{"kind": "done", "cost_usd": _cost(messages),
+                 "turns": sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant")}]
+    msg = d.get("message")
+    if d.get("type") != "message_end" or not isinstance(msg, dict):
+        return []
+    out = []
+    if msg.get("role") == "assistant":
+        for b in msg.get("content") if isinstance(msg.get("content"), list) else []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text" and isinstance(b.get("text"), str) and b["text"]:
+                out.append({"kind": "text", "text": b["text"]})
+            elif b.get("type") == "toolCall":
+                out.append({"kind": "tool", "name": str(b.get("name", "")), "input": _turn_clip(b.get("arguments") or {})})
+        if msg.get("stopReason") == "error":
+            out.append({"kind": "error", "message": _turn_clip(msg.get("errorMessage") or "request failed", 2000)})
+    elif msg.get("role") == "toolResult":
+        out.append({"kind": "tool_result", "text": _turn_clip(_text_of(msg.get("content"))), "error": bool(msg.get("isError"))})
+    return out
+
+
+def last_activity(native_id, locator):
+    """mtime of the session file, which pi appends to while a session is live."""
+    return os.stat(locator).st_mtime
