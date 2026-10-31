@@ -340,7 +340,7 @@ def test_up_runs_init_services_and_the_first_index(tmp_path, monkeypatch, capsys
     assert cli.main(["up"]) == 0
     assert calls == ["init", "serve", "refresh", "background index", "port 127.0.0.1:9753", "open http://127.0.0.1:9753"]
     out = capsys.readouterr().out
-    assert "convo-index is at http://127.0.0.1:9753" in out and "privacy decision" in out   # nothing hosted until the user decides
+    assert "convo-index is at http://127.0.0.1:9753" in out and "Summaries and tags are off" in out   # nothing hosted until the user decides
     assert "tail -f" in out
     calls.clear()
     from convo_index import server
@@ -357,9 +357,35 @@ def test_up_runs_init_services_and_the_first_index(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(cli, "_wait_for_port", lambda host, port, seconds=15: False)
     assert cli.main(["up", "--no-schedule"]) == 1                        # no server answered: no URL, a failure
     out, err = capsys.readouterr()
-    assert "convo-index is at" not in out and "did not answer" in err and "problems: serve" in err
+    assert "convo-index is at" not in out and "did not answer" in err
+    assert "Needs your attention:" in out and "The UI server is not running" in out
     monkeypatch.setattr(cli, "cmd_init", lambda args: 1)
     assert cli.main(["up"]) == 1                                         # a failed init stops everything
+    monkeypatch.setattr(cli, "cmd_init", lambda args: calls.append("init") or 0)
+    calls.clear()
+    monkeypatch.setattr(cli, "_wait_for_port", lambda host, port, seconds=15: calls.append(f"port {host}:{port}") or True)
+    why = "systemctl is installed but no systemd user session is running (usual inside containers) and no crontab command"
+    monkeypatch.setattr(SCH, "install", lambda settings, job="refresh", **k: calls.append(job) or
+                        {"kind": "none", "reason": why, "files": {}, "results": [], "log": "/l", "argv": ["convo-index", job],
+                         "manual": {"serve": "nohup convo-index serve >> /l 2>&1 &", "refresh": "CONVO_INDEX_CONFIG=/c.toml convo-index index"}[job]})
+    assert cli.main(["up", "--no-open"]) == 0                           # a container: no scheduler, still a working UI
+    assert calls == ["init", "serve", "background serve", "refresh", "background index", "port 127.0.0.1:9753"]
+    out = capsys.readouterr().out
+    assert out.count(why) == 1 and "UI server: running for this session only" in out and "daily refresh: not scheduled" in out
+    attention = out.split("Needs your attention:")[1]
+    assert "convo-index init --yes" in attention.split("2.")[0]          # the privacy decision comes first
+    assert "nohup convo-index serve >> /l 2>&1 &" in attention
+    assert "CONVO_INDEX_CONFIG=/c.toml convo-index index" in attention                # the plan's command, config kept
+    assert "convo-index is at" in out.split("Needs your attention:")[0]
+    log = tmp_path / "serve.log"
+    log.write_text("x" * 9000 + "\nstarting\nOSError: [Errno 98] Address already in use\n")
+    monkeypatch.setattr(SCH, "log_path", lambda settings, job="refresh": log)
+    monkeypatch.setattr(cli, "_wait_for_port", lambda host, port, seconds=15: False)
+    assert cli.main(["up", "--no-open", "--no-schedule"]) == 1             # the session server never came up
+    attention = capsys.readouterr().out.split("Needs your attention:")[1]
+    assert "will not start again" not in attention                          # no "restart it later" next to "it is not running"
+    assert "Address already in use" in attention and "x" * 100 not in attention   # only the end of the log
+    assert attention.rstrip().endswith("nohup convo-index serve >> /l 2>&1 &")    # how to start it once fixed
     monkeypatch.setattr(SCH, "uninstall", lambda settings, dry_run=False, job="refresh", **k:
                         {"kind": "schtasks", "results": [{"cmd": ["schtasks"], "ok": False, "stderr": "Access is denied"}]})
     assert cli.main(["service", "uninstall"]) == 1                       # a failed deregistration is a failure

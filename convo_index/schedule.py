@@ -1,6 +1,6 @@
 """Background jobs through the platform's own scheduler — a LaunchAgent on macOS, systemd
-user units on Linux, Task Scheduler tasks on Windows, or crontab lines to paste anywhere
-else (docs/design.md §5).
+user units on Linux, Task Scheduler tasks on Windows, crontab lines to paste anywhere else,
+or (no scheduler at all, e.g. a container) the command to run by hand (docs/design.md §5).
 
 Two jobs: `refresh` (`convo-index index` once a day: `schedule install|uninstall|status`)
 and `serve` (`convo-index serve` kept running from login: `service install|uninstall|status`).
@@ -225,22 +225,52 @@ def windows_task(launcher, hour, minute, description):
 """
 
 
+def systemd_user_available():
+    """True when a systemd user manager answers. The systemctl binary alone is not enough:
+    containers and some SSH logins have it but no user session (no $XDG_RUNTIME_DIR, no bus),
+    and every `systemctl --user` call then fails."""
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        r = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
 def _kind(system=None):
+    return _kind_and_reason(system)[0]
+
+
+def _kind_and_reason(system=None):
+    """The scheduler to use and, when it is not the platform's own, why (in plain words)."""
     system = system or platform.system()
     if system == "Darwin":
-        return "launchd"
+        return "launchd", ""
     if system == "Windows":
-        return "schtasks"
-    return "systemd" if system == "Linux" and shutil.which("systemctl") else "cron"
+        return "schtasks", ""
+    if system == "Linux" and systemd_user_available():
+        return "systemd", ""
+    if system == "Linux" and shutil.which("systemctl"):
+        why = "systemctl is installed but no systemd user session runs here (usual inside containers)"
+    elif system == "Linux":
+        why = "this machine has no systemd"
+    else:
+        why = f"no built-in scheduler support for {system}"
+    if shutil.which("crontab"):
+        return "cron", why
+    return "none", why + ", and there is no crontab"
 
 
 def _uid():
     return getattr(os, "getuid", lambda: 0)()
 
 
-def plan(settings=None, hour=None, minute=None, system=None, home=None, job="refresh"):
+def plan(settings=None, hour=None, minute=None, system=None, home=None, job="refresh", existing=False):
     """What install would write and run, without doing it. `job` is "refresh" (daily index)
-    or "serve" (the UI server from login)."""
+    or "serve" (the UI server from login). `existing` (status, uninstall) keeps systemd when
+    the job's unit file is already there, even if no user manager answers right now (an SSH
+    login without a user session): those units must still be found and removed."""
     settings = settings or S.load()
     spec = JOBS[job]
     if job == "refresh":
@@ -262,8 +292,13 @@ def plan(settings=None, hour=None, minute=None, system=None, home=None, job="ref
         config_path = Path(config_path).expanduser().resolve()   # launchd/cron run with cwd=/: relative paths would vanish
         if not config_path.exists():
             raise ValueError(f"config file {config_path} does not exist; the job would run on defaults")
-    kind = _kind(system)
-    out = {"kind": kind, "job": job, "hour": hour, "minute": minute, "argv": argv, "log": str(log), "files": {}, "commands": []}
+    kind, reason = _kind_and_reason(system)
+    if existing and kind != "systemd" and (system or platform.system()) == "Linux" and shutil.which("systemctl"):
+        unit = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "systemd" / "user" / f"{spec['unit']}.service"
+        if unit.exists():
+            kind, reason = "systemd", ""
+    out = {"kind": kind, "reason": reason, "job": job, "hour": hour, "minute": minute, "argv": argv, "log": str(log),
+           "files": {}, "commands": []}
     if kind == "launchd":
         path = home / "Library" / "LaunchAgents" / f"{spec['label']}.plist"
         out["files"][str(path)] = launchd_plist(argv, hour, minute, log, config_path, label=spec["label"])
@@ -287,9 +322,35 @@ def plan(settings=None, hour=None, minute=None, system=None, home=None, job="ref
         out["commands"] = [["schtasks", "/Create", "/F", "/TN", spec["task"], "/XML", str(xml)]]
         if job == "serve":
             out["commands"].append(["schtasks", "/Run", "/TN", spec["task"]])
-    else:
+    elif kind == "cron":
         out["crontab"] = crontab_line(argv, hour, minute, log, config_path)
+    # how to run it by hand: the only way with kind "none", the fallback when an install fails.
+    # The server goes to the background with its log; the refresh runs in front, its progress visible.
+    # For a person typing it: the bare command when PATH finds this same executable, and the
+    # config only when it is not where convo-index looks anyway.
+    exe = shutil.which(Path(argv[0]).name)
+    shown = [Path(argv[0]).name, *argv[1:]] if exe and Path(exe).resolve() == Path(argv[0]).resolve() else argv
+    custom = config_path if config_path and config_path != default_cfg.expanduser().resolve() else None
+    out["manual"] = manual_line(shown, log if job == "serve" else None, custom,
+                                background=job == "serve", windows=kind == "schtasks")
     return out
+
+
+def _ps(s):
+    """One PowerShell single-quoted string: nothing inside is expanded, a quote is doubled."""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def manual_line(argv, log=None, config_path=None, background=False, windows=False):
+    """The command line that runs a job by hand with the job's configuration. POSIX shell:
+    in the background with output appended to `log` when asked. PowerShell (Windows): in the
+    foreground, as nohup and & have no equivalent there; the window stays open."""
+    if windows:
+        env = f"$env:CONVO_INDEX_CONFIG = {_ps(config_path)}; " if config_path else ""
+        return env + "& " + " ".join(_ps(a) for a in argv)
+    env = f"CONVO_INDEX_CONFIG={_sh(config_path)} " if config_path else ""   # before nohup: it runs a command, not a shell
+    run = " ".join(_sh(a) for a in argv) + (f" >> {_sh(str(log))} 2>&1" if log else "")
+    return f"{env}nohup {run} &" if background else env + run
 
 
 def install(settings=None, hour=None, minute=None, dry_run=False, system=None, home=None, job="refresh"):
@@ -316,7 +377,7 @@ def _run_all(cmds, stop_on_failure=False):
 
 
 def uninstall(settings=None, system=None, home=None, dry_run=False, job="refresh"):
-    p = plan(settings, system=system, home=home, job=job)
+    p = plan(settings, system=system, home=home, job=job, existing=True)
     cmds = []
     if p["kind"] == "launchd":
         path = next(iter(p["files"]))
@@ -341,7 +402,7 @@ def uninstall(settings=None, system=None, home=None, dry_run=False, job="refresh
 
 
 def status(settings=None, system=None, home=None, job="refresh"):
-    p = plan(settings, system=system, home=home, job=job)
+    p = plan(settings, system=system, home=home, job=job, existing=True)
     if p["kind"] == "schtasks":
         r = subprocess.run(["schtasks", "/Query", "/TN", JOBS[job]["task"]], capture_output=True, text=True)
         installed = r.returncode == 0

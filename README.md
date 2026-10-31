@@ -18,7 +18,12 @@ tool, then runs `convo-index up`: it writes the config, keeps the UI server runn
 index build in the background and opens http://127.0.0.1:9753. Re-run the installer to upgrade; set
 `CONVO_INDEX_NO_UP=1` to install the command only. The database lives in
 `~/.local/share/convo-index/`. Nothing goes to a hosted model until you allow it: run
-`convo-index init` on a terminal to decide (the installer cannot ask).
+`convo-index init` on a terminal to decide (the installer cannot ask). `up` ends with a numbered
+"Needs your attention" list of anything left for you to do.
+
+In a container or anywhere else without a systemd user session (systemctl present but no
+`$XDG_RUNTIME_DIR`), `up` starts the server for the current session only and tells you how to
+start it again and how to refresh the index by hand, or gives the crontab lines if `crontab` exists.
 
 On Windows (PowerShell):
 
@@ -213,6 +218,7 @@ the prompt without one and says why; `--no-digest` skips it.
 
 ## Daily refresh and the server from login
     convo-index schedule install            # LaunchAgent (macOS) or systemd user timer (Linux); crontab line elsewhere
+                                            # (no systemd user session and no crontab: prints the command to run yourself)
     convo-index schedule install --print    # show what would be written, change nothing
     convo-index schedule status
     convo-index schedule uninstall

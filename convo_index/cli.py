@@ -73,7 +73,8 @@ def cmd_init(args):
             cfg["privacy"]["hosted_processing"] = "allow" if hosted else "ask"
         elif not sys.stdin.isatty():
             # Consent is never implied by a pipe: leave it unresolved (hosted calls refused).
-            print("hosted_processing left as 'ask' (no terminal to ask; pass --yes to allow)", file=sys.stderr)
+            if not getattr(args, "from_up", False):        # `up` lists it with everything else to do
+                print("hosted_processing left as 'ask' (no terminal to ask; pass --yes to allow)", file=sys.stderr)
         else:
             backends = sorted({cfg["llm"][j]["backend"] for j in ("classify", "summary") if cfg["llm"][j].get("backend")})
             ans = input(f"Summaries and classification will send conversation text to hosted models via "
@@ -431,6 +432,11 @@ def _job_cmd(args, job):
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 2
+    if out["kind"] == "none":
+        what = "keep the UI server running" if job == "serve" else "run the daily refresh"
+        print(f"nothing installed: {out['reason']}, so nothing here can {what}.\n"
+              f"run it yourself instead:\n  {out['manual']}", file=sys.stderr)
+        return 1
     if args.dry_run or out["kind"] == "cron":
         for path, content in out["files"].items():
             print(f"--- {path}\n{content}")
@@ -495,64 +501,141 @@ def _turn_token_of_running_server(server, settings, seconds=3):
         time.sleep(0.1)
 
 
+def _log_tail(path, lines=5, window=8192):
+    """The last few lines of a log, reading only its end (a long-lived log can be large)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - window))
+            text = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    found = text.splitlines()
+    if size > window and found:
+        found = found[1:]                      # the first line was cut by the seek
+    return found[-lines:]
+
+
+def _attention(items):
+    """The numbered list of what the user still has to do, printed last so it is what they see."""
+    if not items:
+        return
+    head = "Needs your attention:"
+    if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
+        head = f"\033[1;33m{head}\033[0m"
+    print(f"\n{head}")
+    for n, (text, cmds, *then) in enumerate(items, 1):
+        print(f"  {n}. {text}")
+        for c in cmds:
+            print(f"       {c}")
+        for more, more_cmds in then:           # a second step of the same item
+            print(f"     {more}")
+            for c in more_cmds:
+                print(f"       {c}")
+
+
 def cmd_up(args):
     """The first run in one go: write the config, keep the UI server running from login,
     schedule the daily refresh, start the index build in the background and open the UI.
     Nothing goes to a hosted model until the privacy choice is made (init asks on a
-    terminal; otherwise it stays "ask")."""
+    terminal; otherwise it stays "ask"). Where no scheduler works (a container) the server is
+    started for this session and the output says what to run by hand. Whatever needs the
+    user ends up in one numbered list at the end."""
     import webbrowser
     from convo_index import indexer, server
     from convo_index import schedule as SCH
     from convo_index import settings as S
+    args.from_up = True
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # piped (an installer), stderr notes must not jump ahead
+    except (AttributeError, ValueError):
+        pass
     rc = cmd_init(args)
     if rc:
         return rc
     S.reset_cache()
     settings = S.load(use_cache=False)
-    problems = []
+    print()
+    problems, todo, told = [], [], set()
+    restart, start = None, "convo-index serve"   # the "start it again" item, and the command that starts it
     for job, skip in (("serve", args.no_serve), ("refresh", args.no_schedule)):
         if skip:
             continue
+        name = "UI server" if job == "serve" else "daily refresh"
         try:
             out = SCH.install(settings, job=job)
         except ValueError as e:
-            print(f"{job}: {e}", file=sys.stderr)
+            print(f"{name}: not set up: {e}", file=sys.stderr)
             problems.append(job)
+            todo.append((f"The {name} could not be set up: {e}", []))
             continue
-        if out["kind"] == "cron":
-            print(f"{job}: add to `crontab -e`:\n  {out['crontab']}")
-            if job == "serve":
-                SCH.start_detached(out)
+        bad = [r for r in out.get("results", []) if not r["ok"]]
+        if out["kind"] in ("launchd", "systemd", "schtasks") and not bad:
+            print(f"{name}: installed ({', '.join(out['files'])})")
+            continue
+        if bad:
+            problems.append(job)
+            print(f"{name}: `{' '.join(bad[0]['cmd'])}` failed: {bad[0]['stderr'] or 'no error output'}", file=sys.stderr)
+        elif out.get("reason") and out["reason"] not in told:
+            told.add(out["reason"])
+            print(f"no {'usable ' if out['kind'] == 'none' else 'built-in '}scheduler: {out['reason']}")
+        if job == "serve":
+            SCH.start_detached(out)
+            print(f"{name}: running for this session only")
+            if out["kind"] == "cron":
+                restart = ("The UI server will not start again after a reboot. If cron runs on this machine, "
+                           "add this line with `crontab -e`:", [out["crontab"]])
+            else:
+                restart = ("The UI server will not start again after this machine or container restarts. "
+                           "Start it again with:", [out["manual"]])
+            start = out["manual"]
+            todo.append(restart)
         else:
-            bad = [r for r in out.get("results", []) if not r["ok"]]
-            if bad:
-                problems.append(job)
-            print(f"{job}: {'installed' if not bad else 'FAILED: ' + bad[0]['stderr']} ({', '.join(out['files'])})")
+            print(f"{name}: not scheduled")
+            if out["kind"] == "cron":
+                todo.append(("New conversations are not indexed automatically. If cron runs on this machine, "
+                             "add this line with `crontab -e` to refresh daily:", [out["crontab"]]))
+            else:
+                todo.append(("New conversations are not indexed automatically. Run this when you want "
+                             "them searchable:", [out["manual"]]))
     host, port = settings["server"]["host"], int(settings["server"]["port"])
     url = server.advertised_url(host, port)
     if args.wait:
-        print("building the index (the first run downloads the 130 MB embedding model) ...")
+        print("index: building (the first run downloads the 130 MB embedding model) ...")
         rc = indexer.main()
     else:
         plan = SCH.plan(settings, job="refresh")
         SCH.start_detached(plan)
-        print(f"building the index in the background (the first run downloads the 130 MB embedding model);"
-              f" progress: tail -f {plan['log']}")
+        print(f"index: building in the background (the first run downloads the 130 MB embedding model); "
+              f"progress: tail -f {plan['log']}")
         rc = 0
     if settings["privacy"].get("hosted_processing") == "ask":
-        print("summaries and tags wait for a privacy decision: run `convo-index init` on a terminal "
-              "(or `convo-index init --yes` to allow hosted LLM processing)")
+        backends = sorted({settings["llm"][j].get("backend") for j in ("classify", "summary")} - {None, ""})
+        todo.insert(0, (f"Summaries and tags are off until you decide whether conversation text may be sent "
+                        f"to {', '.join(backends) or 'a hosted model'}. Run one of:",
+                        ["convo-index init           # asks you", "convo-index init --yes     # allows it"]))
     if not args.no_serve:
         if _wait_for_port("127.0.0.1" if host in ("0.0.0.0", "::", "") else host, port):
             url = server.advertised_url(host, port, _turn_token_of_running_server(server, settings))
+            print()
             print(_green(f"convo-index is at {url}"))
             if not args.no_open:
                 webbrowser.open(url)
         else:
-            print(f"the UI server did not answer at {url} within 15 s; see {SCH.log_path(settings, 'serve')}", file=sys.stderr)
+            log = SCH.log_path(settings, "serve")
+            print(f"UI server: did not answer at {url} within 15 s", file=sys.stderr)
             problems.append("serve")
+            tail = _log_tail(log)
+            if restart:                        # "start it again after a restart" would contradict this item
+                todo.remove(restart)
+            if tail:
+                todo.append((f"The UI server is not running. Its log ({log}) ends with:", tail,
+                             ("After fixing that, start it with:", [start])))
+            else:
+                todo.append((f"The UI server is not running and wrote nothing to {log}. Start it with:", [start]))
+    _attention(todo)
     if problems:
-        print(f"up finished with problems: {', '.join(dict.fromkeys(problems))}", file=sys.stderr)
         return rc or 1
     return rc
 
