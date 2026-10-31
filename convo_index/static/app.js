@@ -862,6 +862,7 @@ async function toggleToolsPanel(open) {
   if (!open) { btn.focus(); return; }
   const body = $("tools-body");
   body.textContent = "Loading…";
+  $("tools-save").disabled = true;             // until the stored list is on screen: Save would post an empty one
   let data;
   try {
     const res = await fetch("/api/turns/tools", { headers: turnHeaders() });
@@ -883,6 +884,7 @@ async function toggleToolsPanel(open) {
     : `<p class="hint">No MCP servers in your Claude Code config. Add one with <code>claude mcp add --scope user</code>.</p>`;
   if ($("tools-extra")) $("tools-extra").value = [...allowed].join("\n");   // entries no checkbox shows
   updateToolsCount(data.allowed || []);
+  $("tools-save").disabled = !servers.length;
   const first = body.querySelector("input, textarea");
   if (first) first.focus();
 }
