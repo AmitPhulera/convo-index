@@ -268,8 +268,8 @@ that a workspace's privacy settings may refuse.
 
 `convo-index stop`, or the power button in the UI's header, stops the running server without
 uninstalling the service: running browser turns end, the server exits cleanly, and the service
-(which restarts it only after a crash) starts it again at the next login; `convo-index serve`
-or `up` start it sooner. Both go through `POST /api/shutdown`, which needs the turn token, a
+(which restarts it only after a crash) starts it again at the next login; `convo-index service
+install` starts it sooner (`convo-index serve` without the service). Both go through `POST /api/shutdown`, which needs the turn token, a
 request from this machine and no proxy in between; the button is disabled in a tab that was
 not opened with `convo-index open` (or the URL `serve` or `up` prints). `service uninstall` keeps
 it off for good.

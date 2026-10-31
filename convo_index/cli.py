@@ -817,7 +817,7 @@ def cmd_stop(args):
             with socket.create_connection((target, port), timeout=1):
                 pass
         except OSError:
-            print("server stopped; start it again with `convo-index serve` (or at the next login, if the service is installed)")
+            print(f"server stopped; start it again with `{server.start_command()}`")
             return 0
         time.sleep(0.2)
     print(f"the server accepted the request but is still listening after {args.timeout:g} s", file=sys.stderr)
