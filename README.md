@@ -231,7 +231,9 @@ the prompt without one and says why; `--no-digest` skips it.
 prompt, with the same closed surface as a browser turn (read-only unless `--edit`, which a
 review ignores), and prints its replies, the new conversation's id and the command that
 resumes it in that tool. The two conversations are linked in the index as soon as the tool
-reports its session. The new session may read the transcript copy's directory and nothing
+reports its session. It sends the conversation to that tool's provider, so it needs
+`[privacy].hosted_processing = allow`, like the handoff note; with `deny` or `ask` it is
+refused and the prompt can still be printed and pasted by hand. The new session may read the transcript copy's directory and nothing
 else outside the project. It is not started when the prompt holds what looks like a
 credential: print the prompt, remove it, and pass the result with `--prompt-file`, or pass
 `--ignore-secrets` to send the prompt as it is (the transcript copy stays masked). The model comes from `--model`, else `[handoff.models]`:
