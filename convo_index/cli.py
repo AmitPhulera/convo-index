@@ -744,6 +744,33 @@ def cmd_up(args):
     return rc
 
 
+def cmd_open(args):
+    """Open the running UI with its turn token, so the tab can send messages, hand off and
+    stop the server: the way in when the login service started the server and no terminal
+    showed its URL. Exit 1 when nothing is listening."""
+    import webbrowser
+    from urllib.parse import urlsplit
+    from convo_index import server
+    from convo_index import settings as S
+    settings = S.load()
+    host, port = settings["server"]["host"], int(settings["server"]["port"])
+    plain = server.advertised_url(host, port)
+    if not _wait_for_port(urlsplit(plain).hostname, port, seconds=1):
+        print(f"no server is running at {plain}; start it with `{server.start_command()}`", file=sys.stderr)
+        return 1
+    token = server.read_turn_token(settings)
+    if not token:
+        print(f"no turn token at {server.turn_token_path(settings)}: the page opens read-only (no messages, "
+              "hand off or stop). Is the server running as this user with this configuration?", file=sys.stderr)
+    url = server.advertised_url(host, port, token)
+    if args.print_url:
+        print(url)
+        return 0
+    print(f"opening {plain}" + (" with the turn token" if token else ""))
+    webbrowser.open(url)
+    return 0
+
+
 def cmd_stop(args):
     """Stop the running UI server through its shutdown endpoint (running turns end first). The
     login service stays installed: it starts the server again at the next login, as do
@@ -891,6 +918,8 @@ def main(argv=None):
     p_up.add_argument("--no-schedule", action="store_true", help="do not install the daily refresh")
     p_up.add_argument("--no-open", action="store_true", help="do not open the UI in a browser")
     p_up.add_argument("--wait", action="store_true", help="build the index in the foreground instead of the background")
+    p_open = sub.add_parser("open", help="open the UI with its turn token, so the tab can send messages and stop the server")
+    p_open.add_argument("--print", dest="print_url", action="store_true", help="print the URL instead of opening a browser")
     p_stop = sub.add_parser("stop", help="stop the running UI server (running turns end first; the login service stays installed)")
     p_stop.add_argument("--timeout", type=float, default=15, help="seconds to wait for the port to close")
     sub.add_parser("mcp", help="MCP server over stdio (search_conversations, get_conversation, get_related)")
@@ -916,6 +945,8 @@ def main(argv=None):
         from convo_index import server
         server.main()
         return 0
+    if args.cmd == "open":
+        return cmd_open(args)
     if args.cmd == "stop":
         return cmd_stop(args)
     if args.cmd == "doctor":

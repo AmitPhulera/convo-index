@@ -389,3 +389,40 @@ def test_up_runs_init_services_and_the_first_index(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(SCH, "uninstall", lambda settings, dry_run=False, job="refresh", **k:
                         {"kind": "schtasks", "results": [{"cmd": ["schtasks"], "ok": False, "stderr": "Access is denied"}]})
     assert cli.main(["service", "uninstall"]) == 1                       # a failed deregistration is a failure
+
+
+def test_open_brings_up_the_ui_with_the_turn_token(tmp_path, monkeypatch, capsys):
+    import webbrowser
+    from convo_index import server
+    _isolate(tmp_path, monkeypatch)
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", opened.append)
+    monkeypatch.setattr(cli, "_wait_for_port", lambda host, port, seconds=15: True)
+    server.turn_token_path(S.load(use_cache=False)).write_text("tok123")
+    assert cli.main(["open"]) == 0 and opened == ["http://127.0.0.1:9753#turns=tok123"]
+    out = capsys.readouterr().out
+    assert "opening http://127.0.0.1:9753 with the turn token" in out and "tok123" not in out   # no secret in scrollback
+    assert cli.main(["open", "--print"]) == 0 and len(opened) == 1                              # prints, opens nothing
+    assert capsys.readouterr().out.strip() == "http://127.0.0.1:9753#turns=tok123"
+
+
+def test_open_without_a_token_opens_read_only_and_says_so(tmp_path, monkeypatch, capsys):
+    import webbrowser
+    _isolate(tmp_path, monkeypatch)
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", opened.append)
+    monkeypatch.setattr(cli, "_wait_for_port", lambda host, port, seconds=15: True)
+    assert cli.main(["open"]) == 0 and opened == ["http://127.0.0.1:9753"]
+    assert "no turn token" in capsys.readouterr().err
+
+
+def test_open_with_no_server_says_how_to_start_it(tmp_path, monkeypatch, capsys):
+    import webbrowser
+    from convo_index import server
+    _isolate(tmp_path, monkeypatch)
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", opened.append)
+    monkeypatch.setattr(cli, "_wait_for_port", lambda host, port, seconds=15: False)
+    monkeypatch.setattr(server, "start_command", lambda: "convo-index service install")
+    assert cli.main(["open"]) == 1 and opened == []
+    assert "start it with `convo-index service install`" in capsys.readouterr().err
