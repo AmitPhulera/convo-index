@@ -494,8 +494,18 @@ def test_linux_without_a_user_session_falls_back_and_says_why(tmp_path, monkeypa
     ps = SCH.manual_line([r"C:\Tools\convo-index.exe", "serve"], r"C:\d\serve.log", r"C:\Users\o'b\cfg.toml",
                          background=True, windows=True)
     assert ps == r"$env:CONVO_INDEX_CONFIG = 'C:\Users\o''b\cfg.toml'; & 'C:\Tools\convo-index.exe' 'serve'"   # PowerShell
+    cfg = SCH.C.user_dir("config") / "convo-index" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True); cfg.write_text("")
+    st.path = cfg                                                                       # loaded from the default place
+    real = tmp_path / "tool" / "convo-index"; real.parent.mkdir(); real.write_text(""); (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "convo-index").symlink_to(real)                                 # uv's ~/.local/bin link
+    monkeypatch.setattr(SCH, "command", lambda sub="index": [str(real), sub])
+    which["convo-index"] = str(tmp_path / "bin" / "convo-index")
+    assert SCH.plan(st, system="Linux", home=tmp_path / "home")["manual"] == "convo-index index"   # nothing to spell out
+    st.path = tmp_path / "elsewhere.toml"; st.path.write_text("")
+    assert SCH.plan(st, system="Linux", home=tmp_path / "home")["manual"].startswith("CONVO_INDEX_CONFIG=")
     monkeypatch.setattr(SCH, "_kind_and_reason", lambda system=None: ("schtasks", ""))
-    assert SCH.plan(st, system="Windows", home=tmp_path / "home", job="serve")["manual"].startswith("& ")
+    assert SCH.plan(st, system="Windows", home=tmp_path / "home", job="serve")["manual"].endswith("; & 'convo-index' 'serve'")
 
 
 def test_existing_systemd_units_are_found_without_a_user_session(tmp_path, monkeypatch):

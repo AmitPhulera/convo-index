@@ -326,7 +326,12 @@ def plan(settings=None, hour=None, minute=None, system=None, home=None, job="ref
         out["crontab"] = crontab_line(argv, hour, minute, log, config_path)
     # how to run it by hand: the only way with kind "none", the fallback when an install fails.
     # The server goes to the background with its log; the refresh runs in front, its progress visible.
-    out["manual"] = manual_line(argv, log if job == "serve" else None, config_path,
+    # For a person typing it: the bare command when PATH finds this same executable, and the
+    # config only when it is not where convo-index looks anyway.
+    exe = shutil.which(Path(argv[0]).name)
+    shown = [Path(argv[0]).name, *argv[1:]] if exe and Path(exe).resolve() == Path(argv[0]).resolve() else argv
+    custom = config_path if config_path and config_path != default_cfg.expanduser().resolve() else None
+    out["manual"] = manual_line(shown, log if job == "serve" else None, custom,
                                 background=job == "serve", windows=kind == "schtasks")
     return out
 
