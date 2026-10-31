@@ -547,6 +547,10 @@ def cmd_up(args):
     from convo_index import schedule as SCH
     from convo_index import settings as S
     args.from_up = True
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # piped (an installer), stderr notes must not jump ahead
+    except (AttributeError, ValueError):
+        pass
     rc = cmd_init(args)
     if rc:
         return rc
