@@ -712,6 +712,13 @@ def add_link(conn, from_id, to_id, relation):
     conn.commit()
 
 
+def handoff_sessions(conn):
+    """Ids of every conversation a handoff started (the `from` side of a link)."""
+    if not _table_exists(conn, "conversation_links"):
+        return set()
+    return {r[0] for r in conn.execute("SELECT from_id FROM conversation_links")}
+
+
 def links_for(conn, conversation_id):
     """Both directions, oldest first: [{id, relation, direction}], where direction is "from"
     when `conversation_id` is the new conversation and "to" when it is the original."""

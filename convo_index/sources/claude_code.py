@@ -290,9 +290,10 @@ def parse_conversation(path, text=None):
     }
 
 
-def exclude_reason(parsed):
+def exclude_reason(parsed, handoff=False):
     """Why a parsed session must not be indexed, or None. Raises UnreadableSource when the
-    file has records but every one of them was unparseable."""
+    file has records but every one of them was unparseable. `handoff`: a handoff started this
+    session (it is linked), so its being headless does not keep it out."""
     if not parsed["messages"]:
         # No messages recovered. If any record was unparseable it could be the reason, so
         # this is not a confirmed-empty session even when metadata lines (ai-title, mode...)
@@ -307,8 +308,10 @@ def exclude_reason(parsed):
     # classification calls), which would otherwise pollute the index every run.
     # The first_prompt check is a flush-race-proof backstop: a concurrently-written
     # classification session may be indexed before its `entrypoint` line lands.
-    # A handoff's new session is headless as well, but a real conversation (see config).
-    if parsed.get("entrypoint") in SKIP_ENTRYPOINTS and not parsed["first_prompt"].startswith(HANDOFF_PROMPT_PREFIXES):
+    # A handoff's new session is headless as well, but a real conversation: known by its link,
+    # or (before the link is written, or for a link the user deleted) by its prompt's opening.
+    if (parsed.get("entrypoint") in SKIP_ENTRYPOINTS and not handoff
+            and not parsed["first_prompt"].startswith(HANDOFF_PROMPT_PREFIXES)):
         return "headless-sdk"
     if parsed["first_prompt"].startswith((CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX)):
         return "self-llm-call"
@@ -353,6 +356,7 @@ class ClaudeCodeAdapter:
 
     def __init__(self, projects_dir=None):
         self.projects_dir = Path(projects_dir) if projects_dir else PROJECTS_DIR
+        self.handoff_ids = set()      # set by the indexer from conversation_links
 
     def available(self):
         return self.projects_dir.exists()
@@ -374,7 +378,7 @@ class ClaudeCodeAdapter:
         text, revision = read_snapshot(ref.locator)
         revision = f"p{PARSER_VERSION}:{revision}"
         parsed = parse_conversation(ref.locator, text)
-        if exclude_reason(parsed):
+        if exclude_reason(parsed, handoff=ref.native_id in self.handoff_ids):
             return None
         conv = to_conversation(parsed, ref.locator)
         # The file name is the session id; `sessionId` inside should agree, but the

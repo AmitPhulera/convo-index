@@ -466,3 +466,18 @@ def test_a_handoff_session_is_titled_after_the_original(tmp_path):
     prompt = H._OPENING["review"].format(harness="Claude Code") + "\n\n## Where and when\n\n- conversation: `x`\n- title: Greeting in app.py\n"
     _make_file(projects, "h6", "/x", prompt, entrypoint="sdk-cli")
     assert _load(ClaudeCodeAdapter(projects), "h6")[0].title == "Second opinion: Greeting in app.py"
+
+
+def test_a_linked_handoff_session_is_indexed_whatever_its_prompt_says(tmp_path, monkeypatch):
+    from convo_index import db as dbm
+    from convo_index import indexer
+    projects = tmp_path / "projects"
+    _make_file(projects, "h7", "/x", "Please check the tests carefully. (the opening was edited away)", entrypoint="sdk-cli")
+    _make_file(projects, "h8", "/x", "a headless script of my own", entrypoint="sdk-cli")
+    st = _quiet(monkeypatch, tmp_path)
+    conn = dbm.connect(st.db_path()); dbm.init_schema(conn, st.db_path())
+    dbm.add_link(conn, "claude_code:h7", "opencode:orig", "review_of")
+    conn.close()
+    indexer.run(adapters=[ClaudeCodeAdapter(projects)], db_path=st.db_path(), settings=st, derived=False)
+    conn = dbm.connect(st.db_path())
+    assert dbm.exists(conn, "claude_code:h7") and not dbm.exists(conn, "claude_code:h8")
