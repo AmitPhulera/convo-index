@@ -418,7 +418,8 @@ def _start_handoff(args, settings, cid, h, kind, out, transcript):
             print(last["stderr"], file=sys.stderr)
     if state["id"]:
         relation = "reviews" if kind == "review" else "continues"
-        print(f"new conversation {state['id']} {relation} {cid}", file=sys.stderr)
+        print(f"new conversation {state['id']} {relation} {cid}" if state["linked"] else
+              f"new conversation {state['id']}; not linked to {cid}: {state['link_error']}", file=sys.stderr)
         resume = resume_command(state["id"], h["cwd"])
         if resume:
             print(f"resume it: {resume}", file=sys.stderr)

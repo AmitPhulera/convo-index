@@ -508,3 +508,16 @@ def test_start_session_brings_an_older_database_up_to_the_link_table(tmp_path, m
     turn, state = H.start_session(runner, tmp_path / "t.db", "claude_code:s1", "opencode", "p", str(tmp_path), kind="review")
     assert drain(runner, turn)[-1]["kind"] == "done"
     assert dbm.links_for(dbm.connect(tmp_path / "t.db"), "claude_code:s1")[0]["id"] == "opencode:ses_9"
+
+
+def test_a_failed_link_write_is_reported_and_the_session_still_finishes(tmp_path, monkeypatch, capsys):
+    import sqlite3
+    cli, _ = _start_env(tmp_path, monkeypatch)
+
+    def broken(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(dbm, "add_link", broken)
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 0
+    out = capsys.readouterr()
+    assert out.out == "Taking over.\n" and "not linked to claude_code:s1: database is locked" in out.err
+    assert "reviews claude_code:s1" not in out.err

@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -518,7 +519,8 @@ def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=
     """Start a new `target` session seeded with `prompt` on `runner` (a TurnRunner) and return
     (turn, state). state["id"] is the new conversation id once the harness has reported its
     session; the link to `from_id` is written at that moment, so a harness that fails before
-    it starts leaves no link to nothing. A review never edits. Raises ValueError when the
+    it starts leaves no link to nothing (state["linked"], or state["link_error"] when the write
+    failed). A review never edits. Raises ValueError when the
     target cannot start a session as asked, LookupError when it is not available here."""
     edits = bool(edits) and kind == "continue"
     cmd, _ = SB.new_session_command(target, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools),
@@ -530,7 +532,7 @@ def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=
         dbm.init_schema(conn, db_path)      # the link table, on a database no newer command has opened yet
     finally:
         conn.close()
-    state = {"id": None}
+    state = {"id": None, "linked": False, "link_error": None}
     probe = f"{target}:x"            # turn_events picks the adapter from the source part only
 
     def translate(line):
@@ -538,11 +540,15 @@ def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=
             sid = SB.session_id(target, line)
             if sid:
                 state["id"] = f"{target}:{sid}"
-                conn = dbm.connect(db_path)
-                try:
-                    dbm.add_link(conn, state["id"], from_id, RELATIONS[kind])
-                finally:
-                    conn.close()
+                try:           # a failed write must not cut the session's stream short
+                    conn = dbm.connect(db_path)
+                    try:
+                        dbm.add_link(conn, state["id"], from_id, RELATIONS[kind])
+                        state["linked"] = True
+                    finally:
+                        conn.close()
+                except sqlite3.Error as e:
+                    state["link_error"] = str(e)
         return SB.turn_events(probe, line)
 
     # a placeholder conversation id: the runner allows one turn per conversation, and this one is new
