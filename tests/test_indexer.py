@@ -49,6 +49,17 @@ def test_adapter_skips_headless_sdk_session(tmp_path):
     assert _load(ClaudeCodeAdapter(projects), "h1") is None
 
 
+def test_adapter_indexes_a_headless_handoff_session(tmp_path):
+    from convo_index import handoff as H
+    projects = tmp_path / "projects"
+    for sid, kind in (("h3", "continue"), ("h4", "review")):
+        _make_file(projects, sid, "/x", H._OPENING[kind].format(harness="opencode") + "\n\n## Where and when", entrypoint="sdk-cli")
+        loaded = _load(ClaudeCodeAdapter(projects), sid)
+        assert loaded is not None and loaded[0].native_id == sid
+    _make_file(projects, "h5", "/x", "You are reviewing my essay", entrypoint="sdk-cli")    # a lookalike stays out
+    assert _load(ClaudeCodeAdapter(projects), "h5") is None
+
+
 def test_adapter_skips_own_classification_prompt(tmp_path):
     # Backstop: a classification session written without a flushed entrypoint line
     # must still be skipped based on its prompt text.

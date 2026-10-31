@@ -16,7 +16,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from convo_index.config import PROJECTS_DIR, CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX
+from convo_index.config import PROJECTS_DIR, CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX, HANDOFF_PROMPT_PREFIXES
 from convo_index.model import (Conversation, Message, ToolCall, UsageRecord, KIND_TEXT, KIND_THINKING,
                                KIND_TOOL_CALL, KIND_TOOL_RESULT, FIDELITY_FULL, FIDELITY_PARTIAL, split_id)
 from convo_index.sources import base as sources
@@ -294,7 +294,8 @@ def exclude_reason(parsed):
     # classification calls), which would otherwise pollute the index every run.
     # The first_prompt check is a flush-race-proof backstop: a concurrently-written
     # classification session may be indexed before its `entrypoint` line lands.
-    if parsed.get("entrypoint") in SKIP_ENTRYPOINTS:
+    # A handoff's new session is headless as well, but a real conversation (see config).
+    if parsed.get("entrypoint") in SKIP_ENTRYPOINTS and not parsed["first_prompt"].startswith(HANDOFF_PROMPT_PREFIXES):
         return "headless-sdk"
     if parsed["first_prompt"].startswith((CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX)):
         return "self-llm-call"

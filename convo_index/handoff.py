@@ -22,7 +22,7 @@ from pathlib import Path
 from convo_index import db as dbm
 from convo_index import export as X
 from convo_index.sources import base as SB
-from convo_index.config import SUMMARY_PROMPT_PREFIX
+from convo_index.config import HANDOFF_PROMPT_PREFIXES, SUMMARY_PROMPT_PREFIX
 from convo_index.indexer import cwd_excluded
 from convo_index.model import KIND_TEXT, KIND_TOOL_CALL, KIND_TOOL_RESULT
 from convo_index.providers import registry as R
@@ -374,10 +374,12 @@ CLOSING = {
         "4. what you checked and found to be fine."),
 }
 
+# The first words are HANDOFF_PROMPT_PREFIXES: the Claude Code adapter indexes a headless session
+# that starts with them (it skips every other one).
 _OPENING = {
-    "continue": "You are taking over a coding conversation that started in {harness}. Everything below\n"
+    "continue": HANDOFF_PROMPT_PREFIXES[0] + " that started in {harness}. Everything below\n"
                 "is context from that conversation; the instruction to act is at the end.",
-    "review": "You are reviewing a coding conversation that took place in {harness}. Everything below is\n"
+    "review": HANDOFF_PROMPT_PREFIXES[1] + " that took place in {harness}. Everything below is\n"
               "context from that conversation; what to do with it is at the end.",
 }
 
