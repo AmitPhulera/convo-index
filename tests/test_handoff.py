@@ -246,3 +246,10 @@ def test_transcript_file_is_private_even_over_an_existing_file_or_symlink(tmp_pa
     H.write_transcript(conn, "claude_code:s1", d)
     assert victim.read_text() == "keep me" and not path.is_symlink()
     assert sorted(p.name for p in d.iterdir()) == ["transcript.md"]       # no temp file left behind
+
+
+def test_a_relative_transcript_dir_gives_an_absolute_pointer(tmp_path, monkeypatch):
+    conn = _db(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    path = H.write_transcript(conn, "claude_code:s1", "rel")
+    assert path.is_absolute() and path == (tmp_path / "rel" / "transcript.md").resolve()

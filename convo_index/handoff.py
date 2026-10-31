@@ -170,7 +170,7 @@ def write_transcript(conn, cid, directory, settings=None):
     md = X.as_markdown(conn, cid, settings, include_tools=True)
     if md is None:
         return None
-    directory = Path(directory)
+    directory = Path(directory).expanduser().resolve()   # the target harness starts elsewhere
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = directory / "transcript.md"
     # a new 0600 file renamed over the name: an existing file's mode is not inherited and a
