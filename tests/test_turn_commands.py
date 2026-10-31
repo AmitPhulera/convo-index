@@ -2,6 +2,7 @@
 harness's stream is translated, and how recent activity is measured."""
 import json
 import os
+import sys
 import time
 
 import pytest
@@ -419,14 +420,46 @@ def test_pi_stream_is_translated_and_noise_dropped():
     assert events[5] == {"kind": "done", "cost_usd": pytest.approx(0.006), "turns": 2}
 
 
+def _pi_assistant(stop, text="", error=None):
+    m = {"role": "assistant", "content": [{"type": "text", "text": text}] if text else [], "stopReason": stop,
+         "usage": {"input": 1, "output": 1, "cost": {"total": 0.01}}}
+    return {**m, "errorMessage": error} if error else m
+
+
 def test_pi_failed_request_is_an_error_though_pi_exits_0():
-    failed = {"role": "assistant", "content": [], "provider": "ollama", "model": "nosuchmodel-xyz", "stopReason": "error",
-              "errorMessage": "404: {\"message\":\"model 'nosuchmodel-xyz' not found\"}",
-              "usage": {"input": 0, "output": 0, "cost": {"total": 0}}}
-    assert pi.turn_events(json.dumps({"type": "message_end", "message": failed})) == [
-        {"kind": "error", "message": "404: {\"message\":\"model 'nosuchmodel-xyz' not found\"}"}]
+    failed = _pi_assistant("error", error="404: model 'nosuchmodel-xyz' not found")
+    assert pi.turn_events(json.dumps({"type": "message_end", "message": failed})) == []
+    assert pi.turn_events(json.dumps({"type": "agent_end", "messages": [failed], "willRetry": False})) == [
+        {"kind": "error", "message": "404: model 'nosuchmodel-xyz' not found"}]
     assert pi.turn_events(json.dumps({"type": "agent_end", "messages": []})) == [{"kind": "done", "cost_usd": None, "turns": 0}]
     assert pi.turn_events("not json") == [] and pi.turn_events("[1]") == [] and pi.turn_events('{"type": "message_end"}') == []
+
+
+def test_pi_retried_failure_ends_as_the_retry_does():
+    """Shaped like pi 1.4.0's auto-retry: a failed run whose agent_end says willRetry, the retry
+    notice, then a second run. Through the runner, the turn's outcome is the last verdict."""
+    from convo_index import turns
+    failed = _pi_assistant("error", error="503 overloaded")
+    lines = [{"type": "message_end", "message": failed},
+             {"type": "agent_end", "messages": [failed], "willRetry": True},
+             {"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 2000, "errorMessage": "503 overloaded"},
+             {"type": "message_end", "message": _pi_assistant("stop", text="Recovered.")},
+             {"type": "agent_end", "messages": [_pi_assistant("stop", text="Recovered.")], "willRetry": False},
+             {"type": "agent_settled", "aborted": False}]
+    events = [e for line in lines for e in pi.turn_events(json.dumps(line))]
+    assert [e["kind"] for e in events] == ["text", "text", "done"]
+    assert "retrying (attempt 1 of 3) after: 503 overloaded" in events[0]["text"]
+    script = "import sys\nfor l in sys.argv[1:]: print(l)"
+    cmd = base.TurnCommand(argv=[sys.executable, "-c", script] + [json.dumps(x) for x in lines], cwd=os.getcwd())
+    r = turns.TurnRunner(refresh=lambda: {"ok": True, "busy": False})
+    t = r.start(f"pi:{PI_SID}", cmd, pi.turn_events)
+    last = [ev for _, ev in r.events(t.id) if ev][-1]
+    assert last["kind"] == "done" and last["cost_usd"] == pytest.approx(0.01)
+    lines[-2] = {"type": "agent_end", "messages": [failed], "willRetry": False}     # the retries ran out
+    cmd = base.TurnCommand(argv=[sys.executable, "-c", script] + [json.dumps(x) for x in lines], cwd=os.getcwd())
+    t = r.start(f"pi:{PI_SID}", cmd, pi.turn_events)
+    last = [ev for _, ev in r.events(t.id) if ev][-1]
+    assert last["kind"] == "error" and last["message"] == "503 overloaded"
 
 
 def test_pi_long_tool_input_is_clipped():

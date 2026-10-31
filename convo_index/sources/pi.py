@@ -485,11 +485,23 @@ def _cost(messages):
     return sum(costs) if costs else None
 
 
+def _verdict(messages):
+    """done or error for a run that pi will not retry, judged by its final assistant message: in
+    JSON mode pi exits 0 even when that request failed."""
+    last = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "assistant"), {})
+    if last.get("stopReason") == "error":
+        return {"kind": "error", "message": _turn_clip(last.get("errorMessage") or "request failed", 2000)}
+    return {"kind": "done", "cost_usd": _cost(messages),
+            "turns": sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant")}
+
+
 def turn_events(line):
     """Events for one `--mode json` line of `pi -p`. Whole messages are read from `message_end`
-    (assistant text and tool calls, tool results; thinking is dropped) and the run's cost from
-    `agent_end`; the streaming deltas, tool execution updates and session header are dropped. A
-    failed request is an assistant message with stopReason "error" (pi still exits 0)."""
+    (assistant text and tool calls, tool results; thinking is dropped); each run ends with an
+    `agent_end`, which becomes the turn's verdict unless pi is about to retry a failed request
+    (`willRetry`; the retry ends with an `agent_end` of its own, and the runner keeps the last
+    verdict). A retry is announced as a text line. The streaming deltas, tool execution updates
+    and session header are dropped."""
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, TypeError):
@@ -497,9 +509,12 @@ def turn_events(line):
     if not isinstance(d, dict):
         return []
     if d.get("type") == "agent_end":
-        messages = d.get("messages") if isinstance(d.get("messages"), list) else []
-        return [{"kind": "done", "cost_usd": _cost(messages),
-                 "turns": sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant")}]
+        if d.get("willRetry") is True:
+            return []
+        return [_verdict(d.get("messages") if isinstance(d.get("messages"), list) else [])]
+    if d.get("type") == "auto_retry_start":
+        return [{"kind": "text", "text": f"[pi is retrying (attempt {d.get('attempt')} of {d.get('maxAttempts')}) "
+                                         f"after: {_turn_clip(str(d.get('errorMessage') or 'an error'), 300)}]"}]
     msg = d.get("message")
     if d.get("type") != "message_end" or not isinstance(msg, dict):
         return []
@@ -512,8 +527,6 @@ def turn_events(line):
                 out.append({"kind": "text", "text": b["text"]})
             elif b.get("type") == "toolCall":
                 out.append({"kind": "tool", "name": str(b.get("name", "")), "input": _turn_clip(b.get("arguments") or {})})
-        if msg.get("stopReason") == "error":
-            out.append({"kind": "error", "message": _turn_clip(msg.get("errorMessage") or "request failed", 2000)})
     elif msg.get("role") == "toolResult":
         out.append({"kind": "tool_result", "text": _turn_clip(_text_of(msg.get("content"))), "error": bool(msg.get("isError"))})
     return out
