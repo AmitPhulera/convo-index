@@ -13,6 +13,19 @@ from convo_index.sources import claude_code as cc
 # ---- Claude Code ------------------------------------------------------------------------------
 
 @pytest.fixture
+def claude_mcp(monkeypatch, tmp_path):
+    """A user config with three MCP servers, found through CLAUDE_CONFIG_DIR; turn scratch in tmp."""
+    home = tmp_path / "claude-home"
+    home.mkdir()
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {
+        "atlassian": {"type": "http", "url": "https://mcp.example/a", "headers": {"Authorization": "Bearer t"}},
+        "claude_ai_Datadog": {"type": "stdio", "command": "dd-mcp"},
+        "slack": {"type": "http", "url": "https://mcp.example/s"}}}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+    monkeypatch.setattr(cc.tempfile, "tempdir", str(tmp_path))
+
+
+@pytest.fixture
 def claude_on_path(monkeypatch):
     monkeypatch.setattr(cc.shutil, "which", lambda name: "/opt/bin/claude" if name == "claude" else None)
     monkeypatch.setattr(base, "is_windows", lambda: False)
@@ -29,10 +42,40 @@ def test_claude_read_only_turn_closes_every_surface_and_sends_the_prompt_on_stdi
     assert base.turn_launcher("claude_code:abc") == ["/opt/bin/claude"]
 
 
-def test_claude_edits_turn_adds_file_tools_but_never_bash(claude_on_path):
+def test_claude_read_only_turn_ignores_the_mcp_allowlist(claude_on_path, claude_mcp):
+    cmd = base.turn_command("claude_code:abc", "what changed?", "/proj", mcp_tools=("mcp__atlassian__*",))
+    assert "--safe-mode" in cmd.argv and "--mcp-config" not in cmd.argv and "Bash" not in " ".join(cmd.argv)
+    assert cmd.scratch == ()
+
+
+def test_claude_edit_turn_adds_file_tools_and_shell_and_no_mcp_without_an_allowlist(claude_on_path, claude_mcp):
     cmd = base.turn_command("claude_code:abc", "fix it", "/proj", edits=True)
-    assert cmd.argv[-4:] == ["--tools", "Read,Glob,Grep,Edit,Write,MultiEdit", "--permission-mode", "acceptEdits"]
-    assert "--restricted" in cmd.argv and "Bash" not in " ".join(cmd.argv)
+    assert cmd.argv == ["/opt/bin/claude", "--resume", "abc",
+                        "-p", "--output-format", "stream-json", "--verbose", "--setting-sources", "", "--restricted",
+                        "--strict-mcp-config", "--disable-slash-commands", "--permission-prompts", "none",
+                        "--tools", "Read,Glob,Grep,Edit,Write,MultiEdit,Bash", "--permission-mode", "acceptEdits",
+                        "--allowedTools", "Bash"]
+    assert "--safe-mode" not in cmd.argv            # it would drop --mcp-config servers too
+    assert cmd.scratch == () and cmd.stdin == "fix it"
+
+
+def test_claude_edit_turn_loads_only_the_allowlisted_servers(claude_on_path, claude_mcp):
+    cmd = base.turn_command("claude_code:abc", "fix it", "/proj", edits=True,
+                            mcp_tools=("mcp__atlassian__getJiraIssue", "mcp__claude_ai_Datadog__*", "mcp__gone__x"))
+    assert cmd.argv[-2:] == ["--allowedTools", "Bash,mcp__atlassian__getJiraIssue,mcp__claude_ai_Datadog"]
+    config = cmd.argv[cmd.argv.index("--mcp-config") + 1]
+    assert os.path.dirname(config) == cmd.scratch[0]                     # removed by the runner with the turn
+    assert json.loads(open(config).read()) == {"mcpServers": {
+        "atlassian": {"type": "http", "url": "https://mcp.example/a", "headers": {"Authorization": "Bearer t"}},
+        "claude_ai_Datadog": {"type": "stdio", "command": "dd-mcp"}}}    # "slack" is configured but not allowlisted
+    if os.name != "nt":
+        assert os.stat(config).st_mode & 0o777 == 0o600
+
+
+def test_claude_mcp_servers_reads_the_user_config(claude_mcp, monkeypatch, tmp_path):
+    assert sorted(cc.mcp_servers()) == ["atlassian", "claude_ai_Datadog", "slack"]
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "nowhere"))
+    assert cc.mcp_servers() == {}
 
 
 def test_claude_turn_helpers_leave_the_transcript_parser_alone():
@@ -178,13 +221,14 @@ def test_opencode_read_only_turn(opencode_on_path):
     assert all(r["effect"] == "allow" for r in rules[1:])
 
 
-def test_opencode_edits_turn_allows_edit_never_bash(opencode_on_path):
-    cmd = base.turn_command("opencode:ses_abc", "fix it", "/proj", edits=True)
+def test_opencode_edit_turn_allows_edit_and_bash(opencode_on_path):
+    cmd = base.turn_command("opencode:ses_abc", "fix it", "/proj", edits=True, mcp_tools=("mcp__atlassian__*",))
     assert "--agent" not in cmd.argv and "--auto" not in cmd.argv
     rules = json.loads(cmd.env["OPENCODE_CONFIG_CONTENT"])["permissions"]
-    assert [r["action"] for r in rules] == ["*", "read", "glob", "grep", "list", "edit"]
-    assert rules[-1] == {"action": "edit", "resource": "*", "effect": "allow"}       # project-relative paths
-    assert not any(r["action"] == "bash" and r["effect"] != "deny" for r in rules)
+    assert [r["action"] for r in rules] == ["*", "read", "glob", "grep", "list", "edit", "bash"]
+    assert rules[-2] == {"action": "edit", "resource": "*", "effect": "allow"}       # project-relative paths
+    assert rules[-1] == {"action": "bash", "resource": "*", "effect": "allow"}
+    assert os.listdir(cmd.env["XDG_CONFIG_HOME"]) == []      # no MCP server: the allowlist is Claude Code's
     assert base.turn_launcher("opencode:ses_abc") == ["/opt/bin/opencode"]
 
 

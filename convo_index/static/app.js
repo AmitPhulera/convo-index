@@ -25,6 +25,7 @@ const ICON = {
   close: '<svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
   stop: '<svg class="icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
   panel: '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>',
+  tools: '<svg class="icon" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/></svg>',
   send: '<svg class="icon" viewBox="0 0 24 24"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4z"/></svg>',
 };
 function sourceLabel(s) { return SOURCE_LABELS[s] || s || "unknown"; }
@@ -800,19 +801,28 @@ function detachTurn() {
   if (turnStream) { turnStream.controller.abort(); turnStream = null; }
 }
 
-// The edits position is a Mode picker: Read-only, or Can edit files (never shell commands).
+// The Mode picker: Read-only, or Edit (files, shell commands and the allowlisted MCP tools,
+// all without asking). Claude Code conversations also get a Tools button for that allowlist.
 function composerHTML(c) {
+  const tools = c.source === "claude_code" && turnToken;
   const send = /Mac/.test(navigator.platform) ? "⌘" : "Ctrl";
   const hint = turnToken ? `<span class="send-hint"><kbd>${send}</kbd><kbd>Enter</kbd> to send</span>`
     : "To send messages here, open the UI through the URL <code>convo-index serve</code> or <code>up</code> prints.";
   return `<div id="turn-live"></div>
     <div class="composer" id="composer">
       <div class="composer-box">
+        ${tools ? `<div class="tools-panel" id="tools-panel" hidden>
+          <div class="tools-head"><strong>MCP tools in Edit mode</strong><span class="hint">These run without asking. Servers come from your Claude Code config; claude.ai connectors cannot be loaded here.</span></div>
+          <div id="tools-body" class="tools-body"></div>
+          <div class="tools-actions"><span class="turn-status" id="tools-status" role="status"></span>
+            <button class="btn ghost" id="tools-cancel" type="button">Cancel</button><button class="btn primary" id="tools-save" type="button">Save</button></div>
+        </div>` : ""}
         <textarea id="turn-prompt" rows="2" aria-label="Message" placeholder="Continue this conversation in ${escape(sourceLabel(c.source))}…"${turnToken ? "" : " disabled"}></textarea>
         <div class="composer-row">
-          <label class="mode-pick" title="What the tool may do. Shell commands are never allowed.">Mode
-            <select id="turn-edits"><option value="read">Read-only</option><option value="edits">Can edit files</option></select>
+          <label class="mode-pick" title="Read-only reads files. Edit also edits files, runs shell commands and uses the allowed MCP tools, without asking.">Mode
+            <select id="turn-edits"><option value="read">Read-only</option><option value="edits">Edit</option></select>
           </label>
+          ${tools ? `<button class="btn ghost" id="turn-tools" type="button" aria-expanded="false" aria-controls="tools-panel" title="MCP tools Edit mode may use">${ICON.tools}<span class="label">${c.edit_mcp_tools ? `Tools · ${c.edit_mcp_tools}` : "Tools"}</span></button>` : ""}
           <span class="turn-status" id="turn-status" role="status">${hint}</span>
           <button class="btn danger" id="turn-stop" hidden title="Stop the tool. What it already wrote stays in the transcript.">${ICON.stop}<span class="label">Stop</span></button>
           <button class="btn primary" id="turn-send"${turnToken ? "" : " disabled"}>${ICON.send}<span class="label">Send</span></button>
@@ -822,6 +832,11 @@ function composerHTML(c) {
 }
 
 function wireComposer(c) {
+  if ($("turn-tools")) {
+    $("turn-tools").addEventListener("click", () => toggleToolsPanel());
+    $("tools-cancel").addEventListener("click", () => toggleToolsPanel(false));
+    $("tools-save").addEventListener("click", saveTools);
+  }
   $("turn-send").addEventListener("click", () => sendTurn(c.id));
   $("turn-stop").addEventListener("click", stopTurn);
   $("turn-prompt").addEventListener("keydown", e => {
@@ -835,6 +850,68 @@ function turnStatus(text, kind) {
   if (!el) return;
   el.className = "turn-status" + (kind ? " " + kind : "");
   el.textContent = text;
+}
+
+// The allowlist panel: each configured server with "All tools" and the tools transcripts
+// have called, plus free entries for the rest. Refusals from the server are shown verbatim.
+async function toggleToolsPanel(open) {
+  const panel = $("tools-panel"), btn = $("turn-tools");
+  open = open === undefined ? panel.hidden : open;
+  panel.hidden = !open;
+  btn.setAttribute("aria-expanded", String(open));
+  if (!open) { btn.focus(); return; }
+  const body = $("tools-body");
+  body.textContent = "Loading…";
+  $("tools-save").disabled = true;             // until the stored list is on screen: Save would post an empty one
+  let data;
+  try {
+    const res = await fetch("/api/turns/tools", { headers: turnHeaders() });
+    data = await res.json().catch(() => ({}));
+    if (!res.ok) { body.textContent = data.error || `The server returned ${res.status}.`; return; }
+  } catch (e) { body.textContent = "The server did not answer."; return; }
+  if (panel.hidden) return;
+  const allowed = new Set(data.allowed || []);
+  const box = (entry, label) => {
+    const on = allowed.delete(entry);
+    return `<label class="tools-pick"><input type="checkbox" data-entry="${escape(entry)}"${on ? " checked" : ""}> ${escape(label)}</label>`;
+  };
+  const servers = data.servers || [];
+  body.innerHTML = servers.length ? servers.map(sv => `<fieldset class="tools-server"><legend>${escape(sv.name)} <span class="hint">${escape(sv.type)}</span></legend>
+      ${box(`mcp__${sv.name}__*`, "All tools")}
+      ${((data.seen || {})[sv.name] || []).map(t => box(`mcp__${sv.name}__${t}`, t)).join("")}
+    </fieldset>`).join("") + `<label class="tools-extra"><span>Other tools, one per line (<code>mcp__server__tool</code>)</span>
+      <textarea id="tools-extra" rows="2" spellcheck="false"></textarea></label>`
+    : `<p class="hint">No MCP servers in your Claude Code config. Add one with <code>claude mcp add --scope user</code>.</p>`;
+  if ($("tools-extra")) $("tools-extra").value = [...allowed].join("\n");   // entries no checkbox shows
+  updateToolsCount(data.allowed || []);
+  $("tools-save").disabled = !servers.length;
+  const first = body.querySelector("input, textarea");
+  if (first) first.focus();
+}
+
+async function saveTools() {
+  const entries = [...document.querySelectorAll("#tools-body input[data-entry]:checked")].map(el => el.dataset.entry)
+    .concat(($("tools-extra") ? $("tools-extra").value : "").split("\n").map(x => x.trim()).filter(Boolean));
+  $("tools-save").disabled = true;
+  let res, body;
+  try {
+    res = await fetch("/api/turns/tools", { method: "POST", headers: turnHeaders({ "Content-Type": "application/json" }),
+                                            body: JSON.stringify({ mcp_tools: entries }) });
+    body = await res.json().catch(() => ({}));
+  } catch (e) { res = null; }
+  if (!$("tools-save")) return;                // the conversation was closed meanwhile
+  $("tools-save").disabled = false;
+  const status = $("tools-status");
+  if (!res || !res.ok) { status.className = "turn-status error"; status.textContent = (body && body.error) || "The server did not answer."; return; }
+  updateToolsCount(body.allowed);
+  status.className = "turn-status"; status.textContent = "";
+  toggleToolsPanel(false);
+  toast(body.allowed.length ? `Edit mode may use ${body.allowed.length} MCP tool entr${body.allowed.length === 1 ? "y" : "ies"}.` : "Edit mode uses no MCP tools.", "success");
+}
+
+function updateToolsCount(list) {
+  const label = $("turn-tools") && $("turn-tools").querySelector(".label");
+  if (label) label.textContent = list.length ? `Tools · ${list.length}` : "Tools";
 }
 
 function setComposerBusy(busy) {
@@ -1076,8 +1153,9 @@ document.addEventListener("keydown", e => {
   const typing = tag === "input" || tag === "textarea" || tag === "select" || e.target.isContentEditable;
   // Chrome clears an <input type=search> on Escape; blur instead so the query survives.
   if (e.key === "Escape") {
-    const filters = $("filters-panel");
-    if (!filters.hidden && (!typing || filters.contains(e.target))) setFiltersOpen(false, true);   // the panel first
+    const filters = $("filters-panel"), tools = $("tools-panel");
+    if (tools && !tools.hidden && (!typing || tools.contains(e.target))) toggleToolsPanel(false);   // an open panel first
+    else if (!filters.hidden && (!typing || filters.contains(e.target))) setFiltersOpen(false, true);
     else if (typing) { e.preventDefault(); e.target.blur(); }
     else if (NARROW.matches && $("detail").classList.contains("details-open")) toggleDetailsPanel(false);   // the drawer first
     else closeDetail();

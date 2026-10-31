@@ -13,12 +13,14 @@ import json
 import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 
 from convo_index.config import PROJECTS_DIR, CLASSIFY_PROMPT_PREFIX, SUMMARY_PROMPT_PREFIX
 from convo_index.model import (Conversation, Message, ToolCall, UsageRecord, KIND_TEXT, KIND_THINKING,
                                KIND_TOOL_CALL, KIND_TOOL_RESULT, FIDELITY_FULL, FIDELITY_PARTIAL, split_id)
 from convo_index.sources import base as sources
+from convo_index import turn_tools
 from convo_index.sources.base import SourceRef, TurnCommand, UnreadableSource, read_snapshot, shell_quote
 
 TOOL_TEXT_LIMIT = 4000
@@ -377,9 +379,17 @@ def resume_command(conversation_id, cwd):
 #
 # `claude -p --resume <id>` runs one more turn of a session and appends it to the same
 # transcript, so an interactive `claude --resume` afterwards sees it. Verified on 2.1.311: with
-# the flags below the init event lists no MCP servers, a PreToolUse hook in the project's
-# settings does not fire, Bash is absent in both positions, and a write outside the working
-# directory is refused by --restricted.
+# the read-only flags below the init event lists no MCP servers, a PreToolUse hook in the
+# project's settings does not fire, Bash is absent, and a write outside the working directory
+# is refused by --restricted.
+#
+# Edit mode adds the edit tools, Bash and the MCP tools on the user's allowlist (turn_tools).
+# --safe-mode drops MCP servers even when they are passed with --mcp-config, so Edit mode runs
+# without it and closes the rest another way: --setting-sources "" loads no user, project or
+# local settings (no hooks, plugins or permission rules; only Claude Code's built-in plugins
+# load), and the turn's own mcp.json holds just the allowlisted servers. Verified on 2.1.311:
+# Bash runs once --tools names it and --allowedTools allows it, an allowlisted MCP tool runs,
+# `mcp__<server>` allows all of a server's tools, and an MCP tool not on the list is denied.
 
 TURN_FLAGS = ["-p", "--output-format", "stream-json", "--verbose",   # stream-json needs --verbose in print mode
               "--safe-mode",              # no plugins, hooks, MCP servers, skills, commands; auth and built-in tools work
@@ -387,8 +397,14 @@ TURN_FLAGS = ["-p", "--output-format", "stream-json", "--verbose",   # stream-js
               "--strict-mcp-config",      # with no --mcp-config: no MCP servers at all
               "--disable-slash-commands", # the prompt is a message, never a skill or command
               "--permission-prompts", "none"]   # anything that would ask is denied
+EDIT_FLAGS = ["-p", "--output-format", "stream-json", "--verbose",
+              "--setting-sources", "",    # no user/project/local settings: no hooks, plugins or permission rules
+              "--restricted",             # file tools confined to cwd; Bash only because --tools names it
+              "--strict-mcp-config",      # MCP servers only from the turn's own --mcp-config
+              "--disable-slash-commands",
+              "--permission-prompts", "none"]
 READ_TOOLS = "Read,Glob,Grep"
-EDIT_TOOLS = "Read,Glob,Grep,Edit,Write,MultiEdit"
+EDIT_TOOLS = "Read,Glob,Grep,Edit,Write,MultiEdit,Bash"
 TURNS_ON_WINDOWS = True       # the prompt goes through stdin; see launcher()
 TURN_TEXT_LIMIT = 400         # chars of a tool input/result shown in a turn event (the transcript parser keeps TOOL_TEXT_LIMIT)
 
@@ -418,14 +434,43 @@ def launcher():
     return [binary]
 
 
-def turn_command(native_id, prompt, cwd, *, edits=False):
+def claude_config_path():
+    """Claude Code's user configuration file, where `claude mcp add --scope user` puts servers."""
+    base_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(base_dir) / ".claude.json" if base_dir else Path.home() / ".claude.json"
+
+
+def mcp_servers():
+    """{name: spec} of the user-scope MCP servers; {} when there are none or the file is unreadable.
+    claude.ai account connectors are not in any file and cannot be loaded into a turn."""
+    try:
+        servers = json.loads(claude_config_path().read_text(encoding="utf-8")).get("mcpServers")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return {k: v for k, v in servers.items() if isinstance(v, dict)} if isinstance(servers, dict) else {}
+
+
+def turn_command(native_id, prompt, cwd, *, edits=False, mcp_tools=()):
     prefix = launcher()
     if prefix is None:
         return None
-    argv = prefix + ["--resume", native_id] + TURN_FLAGS + ["--tools", EDIT_TOOLS if edits else READ_TOOLS]
-    if edits:
-        argv += ["--permission-mode", "acceptEdits"]
-    return TurnCommand(argv=argv, cwd=cwd, stdin=prompt)
+    if not edits:
+        return TurnCommand(argv=prefix + ["--resume", native_id] + TURN_FLAGS + ["--tools", READ_TOOLS], cwd=cwd, stdin=prompt)
+    servers = mcp_servers()
+    chosen = [p for p in (turn_tools.split(e, servers) for e in mcp_tools) if p]   # a server removed since is skipped
+    allowed = ["Bash"] + [f"mcp__{server}" if tool == "*" else f"mcp__{server}__{tool}" for server, tool in chosen]
+    argv = prefix + ["--resume", native_id] + EDIT_FLAGS + ["--tools", EDIT_TOOLS, "--permission-mode", "acceptEdits"]
+    scratch = ()
+    if chosen:
+        # the specs can carry headers with tokens: an owner-only directory the runner removes
+        scratch = (tempfile.mkdtemp(prefix="convo-index-claude-"),)
+        config = os.path.join(scratch[0], "mcp.json")
+        fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"mcpServers": {server: servers[server] for server, _ in chosen}}, fh)
+        argv += ["--mcp-config", config]
+    argv += ["--allowedTools", ",".join(allowed)]
+    return TurnCommand(argv=argv, cwd=cwd, stdin=prompt, scratch=scratch)
 
 
 def _turn_clip(value, limit=TURN_TEXT_LIMIT):

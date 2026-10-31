@@ -133,25 +133,38 @@ sees exactly what happened in the browser, and the index is refreshed before the
 reported finished (ingest only: its summary and tags come with the next full refresh). Claude Code and Opencode are supported today; the other sources will follow.
 
 In the UI, such a conversation has a message box under its transcript. Type, press Send (or
-Cmd/Ctrl+Enter), and the tool's replies, tool calls and results stream in as it works; "Allow
-edits" switches to the edits position described below, and Stop ends the turn. When the turn
+Cmd/Ctrl+Enter), and the tool's replies, tool calls and results stream in as it works; the Mode
+picker chooses Read-only or Edit (below), and Stop ends the turn. When the turn
 finishes the transcript reloads with it; tools that were denied stay named in the status line.
 The same endpoints serve any other client:
 
     POST   /api/conversation/<id>/turn   {"prompt": "...", "edits": false}   -> {"turn_id": ...}
     GET    /api/turn/<turn_id>?after=<n>  server-sent events: text, tool, tool_result, denied, done | error
     DELETE /api/turn/<turn_id>            stop it
+    GET    /api/turns/tools               the MCP servers Edit mode can use and the allowlist
+    POST   /api/turns/tools               {"mcp_tools": ["mcp__<server>__<tool>" | "mcp__<server>__*", ...]}
 
-Every turn runs with the tool's customisation surface closed: no MCP servers, hooks, plugins,
-project settings or slash commands (Claude Code's `--safe-mode --restricted --strict-mcp-config`;
-for Opencode a fresh, empty configuration home per turn, the project configuration switched off, its
-configuration-path variables unset and a deny-all permission ruleset; administrator-managed
-settings of either tool stay in force), and no shell in either position. The default position
-is read-only (`Read`/`Glob`/`Grep` for Claude Code; the `plan` agent plus a deny-all
-permission ruleset for Opencode). `"edits": true` adds the file-editing tools, confined to the
-conversation's directory (Claude Code by `--restricted`, Opencode by its `external_directory`
-permission staying denied); Bash is never available. Anything the tool would normally ask
-about is denied and reported as a `denied` event, so the step can be finished in a terminal.
+Every turn runs with the tool's customisation surface closed: no hooks, plugins, project or
+user settings, or slash commands (Claude Code's `--restricted --disable-slash-commands`, with
+`--safe-mode` in Read-only and `--setting-sources ""` in Edit; for Opencode a fresh, empty
+configuration home per turn, the project configuration switched off, its configuration-path
+variables unset and a deny-all permission ruleset; administrator-managed settings of either
+tool stay in force). Anything the tool would normally ask about is denied and reported as a
+`denied` event, so the step can be finished in a terminal.
+
+- **Read-only** (the default): `Read`/`Glob`/`Grep` for Claude Code, the `plan` agent for
+  Opencode. No shell and no MCP servers.
+- **Edit** (`"edits": true`): adds the file-editing tools, confined to the conversation's
+  directory (Claude Code by `--restricted`, Opencode by its `external_directory` permission
+  staying denied), **the shell**, and for Claude Code **the MCP tools on your allowlist**.
+  None of these ask before running: a shell command from the browser can do whatever your
+  user account can, and an allowlisted MCP tool can act on the service behind it (send,
+  post, create). The allowlist is edited with the Tools button in the message box and kept
+  in `turn-tools.json` next to the database (readable by you only; a file others can write
+  is ignored); `convo-index doctor` prints it. Only servers from your user-scope Claude Code
+  config (`claude mcp add --scope user`) can be listed: the turn loads just those servers,
+  from a per-turn config file that is removed afterwards. claude.ai account connectors and
+  a project's `.mcp.json` are never loaded. Opencode turns get the shell but no MCP tools.
 
 Turns are accepted only on a loopback listener, from a loopback peer, when the browser
 addresses the server by a loopback name, with no proxy header present, and with the server's
