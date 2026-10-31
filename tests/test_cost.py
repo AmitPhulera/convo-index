@@ -122,6 +122,44 @@ def test_alias_with_a_non_string_target_is_reported_not_fatal(tmp_path):
     assert len(p.errors) == 1 and "alias" in p.errors[0] and p.rates("claude-haiku-4-5")["input"] == 1.0
 
 
+def _tiered(path):
+    """One conversation whose requests straddle the 200k (Gemini Pro) and 272k (gpt-6.1) tiers."""
+    conn = dbm.connect(path); dbm.init_schema(conn)
+    conv = Conversation(source="codex", native_id="t1", title="T", first_prompt="fp", source_ref="/a", cwd="/x",
+                        start_ts="2026-10-16T00:00:00Z", messages=[Message(seq=0, role="user", text="hi")],
+                        usage=[UsageRecord("a", None, "openai", "gpt-6.1-sol", input_uncached=50_000, cache_read=50_000, output=10_000),
+                               UsageRecord("b", None, "openai", "gpt-6.1-sol", input_uncached=100_000, cache_read=200_000, output=10_000),
+                               UsageRecord("c", None, "google", "gemini-3.1-pro-preview", input_uncached=250_000, output=1_000),
+                               UsageRecord("d", None, "openai", "gpt-6.1-sol", input_uncached=250_000)])
+    dbm.upsert_conversation(conn, conv, "unknown", None, [], None, "1", lambda t: [None] * len(t))
+    return conn
+
+
+# a: 100k prompt, base        50k*2 + 50k*0.10 + 10k*10            = $0.205
+# b: 300k prompt, over 272k   100k*4 + 200k*0.20 + 10k*15          = $0.59
+# c: 250k prompt, over 200k   250k*4 + 1k*18 (Gemini Pro long)     = $1.018
+# d: 250k prompt, gpt-6.1 still base (its threshold is 272k)        = $0.50
+TIERED_TOTAL = 0.205 + 0.59 + 1.018 + 0.50
+
+
+def test_prompt_size_tiers_price_each_request_by_its_own_prompt(tmp_path):
+    p = K.load(make_settings(tmp_path))
+    assert p.thresholds == [200_000, 272_000]
+    assert p.rates("gpt-6.1-sol", prompt=272_000)["input"] == 2.0          # "over 272k": the threshold itself is base
+    long = p.rates("gpt-6.1-sol", prompt=272_001)
+    assert long == {"input": 4.0, "output": 15.0, "cache_read": 0.20, "cache_write": 5.0, "cache_write_1h": 5.0}
+    assert p.rates("gemini-3.1-pro-preview", prompt=200_001)["cache_write"] == 4.0   # long cache_write -> long input
+    assert p.rates("claude-opus-5-5", prompt=900_000)["input"] == 4.0      # no tier: one rate for every prompt
+    # a band is "how many thresholds the prompt exceeds"; its floor picks the tier exactly per model
+    assert [p.band_floor(b) for b in (0, 1, 2)] == [0, 200_001, 272_001]
+    assert p.rates("gemini-3.1-pro-preview", prompt=p.band_floor(1))["input"] == 4.0
+    assert p.rates("gpt-6.1-sol", prompt=p.band_floor(1))["input"] == 2.0
+    conn = _tiered(tmp_path / "t.db")
+    u = K.usage_for_conversation(conn, "codex:t1", p)
+    assert abs(u["estimated_cost"] - round(TIERED_TOTAL, 4)) < 1e-9 and u["requests"] == 4 and u["coverage"] == 1.0
+    assert u["input_uncached"] == 650_000                                  # bands split the groups, not the totals
+
+
 def test_a_broken_long_context_is_reported_and_the_base_rates_stay(tmp_path):
     s = make_settings(tmp_path)
     up = tmp_path / "pricing.toml"
