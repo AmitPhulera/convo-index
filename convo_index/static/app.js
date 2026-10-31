@@ -27,6 +27,7 @@ const ICON = {
   panel: '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>',
   tools: '<svg class="icon" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/></svg>',
   send: '<svg class="icon" viewBox="0 0 24 24"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4z"/></svg>',
+  handoff: '<svg class="icon" viewBox="0 0 24 24"><path d="M4 12h12M12 6l6 6-6 6M20 5v14"/></svg>',
 };
 function sourceLabel(s) { return SOURCE_LABELS[s] || s || "unknown"; }
 function sourceBadge(s) { return `<span class="badge src ${escape(s || "")}">${escape(sourceLabel(s))}</span>`; }
@@ -493,6 +494,7 @@ async function openDetail(id, cardEl) {
   const keepPanel = id === selectedId && $("detail").classList.contains("details-open");
   if (id !== selectedId) tagEditOpen = false;    // the tag editor stays open only for re-renders
   detachTurn();
+  detachHandoff();
   const gen = ++detailView;
   selectedId = id;
   if (location.hash.slice(1) !== id) location.hash = id;
@@ -565,6 +567,7 @@ async function openDetail(id, cardEl) {
     (c.models || []).length ? `<div title="Models used">${escape(c.models.join(", "))}</div>` : "",
     c.parent_id ? `<div>${escape(c.relation || "child")} of ${convLink(c.parent_id, c.parent_id)}</div>` : "",
     (c.children || []).length ? `<div>Sub-sessions: ${c.children.map(k => convLink(k, k.split(":")[1] || k)).join(" · ")}</div>` : "",
+    (c.links || []).map(l => `<div>${escape(LINK_LABELS[l.relation][l.direction])} ${convLink(l.id, l.title || `${sourceLabel(l.id.split(":")[0])} (not indexed yet)`)}</div>`).join(""),
     usageLine(c.usage),
   ].join("");
   detail.className = open ? "details-open" : "";
@@ -579,12 +582,15 @@ async function openDetail(id, cardEl) {
           ${viewBtn("replies", "Replies", "Only your messages and each final reply; the steps in between fold into a counter")}
           ${viewBtn("all", "All", "Every message, with tool activity and thinking collapsed")}
         </div>` : ""}
+        ${(c.handoff_targets || []).length ? `<button class="btn" id="handoff-toggle" type="button" aria-expanded="false" aria-controls="handoff-panel"
+          title="${turnToken ? "Continue this conversation in another tool, or ask one for a second opinion" : "To hand off from here, open the UI through the URL `convo-index serve` or `up` prints"}"${turnToken ? "" : " disabled"}>${ICON.handoff}<span class="label">Hand off</span></button>` : ""}
         <button class="btn" id="details-toggle" type="button" aria-expanded="${open}" aria-controls="details-panel" title="Summary, tags, references and how to resume">${ICON.panel}<span class="label">Details</span></button>
       </div>
     </div>
     <div class="detail-grid">
       <div class="conversation">
         ${msgs}
+        ${(c.handoff_targets || []).length && turnToken ? handoffHTML(c) : ""}
         ${c.turns_supported ? composerHTML(c) : ""}
       </div>
       <aside class="details-panel" id="details-panel" aria-label="Conversation details">
@@ -649,6 +655,7 @@ async function openDetail(id, cardEl) {
   detail.querySelectorAll(".tag-clear").forEach(b => b.addEventListener("click", () =>
     sendTag(c.id, b.dataset.group, null, "clear")));               // tag null = clear the whole group, one request
   if (c.turns_supported) wireComposer(c);
+  if ($("handoff-panel")) wireHandoff(c);
   $("detail-pane").scrollTop = 0;
   // a turn still running (sent before a reload, from another tab, or before navigating away)
   // is followed again from its first event
@@ -1035,13 +1042,21 @@ async function followTurn(convId, turnId, edits) {
   }
 }
 
-// Server-sent events, framed by a blank line; LF, CRLF and CR line ends are all accepted.
 async function readTurnEvents(reader, s) {
+  return readEvents(reader, (ev, id) => {
+    if (id !== null) s.seen = id;              // the id is the count of events seen
+    turnEvent(s, ev);
+  }, () => turnStream === s && !s.finished);
+}
+
+// Server-sent events, framed by a blank line; LF, CRLF and CR line ends are all accepted.
+// `onEvent(event, id)` gets each one while `alive()` holds.
+async function readEvents(reader, onEvent, alive) {
   const decoder = new TextDecoder();
   let buf = "", cr = false;
   for (;;) {
     const { value, done } = await reader.read();
-    if (done || turnStream !== s) return;
+    if (done || !alive()) return;
     let chunk = decoder.decode(value, { stream: true });
     if (cr && chunk.startsWith("\n")) chunk = chunk.slice(1);    // the CRLF was split across chunks
     cr = chunk.endsWith("\r");
@@ -1056,9 +1071,8 @@ async function readTurnEvents(reader, s) {
         else if (line.startsWith("data: ")) data += line.slice(6);
       }
       if (!data) continue;                     // a keepalive comment
-      if (id !== null) s.seen = id;            // the id is the count of events seen
-      turnEvent(s, JSON.parse(data));
-      if (s.finished) return;
+      onEvent(JSON.parse(data), id);
+      if (!alive()) return;
     }
   }
 }
@@ -1140,6 +1154,251 @@ async function finishTurn(s, ev) {
 }
 
 // Keyboard: ↑/↓ or j/k move through results, Enter opens, Esc closes, / focuses search.
+// ---- Handoff -------------------------------------------------------------------------------
+// Prepare builds the prompt on the server (with a handoff note for Continue, which can take a
+// minute); the user edits it and starts a new session in the chosen tool. Its replies stream
+// here; the new conversation is linked to this one and opens from the details panel.
+const LINK_LABELS = {
+  continued_from: { to: "Continued in", from: "Continued from" },
+  review_of: { to: "Reviewed by", from: "Second opinion on" },
+};
+let handoffStream = null;     // {turnId, controller, seen, text, bubble, newId, finished, target, kind}
+let handoffPrep = null;       // the prepared prompt's response, while it is on screen
+
+function detachHandoff() {
+  if (handoffStream) { handoffStream.controller.abort(); handoffStream = null; }
+  handoffPrep = null;
+}
+
+function handoffHTML(c) {
+  const opts = c.handoff_targets.map(t => `<option value="${escape(t)}"${t !== c.source ? " selected" : ""}>${escape(sourceLabel(t))}</option>`).join("");
+  return `<div class="handoff-panel" id="handoff-panel" hidden>
+    <div class="handoff-head"><strong>Hand off</strong>
+      <span class="hint">A new session in another tool starts from a prompt built from this conversation. You can edit the prompt first.</span></div>
+    <div class="handoff-row">
+      <div class="segmented small" id="handoff-kind" role="group" aria-label="What to ask for">
+        <button type="button" data-kind="continue" aria-pressed="true" title="Pick the work up where it stands, for example when this tool hit its limits">Continue elsewhere</button>
+        <button type="button" data-kind="review" aria-pressed="false" title="Ask another tool to check this conversation's work. It never edits files.">Second opinion</button>
+      </div>
+      <label class="mode-pick">Tool <select id="handoff-target">${opts}</select></label>
+      <label class="mode-pick" id="handoff-mode" title="Read-only reads files. Edit also edits files and runs shell commands, without asking.">Mode
+        <select id="handoff-edits"><option value="read">Read-only</option><option value="edits">Edit</option></select></label>
+      <button class="btn" id="handoff-prepare" type="button">Prepare prompt</button>
+    </div>
+    <div id="handoff-preview" hidden>
+      <div class="handoff-notes" id="handoff-notes"></div>
+      <textarea id="handoff-prompt" rows="14" spellcheck="false" aria-label="Prompt for the new session"></textarea>
+      <label class="handoff-confirm" id="handoff-confirm" hidden><input type="checkbox" id="handoff-ignore-secrets"> Send it anyway</label>
+    </div>
+    <div id="handoff-live"></div>
+    <div class="tools-actions">
+      <span class="turn-status" id="handoff-status" role="status"></span>
+      <button class="btn ghost" id="handoff-close" type="button">Close</button>
+      <button class="btn danger" id="handoff-stop" type="button" hidden>${ICON.stop}<span class="label">Stop</span></button>
+      <button class="btn primary" id="handoff-start" type="button" hidden>${ICON.send}<span class="label">Start</span></button>
+    </div>
+  </div>`;
+}
+
+function handoffKind() {
+  const b = document.querySelector("#handoff-kind button[aria-pressed=true]");
+  return b ? b.dataset.kind : "continue";
+}
+
+function handoffStatus(text, kind) {
+  const el = $("handoff-status");
+  if (!el) return;
+  el.className = "turn-status" + (kind ? " " + kind : "");
+  el.textContent = text;
+}
+
+function wireHandoff(c) {
+  const panel = $("handoff-panel"), toggle = $("handoff-toggle");
+  const show = open => {
+    panel.hidden = !open;
+    toggle.setAttribute("aria-expanded", String(open));
+    if (open) { panel.scrollIntoView({ block: "nearest" }); $("handoff-prepare").focus(); } else toggle.focus();
+  };
+  toggle.addEventListener("click", () => show(panel.hidden));
+  $("handoff-close").addEventListener("click", () => show(false));
+  panel.addEventListener("keydown", e => { if (e.key === "Escape" && !handoffStream) { e.stopPropagation(); show(false); } });
+  const reset = () => {                        // a different kind needs a different prompt
+    handoffPrep = null;
+    $("handoff-preview").hidden = true;
+    $("handoff-start").hidden = true;
+    handoffStatus("");
+  };
+  document.querySelectorAll("#handoff-kind button").forEach(b => b.addEventListener("click", () => {
+    if (b.getAttribute("aria-pressed") === "true" || handoffStream) return;
+    document.querySelectorAll("#handoff-kind button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+    $("handoff-mode").hidden = b.dataset.kind === "review";      // a review never edits
+    reset();
+  }));
+  $("handoff-prepare").addEventListener("click", () => prepareHandoff(c));
+  $("handoff-start").addEventListener("click", () => startHandoff(c));
+  $("handoff-stop").addEventListener("click", stopHandoff);
+}
+
+async function prepareHandoff(c) {
+  const kind = handoffKind(), view = detailView;
+  $("handoff-prepare").disabled = true;
+  $("handoff-start").hidden = true;
+  handoffStatus(kind === "continue" ? "Writing the handoff note with the summary backend… this can take a minute." : "Building the prompt…", "busy");
+  let res = null, body = {};
+  try {
+    res = await fetch(`/api/conversation/${encodeURIComponent(c.id)}/handoff`, {
+      method: "POST", headers: turnHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ kind }) });
+    body = await res.json().catch(() => ({}));
+  } catch (e) { /* reported below */ }
+  if (view !== detailView || !$("handoff-panel")) return;
+  $("handoff-prepare").disabled = false;
+  if (!res || !res.ok) { handoffStatus(body.error || (res ? `The server returned ${res.status}.` : "The server did not answer."), "error"); return; }
+  if (kind !== handoffKind()) return;          // switched while it was being built
+  handoffPrep = body;
+  const notes = [`About ${body.tokens.toLocaleString()} tokens${body.over_budget ? " (over the budget: trim it)" : ""}` +
+                 (body.dropped ? `; ${body.dropped} older assistant message${body.dropped === 1 ? "" : "s"} left out` : "") + "."];
+  if (kind === "continue" && body.digest_status && body.digest_status !== "ok") notes.push(`No handoff note: ${body.digest_status}.`);
+  if (body.transcript_masked) notes.push(`${body.transcript_masked} credential-looking string${body.transcript_masked === 1 ? " was" : "s were"} masked in the transcript the new session can read.`);
+  const list = (title, items) => items.length ? `<details><summary>${escape(title)}</summary><ul>${items.map(x => `<li>${escape(x)}</li>`).join("")}</ul></details>` : "";
+  $("handoff-notes").innerHTML = `<p>${notes.map(escape).join(" ")}</p>`
+    + (body.secrets.length ? `<p class="handoff-warn">The prompt holds what looks like a credential: ${body.secrets.map(s => escape(`${s.kind} ${s.sample}`)).join(", ")}. Remove it before starting.</p>` : "")
+    + list(`${body.problems.length} known problem${body.problems.length === 1 ? "" : "s"} in the transcript`, body.problems.map(p => `${p.kind}: ${p.text}`))
+    + (body.send_refusal ? `<p class="handoff-warn">${escape(body.send_refusal.replace(" Without --start the prompt is printed for you to paste.", ""))} You can still copy the prompt.</p>` : "");
+  $("handoff-prompt").value = body.prompt;
+  $("handoff-prompt").scrollTop = 0;
+  $("handoff-confirm").hidden = !body.secrets.length;
+  $("handoff-ignore-secrets").checked = false;
+  $("handoff-preview").hidden = false;
+  $("handoff-start").hidden = !!body.send_refusal;
+  handoffStatus("");
+  $("handoff-prompt").focus({ preventScroll: true });
+  $("handoff-prompt").setSelectionRange(0, 0);                 // read from the top
+}
+
+async function startHandoff(c) {
+  if (!handoffPrep || handoffStream) return;
+  const prompt = $("handoff-prompt").value, target = $("handoff-target").value, kind = handoffPrep.kind;
+  const edits = kind === "continue" && $("handoff-edits").value === "edits", view = detailView;
+  $("handoff-start").disabled = true;
+  handoffStatus("Starting…", "busy");
+  let res = null, body = {};
+  try {
+    res = await fetch("/api/handoff/start", {
+      method: "POST", headers: turnHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ preview_id: handoffPrep.preview_id, target, prompt, edits,
+                             ignore_secrets: $("handoff-ignore-secrets").checked }) });
+    body = await res.json().catch(() => ({}));
+  } catch (e) { /* reported below */ }
+  if (view !== detailView || !$("handoff-panel")) return;
+  $("handoff-start").disabled = false;
+  if (!res || !res.ok || !body.turn_id) {
+    if (res && res.status === 409) $("handoff-confirm").hidden = false;
+    handoffStatus(body.error || (res ? `The server returned ${res.status}.` : "The server did not answer; the session may have started. Check the details panel shortly."), "error");
+    return;
+  }
+  followHandoff(c, body.turn_id, target, kind);
+}
+
+async function followHandoff(c, turnId, target, kind) {
+  const h = { turnId, controller: new AbortController(), seen: 0, text: "", bubble: null, newId: null, finished: false, target, kind };
+  handoffStream = h;
+  $("handoff-preview").hidden = true;
+  $("handoff-start").hidden = true;
+  $("handoff-prepare").disabled = true;
+  $("handoff-stop").hidden = false;
+  handoffStatus(`Running in ${sourceLabel(target)}…`, "busy");
+  const alive = () => handoffStream === h && !h.finished;
+  let failures = 0;
+  while (alive()) {
+    const before = h.seen;
+    try {
+      const res = await fetch(`/api/turn/${encodeURIComponent(turnId)}?after=${h.seen}`, { headers: turnHeaders(), signal: h.controller.signal });
+      if (!alive()) return;
+      if (!res.ok) return finishHandoff(c, h, { kind: "error", message: `The server returned ${res.status}.` });
+      await readEvents(res.body.getReader(), (ev, id) => { if (id !== null) h.seen = id; handoffEvent(c, h, ev); }, alive);
+    } catch (e) {
+      if (h.controller.signal.aborted) return;
+    }
+    if (!alive()) return;
+    failures = h.seen > before ? 0 : failures + 1;
+    if (failures > 5) { handoffStatus("Lost the connection. The session keeps running on the server; it shows up in the details panel when it is indexed.", "error"); return; }
+    if (failures) await new Promise(r => setTimeout(r, 250 * 2 ** failures));
+  }
+}
+
+function handoffAppend(el) {
+  const live = $("handoff-live");
+  if (live) live.appendChild(el);
+}
+
+function handoffEvent(c, h, ev) {
+  switch (ev.kind) {
+    case "session": h.newId = ev.id; return;
+    case "text":
+      if (!h.bubble) { h.bubble = liveMsg("assistant", sourceLabel(h.target), ""); h.bubbleText = ""; handoffAppend(h.bubble); }
+      h.text += (h.text ? "\n\n" : "") + ev.text;                  // all of it, for Bring back
+      h.bubbleText += (h.bubbleText ? "\n\n" : "") + ev.text;      // this bubble's part
+      h.bubble.querySelector(".msg-body").innerHTML = renderMessageBody(h.bubbleText);
+      return;
+    case "tool": h.bubble = null; return handoffAppend(liveMsg("assistant tool_call", sourceLabel(h.target), escape(`→ ${ev.name || "tool"}`)));
+    case "denied": h.bubble = null; return handoffAppend(liveMsg("harness", "Harness", escape(`${ev.name || "tool"}: not allowed in this mode`), "denied"));
+    case "done":
+    case "error":
+      return finishHandoff(c, h, ev);
+  }
+}
+
+function finishHandoff(c, h, ev) {
+  h.finished = true;
+  $("handoff-stop").hidden = true;
+  $("handoff-prepare").disabled = false;
+  const failed = ev.kind === "error";
+  const cost = ev.cost_usd != null ? ` · ≈ ${fmtUsd(ev.cost_usd)} API-equivalent` : "";
+  handoffStatus(failed ? `${ev.message === "stopped" ? "Stopped." : ev.message || "The session failed."}${cost}` : `Done${cost}.`, failed ? "error" : "");
+  const actions = document.createElement("div");
+  actions.className = "handoff-done";
+  if (h.newId) {
+    const open = document.createElement("a");
+    open.href = "#" + encodeURIComponent(h.newId);
+    open.className = "btn";
+    open.textContent = ev.indexed ? "Open the new conversation" : "Open the new conversation (once indexed)";
+    actions.appendChild(open);
+  }
+  if (h.kind === "review" && h.text) {
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn primary";
+    back.textContent = $("turn-prompt") ? "Bring back" : "Copy the review";
+    back.title = $("turn-prompt") ? "Put the review in this conversation's message box, to send it to the first agent" : "Copy the review to send it yourself";
+    back.addEventListener("click", () => bringBack(h));
+    actions.appendChild(back);
+  }
+  if (actions.children.length) handoffAppend(actions);
+  if (handoffStream === h) handoffStream = null;
+}
+
+function bringBack(h) {
+  const text = `A second opinion from ${sourceLabel(h.target)}:\n\n${h.text}`;
+  const box = $("turn-prompt");
+  if (box) {
+    box.value = text;
+    box.focus();
+    box.scrollIntoView({ block: "nearest" });
+    toast("The review is in the message box. Edit it and send.", "success");
+    return;
+  }
+  navigator.clipboard.writeText(text).then(() => toast("Review copied.", "success"), () => showError("Could not copy the review."));
+}
+
+async function stopHandoff() {
+  const h = handoffStream;
+  if (!h || h.finished) return;
+  $("handoff-stop").disabled = true;
+  try { await fetch(`/api/turn/${encodeURIComponent(h.turnId)}`, { method: "DELETE", headers: turnHeaders() }); }
+  catch (e) { /* the stream's terminal event says how it ended */ }
+  if ($("handoff-stop")) $("handoff-stop").disabled = false;
+}
+
 function moveSelection(delta) {
   if (!currentIds.length) return;
   const idx = currentIds.indexOf(selectedId);

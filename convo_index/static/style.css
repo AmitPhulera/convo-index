@@ -565,3 +565,19 @@ a.bar-label:hover { text-decoration: underline; }
 /* Shown in place of the page once the server has been stopped from the UI. */
 .server-stopped { max-width: 560px; margin: 18vh auto 0; padding: 0 16px; text-align: center; color: var(--text-2); }
 .server-stopped h1 { color: var(--text); font-size: 1.4rem; margin-bottom: .5rem; }
+
+/* Hand off: the panel under the transcript, above the message box */
+.handoff-panel { margin: 16px 0 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); display: grid; gap: 10px; }
+.handoff-panel[hidden], #handoff-preview[hidden], .handoff-confirm[hidden], #handoff-mode[hidden], .handoff-panel .btn[hidden] { display: none; }
+.handoff-head { display: grid; gap: 2px; font-size: 13px; }
+.handoff-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+#handoff-preview { display: grid; gap: 8px; }
+.handoff-notes { font-size: 12.5px; color: var(--text-2); display: grid; gap: 4px; }
+.handoff-notes p, .handoff-notes ul { margin: 0; }
+.handoff-notes ul { padding-left: 18px; max-height: 160px; overflow-y: auto; }
+.handoff-warn { color: var(--warn); }
+#handoff-prompt { width: 100%; min-height: 220px; resize: vertical; font: 12.5px/1.5 var(--mono); color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; box-sizing: border-box; }
+.handoff-confirm { font-size: 12.5px; color: var(--warn); display: inline-flex; gap: 6px; align-items: center; }
+#handoff-live:empty { display: none; }
+#handoff-live { display: grid; gap: 8px; }
+.handoff-done { display: flex; flex-wrap: wrap; gap: 8px; }
