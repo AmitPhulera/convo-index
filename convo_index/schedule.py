@@ -266,9 +266,11 @@ def _uid():
     return getattr(os, "getuid", lambda: 0)()
 
 
-def plan(settings=None, hour=None, minute=None, system=None, home=None, job="refresh"):
+def plan(settings=None, hour=None, minute=None, system=None, home=None, job="refresh", existing=False):
     """What install would write and run, without doing it. `job` is "refresh" (daily index)
-    or "serve" (the UI server from login)."""
+    or "serve" (the UI server from login). `existing` (status, uninstall) keeps systemd when
+    the job's unit file is already there, even if no user manager answers right now (an SSH
+    login without a user session): those units must still be found and removed."""
     settings = settings or S.load()
     spec = JOBS[job]
     if job == "refresh":
@@ -291,6 +293,10 @@ def plan(settings=None, hour=None, minute=None, system=None, home=None, job="ref
         if not config_path.exists():
             raise ValueError(f"config file {config_path} does not exist; the job would run on defaults")
     kind, reason = _kind_and_reason(system)
+    if existing and kind != "systemd" and (system or platform.system()) == "Linux" and shutil.which("systemctl"):
+        unit = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "systemd" / "user" / f"{spec['unit']}.service"
+        if unit.exists():
+            kind, reason = "systemd", ""
     out = {"kind": kind, "reason": reason, "job": job, "hour": hour, "minute": minute, "argv": argv, "log": str(log),
            "files": {}, "commands": []}
     if kind == "launchd":
@@ -354,7 +360,7 @@ def _run_all(cmds, stop_on_failure=False):
 
 
 def uninstall(settings=None, system=None, home=None, dry_run=False, job="refresh"):
-    p = plan(settings, system=system, home=home, job=job)
+    p = plan(settings, system=system, home=home, job=job, existing=True)
     cmds = []
     if p["kind"] == "launchd":
         path = next(iter(p["files"]))
@@ -379,7 +385,7 @@ def uninstall(settings=None, system=None, home=None, dry_run=False, job="refresh
 
 
 def status(settings=None, system=None, home=None, job="refresh"):
-    p = plan(settings, system=system, home=home, job=job)
+    p = plan(settings, system=system, home=home, job=job, existing=True)
     if p["kind"] == "schtasks":
         r = subprocess.run(["schtasks", "/Query", "/TN", JOBS[job]["task"]], capture_output=True, text=True)
         installed = r.returncode == 0

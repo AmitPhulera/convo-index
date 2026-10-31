@@ -489,3 +489,23 @@ def test_linux_without_a_user_session_falls_back_and_says_why(tmp_path, monkeypa
     assert SCH.systemd_user_available() is False                                         # a broken binary is no systemd
     line = SCH.manual_line(["/opt/convo-index", "serve"], "/d/serve.log", "/my cfg.toml", background=True)
     assert line == "CONVO_INDEX_CONFIG='/my cfg.toml' nohup /opt/convo-index serve >> /d/serve.log 2>&1 &"   # env before nohup
+
+
+def test_existing_systemd_units_are_found_without_a_user_session(tmp_path, monkeypatch):
+    """Units installed earlier stay visible to status and uninstall over an SSH login with no
+    user manager: uninstall removes them and reports the systemctl failure, not success."""
+    st = make_settings(tmp_path)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(SCH, "command", lambda sub="index": ["/opt/convo-index", sub])
+    home = tmp_path / "home"
+    _linux(monkeypatch, systemd=True)
+    for path, content in SCH.plan(st, system="Linux", home=home)["files"].items():
+        Path(path).parent.mkdir(parents=True, exist_ok=True); Path(path).write_text(content)
+    monkeypatch.setattr(SCH, "systemd_user_available", lambda: False)                    # the user bus is gone
+    assert SCH.plan(st, system="Linux", home=home)["kind"] == "cron"                      # a new install would not use it
+    stat = SCH.status(st, system="Linux", home=home)
+    assert stat["kind"] == "systemd" and stat["installed"] is True
+    monkeypatch.setattr(SCH.subprocess, "run", lambda cmd, **k: type("R", (), {"returncode": 1, "stderr": "no bus"})())
+    out = SCH.uninstall(st, system="Linux", home=home)
+    assert out["kind"] == "systemd" and not all(r["ok"] for r in out["results"])          # the failure is reported
+    assert sorted(Path(p).name for p in out["removed"]) == ["convo-index.service", "convo-index.timer"]
