@@ -48,6 +48,14 @@ def test_a_store_others_can_write_is_ignored(tmp_path):
     assert TT.load(st) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership")
+def test_a_store_another_account_owns_is_ignored(tmp_path, monkeypatch):
+    st = make_settings(tmp_path)
+    TT.save(["mcp__atlassian__*"], SERVERS, st)
+    monkeypatch.setattr(TT.os, "getuid", lambda: TT.store_path(st).stat().st_uid + 1)
+    assert TT.load(st) == []
+
+
 def test_a_malformed_store_is_empty(tmp_path):
     st = make_settings(tmp_path)
     path = TT.store_path(st)

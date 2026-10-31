@@ -4,7 +4,8 @@ The list is kept in `turn-tools.json` next to the database, private to this user
 `turn-token`, and edited from the UI. It is not in config.toml: settings.write renders that file
 afresh and would drop the user's comments. An entry is `mcp__<server>__<tool>`, or
 `mcp__<server>__*` for every tool of a server, and must name a server the harness has
-configured. A file others could write is ignored: it decides what runs without approval."""
+configured. A file another account owns or could write is ignored: it decides what runs
+without approval."""
 import json
 import os
 import re
@@ -22,8 +23,9 @@ def load(settings=None):
     """The allowlisted entries, or [] when there is no usable store."""
     path = store_path(settings)
     try:
-        if os.name != "nt" and path.stat().st_mode & 0o022:
-            return []                     # writable by others: not the user's own list
+        st = path.stat()
+        if os.name != "nt" and (st.st_mode & 0o022 or st.st_uid != os.getuid()):
+            return []                     # another account's file, or writable by others: not the user's own list
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
