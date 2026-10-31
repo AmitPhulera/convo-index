@@ -435,3 +435,59 @@ def test_session_model_prefers_the_flag_then_the_settings(tmp_path):
     st = make_settings(tmp_path, handoff={"models": {"opencode": "opencode-go/deepseek-v4.1-flash"}})
     assert H.session_model(st, "opencode") == "opencode-go/deepseek-v4.1-flash"
     assert H.session_model(st, "opencode", "x/y") == "x/y" and H.session_model(st, "claude_code") is None
+
+
+def _start_env(tmp_path, monkeypatch, msgs=None, lines=None):
+    from convo_index import cli
+    from convo_index import settings as S
+    from convo_index.sources import base as SB
+    from tests.conftest import make_settings
+    from tests.test_turns import command
+    st = make_settings(tmp_path, handoff={"models": {"opencode": "opencode-go/deepseek-v4.1-flash"}})
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    _db(tmp_path, msgs, cwd=str(tmp_path)).close()
+    sent = {}
+
+    def fake_new_session(target, prompt, cwd, **kw):
+        sent.update(kw, prompt=prompt, cwd=cwd)
+        return command([{"line": x} for x in (lines or [
+            json.dumps({"type": "step_start", "sessionID": "ses_new1", "part": {"type": "step-start"}}),
+            json.dumps({"type": "text", "sessionID": "ses_new1", "part": {"type": "text", "text": "Taking over."}})])]), None
+    monkeypatch.setattr(SB, "new_session_targets", lambda: ["claude_code", "opencode"])
+    monkeypatch.setattr(SB, "new_session_command", fake_new_session)
+    monkeypatch.setattr(cli, "_ingest_only", lambda: {"ok": True, "busy": False})
+    return cli, sent
+
+
+def test_cli_start_runs_the_session_links_it_and_says_how_to_resume(tmp_path, monkeypatch, capsys):
+    cli, sent = _start_env(tmp_path, monkeypatch)
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--edit", "--no-digest"]) == 0
+    out = capsys.readouterr()
+    assert out.out == "Taking over.\n"                                   # the reply, not the prompt
+    assert "new conversation opencode:ses_new1 continues claude_code:s1" in out.err and "resume it:" in out.err
+    assert sent["edits"] is True and sent["model"] == "opencode-go/deepseek-v4.1-flash" and sent["cwd"] == str(tmp_path)
+    assert sent["prompt"].startswith("You are taking over") and sent["read_dirs"][0].name.startswith("claude_code-s1-")
+    links = dbm.links_for(dbm.connect(tmp_path / "t.db"), "claude_code:s1")
+    assert links == [{"id": "opencode:ses_new1", "relation": "continued_from", "direction": "to"}]
+
+
+def test_cli_start_refuses_secrets_unless_told_and_sends_an_edited_prompt(tmp_path, monkeypatch, capsys):
+    msgs = [Message(seq=0, role="user", text="use key AKIAABCDEFGHIJKLMNOP to deploy")]
+    cli, sent = _start_env(tmp_path, monkeypatch, msgs)
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 1
+    assert "not starting: the prompt or the transcript file holds" in capsys.readouterr().err and not sent
+    edited = tmp_path / "edited.md"
+    edited.write_text("Review the deploy script. The key was removed.")
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review", "--prompt-file", str(edited)]) == 1   # transcript still has it
+    capsys.readouterr()
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review", "--prompt-file", str(edited), "--ignore-secrets"]) == 0
+    assert sent["prompt"] == "Review the deploy script. The key was removed." and sent["edits"] is False
+
+
+def test_cli_start_reports_a_failed_session_and_an_unknown_target(tmp_path, monkeypatch, capsys):
+    cli, _ = _start_env(tmp_path, monkeypatch, lines=["no session here"])
+    assert cli.main(["handoff", "s1", "--start", "codex"]) == 1
+    assert "cannot start a session in codex here" in capsys.readouterr().err
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 0
+    err = capsys.readouterr().err
+    assert "new conversation" not in err and dbm.links_for(dbm.connect(tmp_path / "t.db"), "claude_code:s1") == []
