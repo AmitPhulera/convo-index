@@ -15,9 +15,12 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
+from convo_index import db as dbm
 from convo_index import export as X
+from convo_index.sources import base as SB
 from convo_index.config import SUMMARY_PROMPT_PREFIX
 from convo_index.indexer import cwd_excluded
 from convo_index.model import KIND_TEXT, KIND_TOOL_CALL, KIND_TOOL_RESULT
@@ -497,3 +500,46 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
             "transcript_secrets": [s for s in in_file if s not in secrets],
             "chars": len(prompt), "tokens": len(prompt) // 4, "over_budget": len(prompt) > budget_chars,
             "dropped": dropped, "digest_status": digest_status if kind == "continue" else None}
+
+
+# --------------------------------------------------------------- the new session ----
+
+RELATIONS = {"continue": "continued_from", "review": "review_of"}
+
+
+def session_model(settings, target, model=None):
+    """The model a new session of `target` runs: the caller's, else `[handoff.models]`, else
+    None (the harness decides; opencode then uses its own recent models)."""
+    return model or (settings["handoff"]["models"].get(target) or None)
+
+
+def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=False, mcp_tools=(),
+                  read_dirs=(), model=None):
+    """Start a new `target` session seeded with `prompt` on `runner` (a TurnRunner) and return
+    (turn, state). state["id"] is the new conversation id once the harness has reported its
+    session; the link to `from_id` is written at that moment, so a harness that fails before
+    it starts leaves no link to nothing. A review never edits. Raises ValueError when the
+    target cannot start a session as asked, LookupError when it is not available here."""
+    edits = bool(edits) and kind == "continue"
+    cmd, _ = SB.new_session_command(target, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools),
+                                    read_dirs=tuple(read_dirs), model=model)
+    if cmd is None:
+        raise LookupError(f"{target} cannot start a session here: not installed, or no headless mode on this platform")
+    state = {"id": None}
+    probe = f"{target}:x"            # turn_events picks the adapter from the source part only
+
+    def translate(line):
+        if state["id"] is None:
+            sid = SB.session_id(target, line)
+            if sid:
+                state["id"] = f"{target}:{sid}"
+                conn = dbm.connect(db_path)
+                try:
+                    dbm.add_link(conn, state["id"], from_id, RELATIONS[kind])
+                finally:
+                    conn.close()
+        return SB.turn_events(probe, line)
+
+    # a placeholder conversation id: the runner allows one turn per conversation, and this one is new
+    turn = runner.start(f"{target}:handoff-{uuid.uuid4().hex}", cmd, translate, edits=edits)
+    return turn, state

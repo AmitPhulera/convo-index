@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 import subprocess
@@ -388,3 +389,49 @@ def test_the_digest_fits_a_backend_that_carries_less(fake_llm, llm_settings, mon
 def test_repo_state_reads_utf8_whatever_the_locale(tmp_path):
     repo = _git_repo(tmp_path / "repo", subject="Ánimo: fix the café menu")   # Á is C3 81; cp1252 has no 0x81
     assert "Ánimo: fix the café menu" in H.repo_state(str(repo))["log"]
+
+
+def test_start_session_links_once_the_harness_reports_its_session(tmp_path, monkeypatch):
+    from convo_index import turns
+    from convo_index.sources import base as SB
+    from tests.test_turns import command, drain
+    conn = _db(tmp_path)
+    conn.close()
+    seen = {}
+
+    def fake_new_session(target, prompt, cwd, **kw):
+        seen.update(kw, target=target, prompt=prompt)
+        return command([{"line": "not json"},
+                        {"line": json.dumps({"type": "step_start", "sessionID": "ses_new1", "part": {"type": "step-start"}})},
+                        {"line": json.dumps({"type": "text", "sessionID": "ses_new1", "part": {"type": "text", "text": "on it"}})}]), None
+    monkeypatch.setattr(SB, "new_session_command", fake_new_session)
+    runner = turns.TurnRunner()
+    turn, state = H.start_session(runner, tmp_path / "t.db", "claude_code:s1", "opencode", "the prompt", str(tmp_path),
+                                  kind="review", edits=True, read_dirs=["/d"], model="p/m")
+    events = drain(runner, turn)
+    assert state["id"] == "opencode:ses_new1" and any(e.get("text") == "on it" for e in events) and events[-1]["kind"] == "done"
+    assert seen["edits"] is False and seen["read_dirs"] == ("/d",) and seen["model"] == "p/m"   # a review never edits
+    conn = dbm.connect(tmp_path / "t.db")
+    assert dbm.links_for(conn, "claude_code:s1") == [{"id": "opencode:ses_new1", "relation": "review_of", "direction": "to"}]
+
+
+def test_start_session_without_a_session_leaves_no_link(tmp_path, monkeypatch):
+    from convo_index import turns
+    from convo_index.sources import base as SB
+    from tests.test_turns import command, drain
+    _db(tmp_path).close()
+    monkeypatch.setattr(SB, "new_session_command", lambda *a, **k: (command([{"line": "boom"}, {"exit": 3}]), None))
+    runner = turns.TurnRunner()
+    turn, state = H.start_session(runner, tmp_path / "t.db", "claude_code:s1", "opencode", "p", str(tmp_path), kind="continue")
+    assert drain(runner, turn)[-1]["kind"] == "error" and state["id"] is None
+    assert dbm.links_for(dbm.connect(tmp_path / "t.db"), "claude_code:s1") == []
+    monkeypatch.setattr(SB, "new_session_command", lambda *a, **k: (None, None))
+    with pytest.raises(LookupError):
+        H.start_session(runner, tmp_path / "t.db", "claude_code:s1", "codex", "p", str(tmp_path), kind="continue")
+
+
+def test_session_model_prefers_the_flag_then_the_settings(tmp_path):
+    from tests.conftest import make_settings
+    st = make_settings(tmp_path, handoff={"models": {"opencode": "opencode-go/deepseek-v4.1-flash"}})
+    assert H.session_model(st, "opencode") == "opencode-go/deepseek-v4.1-flash"
+    assert H.session_model(st, "opencode", "x/y") == "x/y" and H.session_model(st, "claude_code") is None
