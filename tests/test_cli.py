@@ -117,7 +117,8 @@ def test_doctor_reports_turn_harnesses(tmp_path, monkeypatch, capsys):
     assert rep["turns"]["harnesses"]["opencode"]["path"] is None
     assert rep["turns"]["harnesses"]["claude_code"]["launcher"] == ["/opt/bin/claude"]
     assert rep["turns"]["harnesses"]["opencode"]["launcher"] is None
-    assert set(rep["turns"]["harnesses"]) == {"claude_code", "opencode"}
+    assert set(rep["turns"]["harnesses"]) == {"claude_code", "opencode", "pi"}
+    assert rep["turns"]["harnesses"]["pi"]["launcher"] is None
     assert rep["turns"]["edit_mcp_tools"] == []
     text = doctor.format_report(rep)
     assert "browser turns: on; usable harness: claude_code (/opt/bin/claude)" in text

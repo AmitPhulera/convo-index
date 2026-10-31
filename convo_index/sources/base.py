@@ -10,6 +10,8 @@ from __future__ import annotations
 import importlib
 import os
 import re
+import shutil
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Iterable, Protocol
 
@@ -98,8 +100,10 @@ def resume_command(conversation_id: str, cwd: str | None) -> str | None:
 # module-level functions; the registry below names the modules so adding a harness is one
 # entry plus those functions:
 #
-#   turn_command(native_id, prompt, cwd, *, edits) -> TurnCommand | None
-#       The process to run. None when this platform cannot launch it safely.
+#   turn_command(native_id, prompt, cwd, *, edits, mcp_tools, locator) -> TurnCommand | None
+#       The process to run. None when this platform cannot launch it safely; ValueError when
+#       the session cannot be continued (its file gone or holding another session). `locator`
+#       is the indexed source_ref, for a harness that resumes by file rather than by id.
 #   turn_events(line) -> list[dict]
 #       Events for one stdout line: {"kind": "text", "text"}, {"kind": "tool", "name", "input"},
 #       {"kind": "tool_result", "text", "error"}, {"kind": "denied", "name", "input"},
@@ -123,9 +127,35 @@ def is_windows():
     without patching `os.name`, which would change what `Path` builds)."""
     return os.name == "nt"
 
+
+def _script_from_shim(shim):
+    """The JavaScript entry an npm `.cmd` shim runs: "%dp0%\\node_modules\\...\\cli.js" (npm 7+,
+    which sets dp0 from %~dp0 first) or "%~dp0\\node_modules\\...\\cli.js" (npm 6)."""
+    try:
+        text = Path(shim).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'"%(?:~dp0|dp0%)\\?([^"]+?\.c?js)"', text)
+    return str(Path(shim).parent.joinpath(*m.group(1).replace("\\", "/").strip("/").split("/"))) if m else None
+
+
+def npm_launcher(name):
+    """argv prefix that starts the tool `name` without a shell in between, or None when it is
+    not installed. On Windows an npm install leaves a `<name>.cmd` shim, which cmd.exe would
+    run; it is bypassed by launching node on the script it names. Anything else on PATH (a
+    native `.exe`, the POSIX binary or npm's POSIX symlink) is used as it is."""
+    binary = shutil.which(name)
+    if not binary:
+        return None
+    if is_windows() and binary.lower().endswith((".cmd", ".bat")):
+        script, node = _script_from_shim(binary), shutil.which("node")
+        return [node, script] if script and node and Path(script).exists() else None
+    return [binary]
+
 TURN_MODULES = {
     "claude_code": "convo_index.sources.claude_code",
     "opencode": "convo_index.sources.opencode",
+    "pi": "convo_index.sources.pi",
 }
 
 
@@ -154,7 +184,7 @@ def supports_turns(conversation_id: str) -> bool:
 
 
 def turn_command(conversation_id: str, prompt: str, cwd: str, *, edits: bool = False,
-                 mcp_tools: tuple[str, ...] = ()) -> TurnCommand | None:
+                 mcp_tools: tuple[str, ...] = (), locator: str | None = None) -> TurnCommand | None:
     """The harness invocation for one more turn, or None when the source has no headless
     mode here. `mcp_tools` is the allowlist an Edit-mode turn may call (turn_tools); a harness
     that cannot load MCP servers ignores it. Raises ValueError for a native id that must never
@@ -165,7 +195,8 @@ def turn_command(conversation_id: str, prompt: str, cwd: str, *, edits: bool = F
     mod, native = _turn_module(conversation_id)
     if mod is None or not supports_turns(conversation_id):
         return None
-    return mod.turn_command(native, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools) if edits else ())
+    return mod.turn_command(native, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools) if edits else (),
+                            locator=locator)
 
 
 def turn_launcher(conversation_id: str) -> list[str] | None:

@@ -16,6 +16,7 @@ def test_registered_sources_are_supported(monkeypatch):
     monkeypatch.setattr(base, "is_windows", lambda: False)
     assert base.supports_turns("claude_code:0f1e2d3c-1234-4abc-8def-0123456789ab") is True
     assert base.supports_turns("opencode:ses_abc123") is True
+    assert base.supports_turns("pi:01a0aaaa-1111-7222-8333-444455556666") is True
     assert base.turn_launcher("codex:abc") is None
 
 

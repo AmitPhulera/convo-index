@@ -2,6 +2,7 @@
 harness's stream is translated, and how recent activity is measured."""
 import json
 import os
+import sys
 import time
 
 import pytest
@@ -27,7 +28,7 @@ def claude_mcp(monkeypatch, tmp_path):
 
 @pytest.fixture
 def claude_on_path(monkeypatch):
-    monkeypatch.setattr(cc.shutil, "which", lambda name: "/opt/bin/claude" if name == "claude" else None)
+    monkeypatch.setattr(base.shutil, "which", lambda name: "/opt/bin/claude" if name == "claude" else None)
     monkeypatch.setattr(base, "is_windows", lambda: False)
 
 
@@ -87,7 +88,7 @@ def test_claude_turn_helpers_leave_the_transcript_parser_alone():
 
 
 def test_claude_missing_binary_means_no_command(monkeypatch):
-    monkeypatch.setattr(cc.shutil, "which", lambda name: None)
+    monkeypatch.setattr(base.shutil, "which", lambda name: None)
     assert base.turn_command("claude_code:abc", "x", "/proj") is None
     assert base.turn_launcher("claude_code:abc") is None
 
@@ -100,7 +101,7 @@ def test_claude_windows_npm_shim_is_bypassed_for_node(monkeypatch, tmp_path):
     shim.write_text('@ECHO off\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  '
                     '"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n')
     monkeypatch.setattr(base, "is_windows", lambda: True)
-    monkeypatch.setattr(cc.shutil, "which", lambda name: {"claude": str(shim), "node": "C:\\node\\node.exe"}.get(name))
+    monkeypatch.setattr(base.shutil, "which", lambda name: {"claude": str(shim), "node": "C:\\node\\node.exe"}.get(name))
     cmd = cc.turn_command("abc", "x", "C:\\proj")
     assert cmd.argv[:2] == ["C:\\node\\node.exe", str(script)]
     assert not any(a.lower().endswith(".cmd") for a in cmd.argv)
@@ -115,7 +116,7 @@ def test_claude_windows_npm6_shim_is_bypassed_for_node(monkeypatch, tmp_path):
                     '"%~dp0\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n) ELSE (\r\n'
                     '  node  "%~dp0\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n)\r\n')
     monkeypatch.setattr(base, "is_windows", lambda: True)
-    monkeypatch.setattr(cc.shutil, "which", lambda name: {"claude": str(shim), "node": "C:\\node\\node.exe"}.get(name))
+    monkeypatch.setattr(base.shutil, "which", lambda name: {"claude": str(shim), "node": "C:\\node\\node.exe"}.get(name))
     assert cc.turn_command("abc", "x", "C:\\proj").argv[:2] == ["C:\\node\\node.exe", str(script)]
 
 
@@ -123,14 +124,14 @@ def test_claude_windows_shim_without_a_script_is_refused(monkeypatch, tmp_path):
     shim = tmp_path / "claude.cmd"
     shim.write_text("@ECHO off\r\nsomething else\r\n")
     monkeypatch.setattr(base, "is_windows", lambda: True)
-    monkeypatch.setattr(cc.shutil, "which", lambda name: {"claude": str(shim), "node": "node"}.get(name))
+    monkeypatch.setattr(base.shutil, "which", lambda name: {"claude": str(shim), "node": "node"}.get(name))
     assert cc.turn_command("abc", "x", "C:\\proj") is None
     assert base.turn_launcher("claude_code:abc") is None            # what doctor and the UI see
 
 
 def test_claude_windows_native_exe_is_used_directly(monkeypatch):
     monkeypatch.setattr(base, "is_windows", lambda: True)
-    monkeypatch.setattr(cc.shutil, "which", lambda name: "C:\\Users\\me\\.local\\bin\\claude.exe")
+    monkeypatch.setattr(base.shutil, "which", lambda name: "C:\\Users\\me\\.local\\bin\\claude.exe")
     assert cc.turn_command("abc", "x", "C:\\proj").argv[0].endswith("claude.exe")
 
 
@@ -309,3 +310,176 @@ def test_opencode_last_activity_reads_the_1x_layout_too(tmp_path):
     db = tmp_path / "old.db"
     make_opencode_db(db)
     assert base.last_activity("opencode:ses_1", f"sqlite:{db}#ses_1") is not None
+
+
+# ---- pi ---------------------------------------------------------------------------------------
+
+from convo_index.sources import pi   # noqa: E402
+from tests.test_pi import SID as PI_SID, write_session as write_pi_session   # noqa: E402
+
+
+@pytest.fixture
+def pi_on_path(monkeypatch):
+    monkeypatch.setattr(base.shutil, "which", lambda name: "/opt/bin/pi" if name == "pi" else None)
+    monkeypatch.setattr(base, "is_windows", lambda: False)
+
+
+@pytest.fixture
+def pi_file(tmp_path):
+    return str(write_pi_session(tmp_path / "sessions" / "--proj--"))
+
+
+def test_pi_read_only_turn_resumes_the_file_with_read_tools_and_the_prompt_on_stdin(pi_on_path, pi_file):
+    cmd = base.turn_command(f"pi:{PI_SID}", "what changed?", "/proj", locator=pi_file)
+    assert cmd.argv[0] == "/opt/bin/pi" and cmd.cwd == "/proj" and cmd.stdin == "what changed?"
+    assert "what changed?" not in cmd.argv
+    for flag in ["-p", "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates", "--no-context-files",
+                 "--no-themes", "--no-approve", "--offline"]:
+        assert flag in cmd.argv
+    assert cmd.argv[cmd.argv.index("--mode") + 1] == "json"
+    assert cmd.argv[cmd.argv.index("--session") + 1] == pi_file          # by file: no fork question on stdin
+    assert cmd.argv[cmd.argv.index("--tools") + 1] == "read,grep,find,ls"
+
+
+def test_pi_edit_turn_adds_edits_and_shell_but_no_mcp(pi_on_path, pi_file):
+    cmd = base.turn_command(f"pi:{PI_SID}", "fix it", "/proj", edits=True, mcp_tools=("mcp__atlassian__*",), locator=pi_file)
+    assert cmd.argv[cmd.argv.index("--tools") + 1] == "read,grep,find,ls,edit,write,bash"
+    assert "--no-mcp" in cmd.argv and not any("mcp__" in a for a in cmd.argv)
+
+
+def test_pi_refuses_a_session_file_that_is_gone_or_holds_another_session(pi_on_path, pi_file, tmp_path):
+    other = str(write_pi_session(tmp_path / "other", name="x.jsonl"))
+    for locator in [None, str(tmp_path / "gone.jsonl"), "relative.jsonl", other]:
+        sid = PI_SID if locator != other else "0f1e2d3c-1234-4abc-8def-0123456789ab"
+        with pytest.raises(ValueError, match="no longer holds"):
+            base.turn_command(f"pi:{sid}", "x", "/proj", locator=locator)
+
+
+def test_pi_missing_binary_means_no_command(monkeypatch, pi_file):
+    monkeypatch.setattr(base.shutil, "which", lambda name: None)
+    assert base.turn_command(f"pi:{PI_SID}", "x", "/proj", locator=pi_file) is None
+    assert base.turn_launcher(f"pi:{PI_SID}") is None
+
+
+def test_pi_windows_npm_shim_is_bypassed_for_node(monkeypatch, tmp_path):
+    shim = tmp_path / "pi.cmd"
+    script = tmp_path / "node_modules" / "@earendil-works" / "pi-coding-agent" / "dist" / "bundle" / "cli.js"
+    script.parent.mkdir(parents=True)
+    script.write_text("// entry")
+    shim.write_text('@ECHO off\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  '
+                    '"%dp0%\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*\r\n')
+    monkeypatch.setattr(base, "is_windows", lambda: True)
+    monkeypatch.setattr(base.shutil, "which", lambda name: {"pi": str(shim), "node": "C:\\node\\node.exe"}.get(name))
+    assert base.supports_turns(f"pi:{PI_SID}")
+    assert base.turn_launcher(f"pi:{PI_SID}") == ["C:\\node\\node.exe", str(script)]
+
+
+# Captured from pi 1.4.0 `--mode json` (streaming deltas, the system and user messages and most
+# of each message's fields dropped; paths shortened).
+PI_USAGE = {"input": 1317, "output": 35, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 1352,
+            "cost": {"input": 0.001, "output": 0.002, "cacheRead": 0, "cacheWrite": 0, "total": 0.003}}
+PI_ASSISTANT_1 = {"role": "assistant", "provider": "ollama", "model": "flint:40b-a2b-qat-int4", "usage": PI_USAGE,
+                  "stopReason": "toolUse",
+                  "content": [{"type": "thinking", "thinking": "Let me read both.", "thinkingSignature": "reasoning"},
+                              {"type": "toolCall", "id": "call_sce8utoy", "name": "read", "arguments": {"path": "note.txt"}},
+                              {"type": "toolCall", "id": "call_cleuv6bk", "name": "read", "arguments": {"path": "missing.txt"}}]}
+PI_ASSISTANT_2 = {"role": "assistant", "provider": "ollama", "model": "flint:40b-a2b-qat-int4", "usage": PI_USAGE,
+                  "stopReason": "stop",
+                  "content": [{"type": "thinking", "thinking": "No bash tool.", "thinkingSignature": "reasoning"},
+                              {"type": "text", "text": "note.txt says hello; missing.txt does not exist; no bash tool."}]}
+PI_STREAM = [
+    {"type": "session", "version": 3, "id": "4b72a124-c133-4526-ab9e-b92764ae3b9e", "cwd": "/proj"},
+    {"type": "agent_start"},
+    {"type": "turn_start"},
+    {"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": "Use the read tool"}]}},
+    {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 1, "delta": "P"}},
+    {"type": "message_end", "message": PI_ASSISTANT_1},
+    {"type": "tool_execution_start", "toolCallId": "call_sce8utoy", "toolName": "read", "args": {"path": "note.txt"}},
+    {"type": "tool_execution_end", "toolCallId": "call_sce8utoy", "toolName": "read",
+     "result": {"content": [{"type": "text", "text": "hello from probe\n"}]}, "isError": False},
+    {"type": "message_end", "message": {"role": "toolResult", "toolCallId": "call_sce8utoy", "toolName": "read",
+                                        "content": [{"type": "text", "text": "hello from probe\n"}], "isError": False}},
+    {"type": "message_end", "message": {"role": "toolResult", "toolCallId": "call_cleuv6bk", "toolName": "read",
+                                        "content": [{"type": "text", "text": "ENOENT: no such file or directory, access '/proj/missing.txt'"}],
+                                        "details": {}, "isError": True}},
+    {"type": "turn_end", "message": PI_ASSISTANT_1},
+    {"type": "message_end", "message": PI_ASSISTANT_2},
+    {"type": "agent_end", "messages": [{"role": "user", "content": [{"type": "text", "text": "Use the read tool"}]},
+                                       PI_ASSISTANT_1, PI_ASSISTANT_2]},
+    {"type": "agent_settled", "aborted": False},
+]
+
+
+def test_pi_stream_is_translated_and_noise_dropped():
+    events = [e for line in PI_STREAM for e in base.turn_events(f"pi:{PI_SID}", json.dumps(line))]
+    assert [e["kind"] for e in events] == ["tool", "tool", "tool_result", "tool_result", "text", "done"]
+    assert events[0] == {"kind": "tool", "name": "read", "input": '{"path": "note.txt"}'}
+    assert events[2] == {"kind": "tool_result", "text": "hello from probe\n", "error": False}
+    assert events[3]["error"] is True and events[3]["text"].startswith("ENOENT")
+    assert events[4]["text"].startswith("note.txt says hello")
+    assert events[5] == {"kind": "done", "cost_usd": pytest.approx(0.006), "turns": 2}
+
+
+def _pi_assistant(stop, text="", error=None):
+    m = {"role": "assistant", "content": [{"type": "text", "text": text}] if text else [], "stopReason": stop,
+         "usage": {"input": 1, "output": 1, "cost": {"total": 0.01}}}
+    return {**m, "errorMessage": error} if error else m
+
+
+def test_pi_failed_request_is_an_error_though_pi_exits_0():
+    failed = _pi_assistant("error", error="404: model 'nosuchmodel-xyz' not found")
+    assert pi.turn_events(json.dumps({"type": "message_end", "message": failed})) == []
+    assert pi.turn_events(json.dumps({"type": "agent_end", "messages": [failed], "willRetry": False})) == [
+        {"kind": "error", "message": "404: model 'nosuchmodel-xyz' not found"}]
+    assert pi.turn_events(json.dumps({"type": "agent_end", "messages": [_pi_assistant("aborted")]})) == [
+        {"kind": "error", "message": "request aborted"}]
+    assert pi.turn_events(json.dumps({"type": "agent_end", "messages": []})) == [{"kind": "done", "cost_usd": None, "turns": 0}]
+    assert pi.turn_events("not json") == [] and pi.turn_events("[1]") == [] and pi.turn_events('{"type": "message_end"}') == []
+
+
+def test_pi_truncated_final_response_is_an_error():
+    cut = _pi_assistant("length", text="Partial reply")
+    assert pi.turn_events(json.dumps({"type": "message_end", "message": cut})) == [{"kind": "text", "text": "Partial reply"}]
+    (ev,) = pi.turn_events(json.dumps({"type": "agent_end", "messages": [cut], "willRetry": False}))
+    assert ev["kind"] == "error" and "output limit" in ev["message"]
+
+
+def test_pi_retried_failure_ends_as_the_retry_does():
+    """Shaped like pi 1.4.0's auto-retry: a failed run whose agent_end says willRetry, the retry
+    notice, then a second run. Through the runner, the turn's outcome is the last verdict."""
+    from convo_index import turns
+    failed = _pi_assistant("error", error="503 overloaded")
+    lines = [{"type": "message_end", "message": failed},
+             {"type": "agent_end", "messages": [failed], "willRetry": True},
+             {"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 2000, "errorMessage": "503 overloaded"},
+             {"type": "message_end", "message": _pi_assistant("stop", text="Recovered.")},
+             {"type": "agent_end", "messages": [_pi_assistant("stop", text="Recovered.")], "willRetry": False},
+             {"type": "agent_settled", "aborted": False}]
+    events = [e for line in lines for e in pi.turn_events(json.dumps(line))]
+    assert [e["kind"] for e in events] == ["text", "text", "done"]
+    assert "retrying (attempt 1 of 3) after: 503 overloaded" in events[0]["text"]
+    script = "import sys\nfor l in sys.argv[1:]: print(l)"
+    cmd = base.TurnCommand(argv=[sys.executable, "-c", script] + [json.dumps(x) for x in lines], cwd=os.getcwd())
+    r = turns.TurnRunner(refresh=lambda: {"ok": True, "busy": False})
+    t = r.start(f"pi:{PI_SID}", cmd, pi.turn_events)
+    last = [ev for _, ev in r.events(t.id) if ev][-1]
+    assert last["kind"] == "done" and last["cost_usd"] == pytest.approx(0.01)
+    lines[-2] = {"type": "agent_end", "messages": [failed], "willRetry": False}     # the retries ran out
+    cmd = base.TurnCommand(argv=[sys.executable, "-c", script] + [json.dumps(x) for x in lines], cwd=os.getcwd())
+    t = r.start(f"pi:{PI_SID}", cmd, pi.turn_events)
+    last = [ev for _, ev in r.events(t.id) if ev][-1]
+    assert last["kind"] == "error" and last["message"] == "503 overloaded"
+
+
+def test_pi_long_tool_input_is_clipped():
+    line = json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [
+        {"type": "toolCall", "name": "write", "arguments": {"content": "x" * 5000}}]}})
+    (ev,) = pi.turn_events(line)
+    assert len(ev["input"]) <= pi.TURN_TEXT_LIMIT + 1 and ev["input"].endswith("…")
+
+
+def test_pi_last_activity_is_the_session_file_mtime(pi_file, tmp_path):
+    then = time.time() - 600
+    os.utime(pi_file, (then, then))
+    assert abs(base.last_activity(f"pi:{PI_SID}", pi_file) - then) < 2
+    assert base.last_activity(f"pi:{PI_SID}", str(tmp_path / "gone.jsonl")) is None

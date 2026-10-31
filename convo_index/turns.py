@@ -60,7 +60,8 @@ class Turn:
         self.dropped = 0                 # events evicted from the front
         self.stderr = bytearray()
         self.cost_usd = None
-        self.harness_error = None        # the harness's own error event, if it sent one
+        self.harness_error = None        # the prompt could not be sent, or the output could not be read
+        self.reported_error = None       # the harness's own verdict: its last error event, unless a done event followed
         self.kill_reason = None          # "timeout" | "stopped"
         self.exit_code = None
         self.outcome = None              # (ok, message) latched as soon as the harness is gone
@@ -345,13 +346,15 @@ class TurnRunner:
                 try:
                     events = translate(line)
                 except Exception as e:   # a translator bug must not end the stream
-                    events = [{"kind": "error", "message": f"could not read the harness output: {e}"}]
+                    turn.harness_error = turn.harness_error or f"could not read the harness output: {e}"
+                    continue
                 for ev in events:
                     kind = ev.get("kind")
-                    if kind == "done":           # the harness's own summary feeds the terminal event
-                        turn.cost_usd = ev.get("cost_usd")
+                    if kind == "done":           # the harness's own summary feeds the terminal event; a harness
+                        turn.cost_usd = ev.get("cost_usd")   # that retried a failed request ends with done after error
+                        turn.reported_error = None
                     elif kind == "error":
-                        turn.harness_error = ev.get("message")
+                        turn.reported_error = ev.get("message")
                     else:
                         turn.append(ev)
 
@@ -405,10 +408,11 @@ class TurnRunner:
             # stop() saw the harness running, but it finished on its own before the signal (a
             # signalled harness never exits 0: POSIX reports the signal, the job exits with 1)
             turn.kill_reason = None
-        ok = turn.exit_code == 0 and turn.harness_error is None and turn.kill_reason is None and not unread
+        error = turn.harness_error or turn.reported_error
+        ok = turn.exit_code == 0 and error is None and turn.kill_reason is None and not unread
         if ok:
             return True, None
-        return False, (turn.harness_error or
+        return False, (error or
                        {"timeout": f"the harness was stopped after {self.timeout} seconds",
                         "stopped": "stopped"}.get(turn.kill_reason) or
                        ("the harness output could not be read to the end" if unread else

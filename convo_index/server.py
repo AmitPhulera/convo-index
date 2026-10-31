@@ -516,7 +516,11 @@ def turn_preconditions(conversation_id, prompt, edits, cfg=None):
     if changed is not None and 0 <= time.time() - changed < RECENT_ACTIVITY and not (own is not None and changed <= own):
         raise TURNS.TurnRefused(423, f"the session changed {int(time.time() - changed)} s ago; "
                                      "if it is open in a terminal, continue it there")
-    command = turn_command(conversation_id, prompt, cwd, edits=edits, mcp_tools=tuple(TT.load(cfg)) if edits else ())
+    try:
+        command = turn_command(conversation_id, prompt, cwd, edits=edits,
+                               mcp_tools=tuple(TT.load(cfg)) if edits else (), locator=locator)
+    except ValueError as e:
+        raise TURNS.TurnRefused(412, str(e)) from None
     if command is None:
         raise TURNS.TurnRefused(424, f"the {source} command is not installed on this machine (not on PATH)")
     return conversation_id, command, locator

@@ -128,10 +128,10 @@ after an automatic backup to `convos.db.bak-<timestamp>`.
 ## Continue a conversation from the browser
 
 The UI server can run one more turn of an indexed conversation in the tool that owns it
-(`claude -p --resume`, `opencode run --session`). The tool appends the turn to its own
-transcript, so `claude --resume <id>` or `opencode --session <id>` in a terminal afterwards
+(`claude -p --resume`, `opencode run --session`, `pi -p --session <file>`). The tool appends the turn to its own
+transcript, so `claude --resume <id>`, `opencode --session <id>` or `pi --session <id>` in a terminal afterwards
 sees exactly what happened in the browser, and the index is refreshed before the turn is
-reported finished (ingest only: its summary and tags come with the next full refresh). Claude Code and Opencode are supported today; the other sources will follow.
+reported finished (ingest only: its summary and tags come with the next full refresh). Claude Code, Opencode and pi are supported today; Codex and Antigravity will follow.
 
 In the UI, such a conversation has a message box under its transcript. Type, press Send (or
 Cmd/Ctrl+Enter), and the tool's replies, tool calls and results stream in as it works; the Mode
@@ -149,15 +149,17 @@ Every turn runs with the tool's customisation surface closed: no hooks, plugins,
 user settings, or slash commands (Claude Code's `--restricted --disable-slash-commands`, with
 `--safe-mode` in Read-only and `--setting-sources ""` in Edit; for Opencode a fresh, empty
 configuration home per turn, the project configuration switched off, its configuration-path
-variables unset and a deny-all permission ruleset; administrator-managed settings of either
-tool stay in force). Anything the tool would normally ask about is denied and reported as a
+variables unset and a deny-all permission ruleset; for pi `--no-extensions --no-mcp --no-skills
+--no-prompt-templates --no-context-files --no-approve`, so no extension, MCP server, skill,
+AGENTS.md/CLAUDE.md or project-local file loads; administrator-managed settings of Claude Code
+and Opencode stay in force). Anything the tool would normally ask about is denied and reported as a
 `denied` event, so the step can be finished in a terminal.
 
 - **Read-only** (the default): `Read`/`Glob`/`Grep` for Claude Code, the `plan` agent for
-  Opencode. No shell and no MCP servers.
+  Opencode, `read`/`grep`/`find`/`ls` for pi. No shell and no MCP servers.
 - **Edit** (`"edits": true`): adds the file-editing tools, confined to the conversation's
-  directory (Claude Code by `--restricted`, Opencode by its `external_directory` permission
-  staying denied), **the shell**, and for Claude Code **the MCP tools on your allowlist**.
+  directory for Claude Code (by `--restricted`) and Opencode (by its `external_directory`
+  permission staying denied) but not for pi (below), **the shell**, and for Claude Code **the MCP tools on your allowlist**.
   None of these ask before running: a shell command from the browser can do whatever your
   user account can, and an allowlisted MCP tool can act on the service behind it (send,
   post, create). The allowlist is edited with the Tools button in the message box and kept
@@ -165,7 +167,11 @@ tool stay in force). Anything the tool would normally ask about is denied and re
   is ignored); `convo-index doctor` prints it. Only servers from your user-scope Claude Code
   config (`claude mcp add --scope user`) can be listed: the turn loads just those servers,
   from a per-turn config file that is removed afterwards. claude.ai account connectors and
-  a project's `.mcp.json` are never loaded. Opencode turns get the shell but no MCP tools.
+  a project's `.mcp.json` are never loaded. Opencode and pi turns get the shell but no MCP tools.
+
+pi has no sandbox and no permission prompts: the tool list is its whole policy, and its tools
+(the read tools in Read-only too) reach any file your account can, not just the conversation's
+directory.
 
 Turns are accepted only on a loopback listener, from a loopback peer, when the browser
 addresses the server by a loopback name, with no proxy header present, and with the server's
@@ -180,7 +186,7 @@ conversation whose transcript changed in the last 30 seconds is refused as well 
 probably open in a terminal), as is one whose directory is gone or excluded by
 `exclude_cwd`. Turns belong to the server process: closing the page does not stop one,
 reopening the conversation resumes its stream, and stopping the server stops every turn. `convo-index doctor` lists which tools are on
-PATH for this. On Windows, Claude Code turns run the tool through `node` rather than the npm
+PATH for this. On Windows, Claude Code and pi turns run the tool through `node` rather than the npm
 `.cmd` shim, inside a job object that ends the whole process tree; Opencode turns are not
 offered there yet. `scripts/probe_turns.sh` is the manual
 check that the closing flags still hold after a tool upgrade.
