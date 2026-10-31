@@ -418,6 +418,9 @@ def _start_handoff(args, settings, cid, h, kind, out, transcript):
         print(f"the session failed: {last.get('message') or 'unknown error'}", file=sys.stderr)
         if last.get("stderr"):
             print(last["stderr"], file=sys.stderr)
+    if not state["id"]:
+        print("the tool never reported its session, so nothing was linked; it may still be in that tool's history",
+              file=sys.stderr)
     if state["id"]:
         relation = "reviews" if kind == "review" else "continues"
         print(f"new conversation {state['id']} {relation} {cid}" if state["linked"] else

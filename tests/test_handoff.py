@@ -574,3 +574,23 @@ def test_an_edited_prompt_points_at_the_copy_this_run_opens(tmp_path, monkeypatc
     assert f"is in `{opened}`" in sent["prompt"] and str(tmp_path / "first") not in sent["prompt"]
     assert "Give a short second opinion" in sent["prompt"]
     assert H.point_at("no pointer here", "/x/transcript.md") == "no pointer here"
+
+
+def test_an_id_we_chose_links_even_when_the_stream_does_not_name_it(tmp_path, monkeypatch):
+    from convo_index import turns
+    from convo_index.sources import base as SB
+    from tests.test_turns import command, drain
+    _db(tmp_path).close()
+    monkeypatch.setattr(SB, "new_session_command", lambda *a, **k: (command([
+        {"line": "warming up"},                                            # not an event: not proof the session exists
+        {"line": json.dumps({"type": "system", "subtype": "init", "sessionId_v2": "renamed"})}]), "ours-1234"))
+    runner = turns.TurnRunner()
+    turn, state = H.start_session(runner, tmp_path / "t.db", "claude_code:s1", "claude_code", "p", str(tmp_path), kind="review")
+    drain(runner, turn)
+    assert state["id"] == "claude_code:ours-1234" and state["linked"]
+
+
+def test_cli_says_when_nothing_was_linked(tmp_path, monkeypatch, capsys):
+    cli, _ = _start_env(tmp_path, monkeypatch, lines=["no session here"])
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 0
+    assert "the tool never reported its session, so nothing was linked" in capsys.readouterr().err

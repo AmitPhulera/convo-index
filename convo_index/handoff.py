@@ -9,6 +9,7 @@ here runs a harness: `convo-index handoff` prints the prompt for the user to pas
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -548,6 +549,13 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
 RELATIONS = {"continue": "continued_from", "review": "review_of"}
 
 
+def _is_event(line):
+    try:
+        return isinstance(json.loads(line), dict)
+    except (ValueError, TypeError):
+        return False
+
+
 def session_model(settings, target, model=None):
     """The model a new session of `target` runs: the caller's, else `[handoff.models]`, else
     None (the harness decides; opencode then uses its own recent models)."""
@@ -563,8 +571,8 @@ def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=
     failed). A review never edits. Raises ValueError when the
     target cannot start a session as asked, LookupError when it is not available here."""
     edits = bool(edits) and kind == "continue"
-    cmd, _ = SB.new_session_command(target, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools),
-                                    read_dirs=tuple(read_dirs), model=model)
+    cmd, native = SB.new_session_command(target, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools),
+                                         read_dirs=tuple(read_dirs), model=model)
     if cmd is None:
         raise LookupError(f"{target} cannot start a session here: not installed, or no headless mode on this platform")
     conn = dbm.connect(db_path)
@@ -578,7 +586,9 @@ def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=
     def translate(line):
         found = []
         if state["id"] is None:
-            sid = SB.session_id(target, line)
+            # the stream names the session; an id we chose ourselves (Claude Code) counts as soon
+            # as the tool writes its first event, should a new version name it differently
+            sid = SB.session_id(target, line) or (native if native and _is_event(line) else None)
             if sid:
                 state["id"] = f"{target}:{sid}"
                 try:           # a failed write must not cut the session's stream short
