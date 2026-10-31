@@ -12,12 +12,16 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
+from convo_index import db as dbm
 from convo_index import export as X
+from convo_index.sources import base as SB
 from convo_index.config import SUMMARY_PROMPT_PREFIX
 from convo_index.indexer import cwd_excluded
 from convo_index.model import KIND_TEXT, KIND_TOOL_CALL, KIND_TOOL_RESULT
@@ -95,6 +99,19 @@ def refusal(settings, h):
     return None
 
 
+def send_refusal(settings):
+    """Why a new session may not be started, or None. Starting one sends the prompt and the
+    transcript to that tool's provider, so it needs the same consent as a hosted summary:
+    `[privacy].hosted_processing = allow`. Printing the prompt needs none; pasting it is the
+    user's own act."""
+    state = R.policy_state(settings)
+    if state == "allow":
+        return None
+    return (f"[privacy].hosted_processing = {state}: starting a session sends this conversation to that tool's "
+            "provider" + ("; run `convo-index init` to decide" if state == "ask" else "")
+            + ". Without --start the prompt is printed for you to paste.")
+
+
 def harness_label(m):
     if m.get("role") != "user" or (m.get("kind") or KIND_TEXT) != KIND_TEXT:
         return None
@@ -131,6 +148,19 @@ def known_problems(msgs):
         elif _is_user_words(m):
             after_reply = False
     return out
+
+
+MASK = "[credential masked: {kind}]"
+
+
+def mask_secrets(text):
+    """(text, count) with every credential-looking string replaced by a MASK marker. The
+    transcript copy is masked as it is written: nobody reviews it before the target reads it."""
+    count = 0
+    for rx, kind in SECRET_PATTERNS:
+        text, n = rx.subn(MASK.format(kind=kind), text or "")
+        count += n
+    return text, count
 
 
 def find_secrets(text):
@@ -217,10 +247,12 @@ def prune_copies(db_path, days=COPY_DAYS, now=None):
 
 def write_transcript(conn, cid, directory, settings=None):
     """The full conversation, tools included, as Markdown in `directory` (readable by this
-    user only). The prompt names the file so the target reads detail on demand."""
+    user only), credentials masked. The prompt names the file so the target reads detail on
+    demand."""
     md = X.as_markdown(conn, cid, settings, include_tools=True)
     if md is None:
         return None
+    md, _ = mask_secrets(md)
     directory = Path(directory).expanduser().resolve()   # the target harness starts elsewhere
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = directory / "transcript.md"
@@ -445,9 +477,8 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
 
     `digest_result` (continue only) and `repo` are passed in so the caller decides what runs:
     the digest is an LLM call and repo state runs git. Returns {kind, prompt, problems,
-    secrets, transcript_secrets, chars, tokens, over_budget, dropped, digest_status}, where
-    transcript_secrets are the hits in the transcript file (tool output included) that the
-    prompt itself does not show."""
+    secrets, transcript_masked, chars, tokens, over_budget, dropped, digest_status}, where
+    transcript_masked counts the credentials masked in the transcript file."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}, not {kind!r}")
     h = X.head(conn, cid)
@@ -490,10 +521,62 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
     prompt = "\n\n".join(sections) + "\n"
     secrets = find_secrets(prompt)
     try:
-        in_file = find_secrets(Path(transcript_path).read_text(encoding="utf-8")) if transcript_path else []
+        masked = Path(transcript_path).read_text(encoding="utf-8").count(MASK.split("{")[0]) if transcript_path else 0
     except OSError:
-        in_file = []          # a pointer the caller made up (tests) or a file already removed
-    return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": secrets,
-            "transcript_secrets": [s for s in in_file if s not in secrets],
+        masked = 0            # a pointer the caller made up (tests) or a file already removed
+    return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": secrets, "transcript_masked": masked,
             "chars": len(prompt), "tokens": len(prompt) // 4, "over_budget": len(prompt) > budget_chars,
             "dropped": dropped, "digest_status": digest_status if kind == "continue" else None}
+
+
+# --------------------------------------------------------------- the new session ----
+
+RELATIONS = {"continue": "continued_from", "review": "review_of"}
+
+
+def session_model(settings, target, model=None):
+    """The model a new session of `target` runs: the caller's, else `[handoff.models]`, else
+    None (the harness decides; opencode then uses its own recent models)."""
+    return model or (settings["handoff"]["models"].get(target) or None)
+
+
+def start_session(runner, db_path, from_id, target, prompt, cwd, *, kind, edits=False, mcp_tools=(),
+                  read_dirs=(), model=None):
+    """Start a new `target` session seeded with `prompt` on `runner` (a TurnRunner) and return
+    (turn, state). state["id"] is the new conversation id once the harness has reported its
+    session; the link to `from_id` is written at that moment, so a harness that fails before
+    it starts leaves no link to nothing (state["linked"], or state["link_error"] when the write
+    failed). A review never edits. Raises ValueError when the
+    target cannot start a session as asked, LookupError when it is not available here."""
+    edits = bool(edits) and kind == "continue"
+    cmd, _ = SB.new_session_command(target, prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools),
+                                    read_dirs=tuple(read_dirs), model=model)
+    if cmd is None:
+        raise LookupError(f"{target} cannot start a session here: not installed, or no headless mode on this platform")
+    conn = dbm.connect(db_path)
+    try:
+        dbm.init_schema(conn, db_path)      # the link table, on a database no newer command has opened yet
+    finally:
+        conn.close()
+    state = {"id": None, "linked": False, "link_error": None}
+    probe = f"{target}:x"            # turn_events picks the adapter from the source part only
+
+    def translate(line):
+        if state["id"] is None:
+            sid = SB.session_id(target, line)
+            if sid:
+                state["id"] = f"{target}:{sid}"
+                try:           # a failed write must not cut the session's stream short
+                    conn = dbm.connect(db_path)
+                    try:
+                        dbm.add_link(conn, state["id"], from_id, RELATIONS[kind])
+                        state["linked"] = True
+                    finally:
+                        conn.close()
+                except sqlite3.Error as e:
+                    state["link_error"] = str(e)
+        return SB.turn_events(probe, line)
+
+    # a placeholder conversation id: the runner allows one turn per conversation, and this one is new
+    turn = runner.start(f"{target}:handoff-{uuid.uuid4().hex}", cmd, translate, edits=edits)
+    return turn, state

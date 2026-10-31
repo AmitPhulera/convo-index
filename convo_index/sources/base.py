@@ -200,6 +200,33 @@ def turn_command(conversation_id: str, prompt: str, cwd: str, *, edits: bool = F
                             locator=locator)
 
 
+def new_session_targets() -> list[str]:
+    """Sources a handoff can start a new session in on this machine's platform."""
+    return [s for s, name in TURN_MODULES.items()
+            if supports_turns(f"{s}:x") and hasattr(importlib.import_module(name), "new_session_command")]
+
+
+def new_session_command(source: str, prompt: str, cwd: str, *, edits: bool = False, mcp_tools: tuple[str, ...] = (),
+                        read_dirs: tuple[str, ...] = (), model: str | None = None):
+    """(TurnCommand, native id or None) for a new session of `source` seeded with `prompt`, or
+    (None, None) when it has no headless mode here or is not installed. The id is None when the
+    harness picks it; session_id() then finds it in the stream. Raises ValueError for a
+    harness that cannot start one as asked (opencode without a model)."""
+    if source not in new_session_targets():
+        return None, None
+    mod = importlib.import_module(TURN_MODULES[source])
+    return mod.new_session_command(prompt, cwd, edits=edits, mcp_tools=tuple(mcp_tools) if edits else (),
+                                   read_dirs=tuple(str(d) for d in read_dirs), model=model)
+
+
+def session_id(source: str, line: str) -> str | None:
+    """The new session's native id if this stdout line reports it."""
+    name = TURN_MODULES.get(source)
+    find = getattr(importlib.import_module(name), "session_id", None) if name else None   # resume-only sources have none
+    sid = find(line) if find else None
+    return sid if sid and NATIVE_ID_RE.fullmatch(sid) else None
+
+
 def turn_launcher(conversation_id: str) -> list[str] | None:
     """How the source's tool would be started on this machine, or None when it cannot be."""
     mod, _ = _turn_module(conversation_id)

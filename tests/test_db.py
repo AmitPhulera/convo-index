@@ -407,3 +407,37 @@ def test_parser_version_bump_with_changed_text_does_not_carry_the_summary(tmp_pa
     dbm.upsert_conversation(conn, Conversation(source="claude_code", native_id="s2", title="T", first_prompt="p", source_ref="/b",
                                                cwd="/x", messages=swapped), "unknown", None, [], None, "p2:1:1", _embed_none)
     assert dbm.get_summarized_revision(conn, "claude_code:s2") == "p1:1:1"  # same texts in another order: stale
+
+
+def test_links_survive_reindex_and_go_with_a_deletion(tmp_path):
+    conn = _open(tmp_path)
+    dbm.upsert_conversation(conn, _conv(), "globex", "path", [], "/a", "1", _embed_none)
+    dbm.add_link(conn, "codex:new", "claude_code:s1", "continued_from")     # new session not indexed yet
+    dbm.add_link(conn, "opencode:rev", "claude_code:s1", "review_of")
+    dbm.upsert_conversation(conn, _conv(), "globex", "path", [], "/a", "2", _embed_none)
+    assert dbm.links_for(conn, "claude_code:s1") == [
+        {"id": "codex:new", "relation": "continued_from", "direction": "to"},
+        {"id": "opencode:rev", "relation": "review_of", "direction": "to"}]
+    assert dbm.links_for(conn, "codex:new") == [{"id": "claude_code:s1", "relation": "continued_from", "direction": "from"}]
+    dbm.delete_conversation(conn, "claude_code:s1")
+    assert dbm.links_for(conn, "codex:new") == [] and dbm.links_for(conn, "opencode:rev") == []
+
+
+def test_links_refuse_unknown_relations_and_self_links(tmp_path):
+    import pytest
+    conn = _open(tmp_path)
+    with pytest.raises(ValueError):
+        dbm.add_link(conn, "a:1", "b:2", "fork")
+    with pytest.raises(ValueError):
+        dbm.add_link(conn, "a:1", "a:1", "review_of")
+
+
+def test_links_keep_creation_order_within_a_second(tmp_path, monkeypatch):
+    conn = _open(tmp_path)
+    monkeypatch.setattr(dbm.time, "strftime", lambda *a: "2026-10-31T00:00:00Z")
+    ids = [f"x:{c}" for c in "zyxwvutsrq"]
+    for i in ids:
+        dbm.add_link(conn, i, "a:1", "review_of")
+    dbm.add_link(conn, "x:z", "a:1", "continued_from")      # a second write updates the row, keeps its place
+    assert [d["id"] for d in dbm.links_for(conn, "a:1")] == ids
+    assert dbm.links_for(conn, "a:1")[0]["relation"] == "continued_from"

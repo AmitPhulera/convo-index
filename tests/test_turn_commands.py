@@ -43,6 +43,20 @@ def test_claude_read_only_turn_closes_every_surface_and_sends_the_prompt_on_stdi
     assert base.turn_launcher("claude_code:abc") == ["/opt/bin/claude"]
 
 
+def test_claude_new_session_keeps_the_closing_flags_and_opens_only_the_read_dirs(claude_on_path, claude_mcp):
+    cmd, sid = cc.new_session_command("take over", "/proj", read_dirs=["/data/handoffs/x"], model="claude-sonnet-5-5")
+    assert cmd.argv == ["/opt/bin/claude", "--session-id", sid,
+                        "-p", "--output-format", "stream-json", "--verbose", "--safe-mode", "--restricted",
+                        "--strict-mcp-config", "--disable-slash-commands", "--permission-prompts", "none",
+                        "--tools", "Read,Glob,Grep", "--add-dir", "/data/handoffs/x", "--model", "claude-sonnet-5-5"]
+    assert cmd.stdin == "take over" and len(sid) == 36 and "--resume" not in cmd.argv
+    edit, sid2 = cc.new_session_command("go on", "/proj", edits=True, read_dirs=["/d"])
+    assert sid2 != sid and edit.argv[1:3] == ["--session-id", sid2] and edit.argv[-2:] == ["--add-dir", "/d"]
+    assert "Bash" in edit.argv[edit.argv.index("--tools") + 1] and "--safe-mode" not in edit.argv
+    init = json.dumps({"type": "system", "subtype": "init", "session_id": sid})
+    assert cc.session_id(init) == sid and cc.session_id('{"type": "assistant"}') is None and cc.session_id("nope") is None
+
+
 def test_claude_read_only_turn_ignores_the_mcp_allowlist(claude_on_path, claude_mcp):
     cmd = base.turn_command("claude_code:abc", "what changed?", "/proj", mcp_tools=("mcp__atlassian__*",))
     assert "--safe-mode" in cmd.argv and "--mcp-config" not in cmd.argv and "Bash" not in " ".join(cmd.argv)
@@ -231,6 +245,24 @@ def test_opencode_edit_turn_allows_edit_and_bash(opencode_on_path):
     assert rules[-1] == {"action": "bash", "resource": "*", "effect": "allow"}
     assert os.listdir(cmd.env["XDG_CONFIG_HOME"]) == []      # no MCP server: the allowlist is Claude Code's
     assert base.turn_launcher("opencode:ses_abc") == ["/opt/bin/opencode"]
+
+
+def test_opencode_new_session_names_a_model_and_opens_only_the_read_dirs(opencode_on_path, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    cmd, sid = oc.new_session_command("take over", "/proj", read_dirs=["/data/handoffs/x"], model="opencode-go/m1")
+    assert sid is None and cmd.argv == ["/opt/bin/opencode", "run", "--standalone", "--format", "json",
+                                        "-m", "opencode-go/m1", "--agent", "plan", "take over"]
+    rules = json.loads(cmd.env["OPENCODE_CONFIG_CONTENT"])["permissions"]
+    assert rules[0]["effect"] == "deny" and rules[-1] == {"action": "external_directory", "resource": "/data/handoffs/x/*", "effect": "allow"}
+    assert "--session" not in cmd.argv and cmd.scratch == (cmd.env["XDG_CONFIG_HOME"],)
+    with pytest.raises(ValueError, match="pass --model"):
+        oc.new_session_command("x", "/proj")                         # no recent models yet
+    (tmp_path / "state" / "opencode").mkdir(parents=True)
+    (tmp_path / "state" / "opencode" / "model.json").write_text(json.dumps(
+        {"recent": [{"providerID": "opencode-go", "modelID": "deepseek-v4.1-flash"}, {"providerID": "x", "modelID": "y"}]}))
+    cmd, _ = oc.new_session_command("x", "/proj", edits=True)
+    assert cmd.argv[cmd.argv.index("-m") + 1] == "opencode-go/deepseek-v4.1-flash" and "--agent" not in cmd.argv
+    assert oc.session_id('{"type": "step_start", "sessionID": "ses_1"}') == "ses_1" and oc.session_id("[]") is None
 
 
 def test_opencode_prompt_is_one_argv_element(opencode_on_path):
@@ -640,3 +672,19 @@ def test_codex_last_activity_is_the_rollout_mtime(rollout, tmp_path):
     os.utime(rollout, (then, then))
     assert abs(base.last_activity(f"codex:{CODEX_TID}", rollout) - then) < 2
     assert base.last_activity(f"codex:{CODEX_TID}", str(tmp_path / "gone.jsonl")) is None
+
+
+def test_new_sessions_dispatch_by_source(opencode_on_path, monkeypatch):
+    bins = {"claude": "/opt/bin/claude", "opencode": "/opt/bin/opencode", "pi": "/opt/bin/pi"}
+    monkeypatch.setattr(base.shutil, "which", bins.get)   # one shutil module behind every adapter
+    assert base.new_session_targets() == ["claude_code", "opencode"]     # pi resumes, but cannot start one yet
+    cmd, sid = base.new_session_command("claude_code", "go", "/proj", read_dirs=["/d"])
+    assert cmd.argv[1:3] == ["--session-id", sid]
+    cmd, sid = base.new_session_command("opencode", "go", "/proj", model="p/m")
+    assert sid is None and "-m" in cmd.argv
+    assert base.new_session_command("codex", "go", "/proj") == (None, None)
+    assert base.session_id("opencode", '{"sessionID": "ses_1"}') == "ses_1"
+    assert base.session_id("opencode", '{"sessionID": "../../etc"}') is None      # never a path or an option
+    assert base.session_id("codex", "{}") is None
+    monkeypatch.setattr(base, "is_windows", lambda: True)
+    assert base.new_session_targets() == ["claude_code"]                           # opencode turns are POSIX only

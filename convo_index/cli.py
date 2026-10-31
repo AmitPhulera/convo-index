@@ -287,13 +287,22 @@ def cmd_search(args):
 def cmd_handoff(args):
     """Print the prompt that seeds a new session in another harness: paste it there. What the
     preview would show beside it (known problems, credential-looking strings, size) goes to
-    stderr, so stdout is only the prompt."""
+    stderr, so stdout is only the prompt. With --start the new session is run here instead and
+    its replies are printed."""
     from convo_index import settings as S
     from convo_index import db as dbm
     from convo_index import export as X
     from convo_index import handoff as H
+    from convo_index.sources import base as SB
     settings = S.load()
     kind = "review" if args.review else "continue"
+    if args.start and args.start not in SB.new_session_targets():
+        print(f"cannot start a session in {args.start} here; choose one of: {', '.join(SB.new_session_targets()) or 'none'}",
+              file=sys.stderr)
+        return 1
+    if args.start and H.send_refusal(settings):
+        print(f"not starting: {H.send_refusal(settings)}", file=sys.stderr)
+        return 1
     conn = dbm.connect(settings.db_path())
     try:
         try:
@@ -308,6 +317,10 @@ def cmd_handoff(args):
         why = H.refusal(settings, h)
         if why:
             print(f"not handing off: {why}", file=sys.stderr)
+            return 1
+        if args.start and not (h["cwd"] and os.path.isdir(h["cwd"])):
+            print(f"not starting a session: the conversation's directory is gone: {h['cwd'] or '(none recorded)'}",
+                  file=sys.stderr)
             return 1
         H.prune_copies(settings.db_path())
         where = Path(args.transcript_dir).expanduser() if args.transcript_dir else H.copy_dir(settings.db_path(), cid)
@@ -327,7 +340,8 @@ def cmd_handoff(args):
                       repo=H.repo_state(h["cwd"]))
     finally:
         conn.close()
-    print(out["prompt"], end="")
+    if not args.start:
+        print(out["prompt"], end="")
     note = [f"{kind}: ~{out['tokens']:,} tokens" + (" (over the budget)" if out["over_budget"] else "")
             + (f", {out['dropped']} assistant message(s) left out" if out["dropped"] else ""),
             f"transcript: {transcript}"]
@@ -337,10 +351,83 @@ def cmd_handoff(args):
     if len(out["problems"]) > H.MAX_PROBLEMS:
         note.append(f"known problems: {len(out['problems']) - H.MAX_PROBLEMS} earlier ones not listed")
     note += [f"looks like a secret, remove before sending: {s['kind']} {s['sample']}" for s in out["secrets"]]
-    note += [f"looks like a secret in the transcript file, which the prompt points at: {s['kind']} {s['sample']}"
-             for s in out["transcript_secrets"]]
+    if out["transcript_masked"]:
+        note.append(f"masked {out['transcript_masked']} credential-looking string(s) in the transcript file")
     print("\n".join(note), file=sys.stderr)
+    if args.start:
+        return _start_handoff(args, settings, cid, h, kind, out, transcript)
     return 0
+
+
+def _ingest_only():
+    """The refresh a browser turn runs after the harness exits: ingest, no LLM jobs."""
+    import subprocess
+    from convo_index.indexer import EXIT_LOCKED
+    res = subprocess.run([sys.executable, "-m", "convo_index.indexer", "--no-jobs"], capture_output=True, text=True, check=False)
+    return {"ok": res.returncode == 0, "busy": res.returncode == EXIT_LOCKED, "error": (res.stderr or "")[-500:]}
+
+
+def _start_handoff(args, settings, cid, h, kind, out, transcript):
+    """Run the new session here: refuse credential-looking strings unless told otherwise,
+    stream the replies (text to stdout, the rest to stderr), and say how to resume it."""
+    from convo_index import handoff as H
+    from convo_index import turns as TURNS
+    from convo_index.sources.base import resume_command
+    if args.prompt_file:
+        try:
+            prompt = Path(args.prompt_file).expanduser().read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"cannot read {args.prompt_file}: {e.strerror or e}", file=sys.stderr)
+            return 1
+        secrets = H.find_secrets(prompt)
+    else:
+        prompt, secrets = out["prompt"], out["secrets"]
+    if secrets and not args.ignore_secrets:       # the transcript copy is masked; the prompt is yours to fix
+        print("not starting: the prompt holds what looks like a credential (listed above). Print it without "
+              "--start, remove it, and pass the result with --prompt-file; or pass --ignore-secrets.", file=sys.stderr)
+        return 1
+    t = settings["ui"]["turns"]
+    runner = TURNS.TurnRunner(timeout=int(t.get("timeout_seconds") or 1200), max_concurrent=1, refresh=_ingest_only)
+    try:
+        turn, state = H.start_session(runner, settings.db_path(), cid, args.start, prompt, h["cwd"], kind=kind,
+                                      edits=args.edit, read_dirs=(transcript.parent,),
+                                      model=H.session_model(settings, args.start, args.model))
+    except (ValueError, LookupError, TURNS.TurnRefused) as e:
+        print(f"not starting: {e}", file=sys.stderr)
+        return 1
+    mode = "edit" if args.edit and kind == "continue" else "read-only"
+    print(f"starting a new {args.start} session ({mode}) in {h['cwd']}; Ctrl-C stops it", file=sys.stderr)
+    last = None
+    try:
+        for _, ev in runner.events(turn.id):
+            if ev is None:
+                continue
+            last = ev
+            if ev["kind"] == "text":
+                print(ev["text"], flush=True)
+            elif ev["kind"] == "tool":
+                print(f"→ {ev.get('name') or 'tool'}", file=sys.stderr)
+            elif ev["kind"] == "denied":
+                print(f"✗ {ev.get('name') or 'tool'}: not allowed in this mode", file=sys.stderr)
+    except KeyboardInterrupt:
+        runner.stop(turn.id)
+        for _, ev in runner.events(turn.id):
+            last = ev if ev is not None else last
+    ok = bool(last) and last["kind"] == "done"
+    if not ok and last:
+        print(f"the session failed: {last.get('message') or 'unknown error'}", file=sys.stderr)
+        if last.get("stderr"):
+            print(last["stderr"], file=sys.stderr)
+    if state["id"]:
+        relation = "reviews" if kind == "review" else "continues"
+        print(f"new conversation {state['id']} {relation} {cid}" if state["linked"] else
+              f"new conversation {state['id']}; not linked to {cid}: {state['link_error']}", file=sys.stderr)
+        resume = resume_command(state["id"], h["cwd"])
+        if resume:
+            print(f"resume it: {resume}", file=sys.stderr)
+        if last and not last.get("indexed"):
+            print(f"not indexed yet: {last.get('reason') or 'run convo-index index'}", file=sys.stderr)
+    return 0 if ok else 1
 
 
 def cmd_export(args):
@@ -767,6 +854,11 @@ def main(argv=None):
     p_hand.add_argument("--review", action="store_true", help="a second opinion instead of a continuation")
     p_hand.add_argument("--no-digest", action="store_true", help="skip the LLM handoff note (continue only)")
     p_hand.add_argument("--transcript-dir", help="where to write the full transcript the prompt points at")
+    p_hand.add_argument("--start", metavar="TOOL", help="run the new session here, in claude_code or opencode")
+    p_hand.add_argument("--edit", action="store_true", help="with --start: let it edit files and run the shell (continue only)")
+    p_hand.add_argument("--model", help="with --start: the model the new session runs (else [handoff.models])")
+    p_hand.add_argument("--prompt-file", help="with --start: send this (edited) prompt instead of the generated one")
+    p_hand.add_argument("--ignore-secrets", action="store_true", help="with --start: send even if a credential is found")
     p_bak = sub.add_parser("backup", help="copy the database (SQLite backup API, WAL-safe) to a path")
     p_bak.add_argument("path")
     p_sch = sub.add_parser("schedule", help="daily refresh via LaunchAgent (macOS), systemd user timer (Linux) or a crontab line")

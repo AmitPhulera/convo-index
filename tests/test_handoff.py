@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 import subprocess
@@ -312,7 +313,9 @@ def test_secrets_in_tool_output_are_reported_from_the_transcript_file(tmp_path, 
     _db(tmp_path, msgs).close()
     assert cli.main(["handoff", "s1", "--review", "--transcript-dir", str(tmp_path / "h")]) == 0
     out = capsys.readouterr()
-    assert "AKIA" not in out.out and "looks like a secret in the transcript file" in out.err and "AWS access key" in out.err
+    assert "AKIA" not in out.out and "masked 1 credential-looking string(s) in the transcript file" in out.err
+    text = (tmp_path / "h" / "transcript.md").read_text()
+    assert "AKIAABCDEFGHIJKLMNOP" not in text and "export AWS_KEY=[credential masked: AWS access key]" in text
 
 
 def test_the_budget_counts_each_message_as_rendered(tmp_path):
@@ -388,3 +391,160 @@ def test_the_digest_fits_a_backend_that_carries_less(fake_llm, llm_settings, mon
 def test_repo_state_reads_utf8_whatever_the_locale(tmp_path):
     repo = _git_repo(tmp_path / "repo", subject="Ánimo: fix the café menu")   # Á is C3 81; cp1252 has no 0x81
     assert "Ánimo: fix the café menu" in H.repo_state(str(repo))["log"]
+
+
+def test_start_session_links_once_the_harness_reports_its_session(tmp_path, monkeypatch):
+    from convo_index import turns
+    from convo_index.sources import base as SB
+    from tests.test_turns import command, drain
+    conn = _db(tmp_path)
+    conn.close()
+    seen = {}
+
+    def fake_new_session(target, prompt, cwd, **kw):
+        seen.update(kw, target=target, prompt=prompt)
+        return command([{"line": "not json"},
+                        {"line": json.dumps({"type": "step_start", "sessionID": "ses_new1", "part": {"type": "step-start"}})},
+                        {"line": json.dumps({"type": "text", "sessionID": "ses_new1", "part": {"type": "text", "text": "on it"}})}]), None
+    monkeypatch.setattr(SB, "new_session_command", fake_new_session)
+    runner = turns.TurnRunner()
+    turn, state = H.start_session(runner, tmp_path / "t.db", "claude_code:s1", "opencode", "the prompt", str(tmp_path),
+                                  kind="review", edits=True, read_dirs=["/d"], model="p/m")
+    events = drain(runner, turn)
+    assert state["id"] == "opencode:ses_new1" and any(e.get("text") == "on it" for e in events) and events[-1]["kind"] == "done"
+    assert seen["edits"] is False and seen["read_dirs"] == ("/d",) and seen["model"] == "p/m"   # a review never edits
+    conn = dbm.connect(tmp_path / "t.db")
+    assert dbm.links_for(conn, "claude_code:s1") == [{"id": "opencode:ses_new1", "relation": "review_of", "direction": "to"}]
+
+
+def test_start_session_without_a_session_leaves_no_link(tmp_path, monkeypatch):
+    from convo_index import turns
+    from convo_index.sources import base as SB
+    from tests.test_turns import command, drain
+    _db(tmp_path).close()
+    monkeypatch.setattr(SB, "new_session_command", lambda *a, **k: (command([{"line": "boom"}, {"exit": 3}]), None))
+    runner = turns.TurnRunner()
+    turn, state = H.start_session(runner, tmp_path / "t.db", "claude_code:s1", "opencode", "p", str(tmp_path), kind="continue")
+    assert drain(runner, turn)[-1]["kind"] == "error" and state["id"] is None
+    assert dbm.links_for(dbm.connect(tmp_path / "t.db"), "claude_code:s1") == []
+    monkeypatch.setattr(SB, "new_session_command", lambda *a, **k: (None, None))
+    with pytest.raises(LookupError):
+        H.start_session(runner, tmp_path / "t.db", "claude_code:s1", "codex", "p", str(tmp_path), kind="continue")
+
+
+def test_session_model_prefers_the_flag_then_the_settings(tmp_path):
+    from tests.conftest import make_settings
+    st = make_settings(tmp_path, handoff={"models": {"opencode": "opencode-go/deepseek-v4.1-flash"}})
+    assert H.session_model(st, "opencode") == "opencode-go/deepseek-v4.1-flash"
+    assert H.session_model(st, "opencode", "x/y") == "x/y" and H.session_model(st, "claude_code") is None
+
+
+def _start_env(tmp_path, monkeypatch, msgs=None, lines=None):
+    from convo_index import cli
+    from convo_index import settings as S
+    from convo_index.sources import base as SB
+    from tests.conftest import make_settings
+    from tests.test_turns import command
+    st = make_settings(tmp_path, handoff={"models": {"opencode": "opencode-go/deepseek-v4.1-flash"}},
+                       privacy={"hosted_processing": "allow"})
+    monkeypatch.setattr(S, "load", lambda *a, **k: st)
+    _db(tmp_path, msgs, cwd=str(tmp_path)).close()
+    sent = {}
+
+    def fake_new_session(target, prompt, cwd, **kw):
+        sent.update(kw, prompt=prompt, cwd=cwd)
+        return command([{"line": x} for x in (lines or [
+            json.dumps({"type": "step_start", "sessionID": "ses_new1", "part": {"type": "step-start"}}),
+            json.dumps({"type": "text", "sessionID": "ses_new1", "part": {"type": "text", "text": "Taking over."}})])]), None
+    monkeypatch.setattr(SB, "new_session_targets", lambda: ["claude_code", "opencode"])
+    monkeypatch.setattr(SB, "new_session_command", fake_new_session)
+    monkeypatch.setattr(cli, "_ingest_only", lambda: {"ok": True, "busy": False})
+    return cli, sent
+
+
+def test_cli_start_runs_the_session_links_it_and_says_how_to_resume(tmp_path, monkeypatch, capsys):
+    cli, sent = _start_env(tmp_path, monkeypatch)
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--edit", "--no-digest"]) == 0
+    out = capsys.readouterr()
+    assert out.out == "Taking over.\n"                                   # the reply, not the prompt
+    assert "new conversation opencode:ses_new1 continues claude_code:s1" in out.err and "resume it:" in out.err
+    assert sent["edits"] is True and sent["model"] == "opencode-go/deepseek-v4.1-flash" and sent["cwd"] == str(tmp_path)
+    assert sent["prompt"].startswith("You are taking over") and sent["read_dirs"][0].name.startswith("claude_code-s1-")
+    links = dbm.links_for(dbm.connect(tmp_path / "t.db"), "claude_code:s1")
+    assert links == [{"id": "opencode:ses_new1", "relation": "continued_from", "direction": "to"}]
+
+
+def test_cli_start_refuses_secrets_unless_told_and_sends_an_edited_prompt(tmp_path, monkeypatch, capsys):
+    msgs = [Message(seq=0, role="user", text="use key AKIAABCDEFGHIJKLMNOP to deploy")]
+    cli, sent = _start_env(tmp_path, monkeypatch, msgs)
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 1
+    assert "not starting: the prompt holds" in capsys.readouterr().err and not sent
+    edited = tmp_path / "edited.md"
+    edited.write_text("Review the deploy script. The key was removed.")
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review", "--prompt-file", str(edited)]) == 0   # the copy is masked
+    assert sent["prompt"] == "Review the deploy script. The key was removed." and sent["edits"] is False
+    copy = sent["read_dirs"][0] / "transcript.md"
+    assert "AKIAABCDEFGHIJKLMNOP" not in copy.read_text() and "[credential masked: AWS access key]" in copy.read_text()
+    sent.clear()
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review", "--ignore-secrets"]) == 0
+    assert "AKIAABCDEFGHIJKLMNOP" in sent["prompt"]                      # told to: the prompt goes as it is
+
+
+def test_cli_start_reports_a_failed_session_and_an_unknown_target(tmp_path, monkeypatch, capsys):
+    cli, _ = _start_env(tmp_path, monkeypatch, lines=["no session here"])
+    assert cli.main(["handoff", "s1", "--start", "codex"]) == 1
+    assert "cannot start a session in codex here" in capsys.readouterr().err
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 0
+    err = capsys.readouterr().err
+    assert "new conversation" not in err and dbm.links_for(dbm.connect(tmp_path / "t.db"), "claude_code:s1") == []
+
+
+def test_start_session_brings_an_older_database_up_to_the_link_table(tmp_path, monkeypatch):
+    from convo_index import turns
+    from convo_index.sources import base as SB
+    from tests.test_turns import command, drain
+    _db(tmp_path).close()
+    conn = dbm.connect(tmp_path / "t.db")
+    conn.execute("DROP TABLE conversation_links")                       # as a database made before v8
+    conn.execute("DELETE FROM schema_migrations WHERE version = 8")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(SB, "new_session_command", lambda *a, **k: (command([{"line": json.dumps({"sessionID": "ses_9"})}]), None))
+    runner = turns.TurnRunner()
+    turn, state = H.start_session(runner, tmp_path / "t.db", "claude_code:s1", "opencode", "p", str(tmp_path), kind="review")
+    assert drain(runner, turn)[-1]["kind"] == "done"
+    assert dbm.links_for(dbm.connect(tmp_path / "t.db"), "claude_code:s1")[0]["id"] == "opencode:ses_9"
+
+
+def test_a_failed_link_write_is_reported_and_the_session_still_finishes(tmp_path, monkeypatch, capsys):
+    import sqlite3
+    cli, _ = _start_env(tmp_path, monkeypatch)
+
+    def broken(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(dbm, "add_link", broken)
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 0
+    out = capsys.readouterr()
+    assert out.out == "Taking over.\n" and "not linked to claude_code:s1: database is locked" in out.err
+    assert "reviews claude_code:s1" not in out.err
+
+
+def test_mask_secrets_replaces_every_match_and_counts_them():
+    text, n = H.mask_secrets("a AKIAABCDEFGHIJKLMNOP b ghp_" + "x" * 36 + " c password=hunter2hunter2 d")
+    assert n == 3 and "AKIA" not in text and "ghp_" not in text and "hunter2" not in text
+    assert text.startswith("a [credential masked: AWS access key] b [credential masked: GitHub token] c ")
+    assert H.mask_secrets("nothing here") == ("nothing here", 0) and H.find_secrets(text) == []
+
+
+@pytest.mark.parametrize("state", ["deny", "ask"])
+def test_cli_start_needs_hosted_processing_allowed(tmp_path, monkeypatch, capsys, state):
+    cli, sent = _start_env(tmp_path, monkeypatch)
+    from convo_index import settings as S
+    S.load()["privacy"]["hosted_processing"] = state
+    assert cli.main(["handoff", "s1", "--start", "opencode", "--review"]) == 1
+    err = capsys.readouterr().err
+    assert f"not starting: [privacy].hosted_processing = {state}" in err and not sent
+    assert ("convo-index init" in err) == (state == "ask")
+    assert not (tmp_path / "handoffs").exists()                          # refused before anything is written
+    assert cli.main(["handoff", "s1", "--review"]) == 0                  # printing the prompt is still fine
+    assert capsys.readouterr().out.startswith("You are reviewing")

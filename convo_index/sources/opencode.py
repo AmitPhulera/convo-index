@@ -524,7 +524,7 @@ CONFIG_OVERRIDES = ("OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CLI_CONF
 _ALLOW_READ = ["read", "glob", "grep", "list"]
 
 
-def _permission_rules(edits):
+def _permission_rules(edits, read_dirs=()):
     """Ordered rules, last match wins: deny everything (MCP and plugin tools included, and
     `external_directory`, which confines every tool to the project: a write to /tmp or a read
     of /etc/hosts is refused with "Permission denied: external_directory"), then allow the
@@ -534,6 +534,8 @@ def _permission_rules(edits):
     rules = [{"action": "*", "resource": "*", "effect": "deny"}]
     for action in _ALLOW_READ + (["edit", "bash"] if edits else []):
         rules.append({"action": action, "resource": "*", "effect": "allow"})
+    for d in read_dirs:     # a handoff's transcript copy: outside the project, and nothing else is
+        rules.append({"action": "external_directory", "resource": f"{d}/*", "effect": "allow"})
     return rules
 
 
@@ -577,19 +579,62 @@ def turn_command(native_id, prompt, cwd, *, edits=False, mcp_tools=(), locator=N
     """`mcp_tools` is ignored: a turn's configuration home is empty, so no MCP server loads.
     The session is resumed by id (`locator` points into the shared database), with its own
     model when the database names one."""
+    model = session_model(native_id, locator)
+    return _command(["--session", native_id] + (["-m", model] if model else []), prompt, cwd, edits=edits)
+
+
+# A handoff starts a new session: `run` without `--session`, and every event carries the
+# `sessionID` it was given. Verified on 2.2.4: the transcript copy outside the project is
+# refused ("Permission denied: external_directory") until a rule allows that directory. With
+# the turn's empty configuration home opencode falls back to a default model that a workspace's
+# privacy settings may refuse, so a new session always names one, as a resumed turn names its
+# session's (session_model): the caller's, else the first of opencode's own recent models.
+
+def recent_model():
+    """"provider/model" the user last picked in opencode, or None."""
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "opencode" / "model.json"
+    try:
+        first = (json.loads(state.read_text(encoding="utf-8")).get("recent") or [None])[0]
+    except (OSError, ValueError, AttributeError):
+        return None
+    if isinstance(first, dict) and first.get("providerID") and first.get("modelID"):
+        return f"{first['providerID']}/{first['modelID']}"
+    return None
+
+
+def new_session_command(prompt, cwd, *, edits=False, mcp_tools=(), read_dirs=(), model=None):
+    """(TurnCommand, None) for a new session seeded with `prompt` (the id comes from the stream,
+    see session_id), or (None, None). Raises ValueError when no model can be named."""
+    if launcher() is None:
+        return None, None
+    model = model or recent_model()
+    if not model:
+        raise ValueError("no model for a new opencode session: pass --model provider/model "
+                         "(opencode's recent-models list is empty)")
+    return _command(["-m", model], prompt, cwd, edits=edits, read_dirs=read_dirs), None
+
+
+def session_id(line):
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    sid = d.get("sessionID") if isinstance(d, dict) else None
+    return sid if isinstance(sid, str) and sid else None
+
+
+def _command(session, prompt, cwd, *, edits, read_dirs=()):
     prefix = launcher()
     if prefix is None:
         return None
     if prompt.startswith("-"):
         prompt = " " + prompt
-    model = session_model(native_id, locator)
-    argv = (prefix + RUN_FLAGS + ["--session", native_id] + (["-m", model] if model else [])
-            + ([] if edits else ["--agent", "plan"]) + [prompt])
+    argv = prefix + RUN_FLAGS + session + ([] if edits else ["--agent", "plan"]) + [prompt]
     home = turn_config_home()
     env = {"XDG_CONFIG_HOME": home,                   # no global opencode.json, plugins, agents, commands
            "OPENCODE_DISABLE_CLAUDE_CODE": "1",       # nor ~/.claude and project .claude instructions
            "OPENCODE_CONFIG_PROJECT_DISABLE": "1",    # nor the project's opencode.json and .opencode directory
-           "OPENCODE_CONFIG_CONTENT": json.dumps({"permissions": _permission_rules(edits)})}
+           "OPENCODE_CONFIG_CONTENT": json.dumps({"permissions": _permission_rules(edits, read_dirs)})}
     return TurnCommand(argv=argv, cwd=cwd, env=env, unset=CONFIG_OVERRIDES, stdin=None, scratch=(home,))
 
 

@@ -19,7 +19,7 @@ import sqlite_vec
 from convo_index.config import EMBED_DIM
 from convo_index.model import TITLE_LIMIT, display_title, Conversation, KIND_TEXT
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def connect(path):
@@ -177,6 +177,17 @@ CREATE TABLE IF NOT EXISTS reference_decisions(
 
 -- v6: one vector per conversation (docs/design.md §8). vec0 needs integer rowids, hence the id map.
 CREATE TABLE IF NOT EXISTS conv_vec_ids(vid INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL UNIQUE);
+
+-- v8: handoffs between harnesses. The user's word like tag_decisions, so re-ingestion never
+-- touches it (conversations.parent_id is rewritten from the source on every ingest).
+CREATE TABLE IF NOT EXISTS conversation_links(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, -- creation order (ts has one-second resolution)
+    from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+    relation TEXT NOT NULL,               -- continued_from | review_of: from_id is the new conversation
+    ts TEXT,
+    UNIQUE(from_id, to_id)
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_links_to ON conversation_links(to_id);
 """
 
 
@@ -298,6 +309,8 @@ def _init_schema_locked(conn, db_path, dim=None):
         for cid, title in conn.execute(f"SELECT id, title FROM conversations WHERE length(title) > {TITLE_LIMIT} OR title LIKE '%' || char(10) || '%'").fetchall():
             conn.execute("UPDATE conversations SET title=? WHERE id=?", (display_title(title), cid))
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(7, ?)", (now,))
+    if 8 not in applied:
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(8, ?)", (now,))
     conn.commit()
 
 
@@ -672,11 +685,44 @@ def delete_conversation(conn, conversation_id):
                ON CONFLICT(conversation_id) DO UPDATE SET deleted=1""",
             (conversation_id,),
         )
+        if _table_exists(conn, "conversation_links"):
+            conn.execute("DELETE FROM conversation_links WHERE from_id=? OR to_id=?", (conversation_id, conversation_id))
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
     return archive_path
+
+
+LINK_RELATIONS = ("continued_from", "review_of")
+
+
+def add_link(conn, from_id, to_id, relation):
+    """Record that `from_id` (a new conversation in another harness) continues or reviews
+    `to_id`. The ids need not be indexed yet: a handoff knows the new session's id before
+    the first refresh has read it."""
+    if relation not in LINK_RELATIONS:
+        raise ValueError(f"relation must be one of {', '.join(LINK_RELATIONS)}, not {relation!r}")
+    if from_id == to_id:
+        raise ValueError("a conversation cannot link to itself")
+    conn.execute(
+        """INSERT INTO conversation_links(from_id, to_id, relation, ts) VALUES(?, ?, ?, ?)
+           ON CONFLICT(from_id, to_id) DO UPDATE SET relation=excluded.relation, ts=excluded.ts""",
+        (from_id, to_id, relation, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+    conn.commit()
+
+
+def links_for(conn, conversation_id):
+    """Both directions, oldest first: [{id, relation, direction}], where direction is "from"
+    when `conversation_id` is the new conversation and "to" when it is the original."""
+    if not _table_exists(conn, "conversation_links"):
+        return []
+    rows = conn.execute(
+        """SELECT to_id, relation, 'from', id FROM conversation_links WHERE from_id=?
+           UNION ALL
+           SELECT from_id, relation, 'to', id FROM conversation_links WHERE to_id=?
+           ORDER BY 4""", (conversation_id, conversation_id)).fetchall()
+    return [{"id": r[0], "relation": r[1], "direction": r[2]} for r in rows]
 
 
 def plan_messages(conn, conv: Conversation):

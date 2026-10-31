@@ -9,11 +9,13 @@
 #
 # PROBE_MCP_TOOLS="mcp__<server>__<tool> ..." allowlists tools of your user-scope MCP servers
 # for the Edit-mode run (pick read-only ones); without it Edit mode must load no MCP server.
+# PROBE_OPENCODE_MODEL=provider/model is the model a new opencode session runs (default: the
+# first of opencode's recent models), as `convo-index handoff --start` would pass it.
 set -u
 which="${1:-all}"
 opencode=$(command -v opencode || true)
 [ -n "$opencode" ] || [ ! -x "$HOME/.opencode/bin/opencode" ] || opencode="$HOME/.opencode/bin/opencode"
-root=$(mktemp -d)
+root=$(cd "$(mktemp -d)" && pwd -P)    # macOS: Claude records /private/var/..., not mktemp's /var/...
 proj="$root/proj"
 mkdir -p "$proj/.claude"
 cd "$proj"
@@ -240,5 +242,63 @@ PY
   codex delete --force "$ctid" > /dev/null 2>&1    # the thread must not be indexed
 elif [ "$which" = codex ] || [ "$which" = all ]; then
   echo "== codex not installed or its thread was not created; skipped"
+fi
+
+# A handoff's new session: same closing flags, a new id, and the transcript copy's directory as
+# the only readable place outside the project.
+mkdir -p "$root/handoff"
+printf 'HANDOFF-PROBE-LINE from the transcript copy\n' > "$root/handoff/transcript.md"
+new_prompt="Read the file $root/handoff/transcript.md and reply with exactly its first line. Then try to read /etc/hosts and say in one sentence whether that worked."
+# run_new <source> <out file>: the adapter's new-session command; prints the new native id
+run_new() {
+  python3 - "$1" "$new_prompt" "$2" "$proj" "$root/handoff" <<'PY'
+import subprocess, sys, os, shutil
+from convo_index.sources.base import new_session_command, session_id
+source, prompt, out, cwd, read_dir = sys.argv[1:]
+cmd, sid = new_session_command(source, prompt, cwd, read_dirs=(read_dir,), model=os.environ.get("PROBE_OPENCODE_MODEL") if source == "opencode" else None)
+env = {k: v for k, v in os.environ.items() if k not in cmd.unset}
+env.update(cmd.env)
+with open(out, "wb") as fh:
+    subprocess.run(cmd.argv, cwd=cmd.cwd, env=env, input=cmd.stdin.encode() if cmd.stdin is not None else None,
+                   stdin=None if cmd.stdin is not None else subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, timeout=600)
+for d in cmd.scratch:
+    shutil.rmtree(d, ignore_errors=True)
+for line in open(out, encoding="utf-8", errors="replace"):
+    sid = sid or session_id(source, line)
+print(sid or "")
+PY
+}
+if [ "$which" = claude ] || [ "$which" = all ]; then
+  echo "== claude, new session for a handoff"
+  nsid=$(run_new claude_code "$root/claude-new.jsonl")
+  python3 - "$root/claude-new.jsonl" "$nsid" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    try: d = json.loads(line)
+    except Exception: continue
+    if d.get("type") == "system" and d.get("subtype") == "init":
+        print("session:", d.get("session_id"), "(expect:", sys.argv[2] + ")", "| tools:", d.get("tools"))
+    if d.get("type") == "result": print("reply:", (d.get("result") or "")[:300].replace("\n", " "))
+PY
+  echo "(expect: the HANDOFF-PROBE-LINE, and /etc/hosts refused)"
+  rm -rf "$HOME/.claude/projects/$(echo "$proj" | tr '/.' '--')"
+fi
+if { [ "$which" = opencode ] || [ "$which" = all ]; } && [ -n "$opencode" ]; then
+  echo "== opencode, new session for a handoff"
+  onsid=$(run_new opencode "$root/opencode-new.jsonl")
+  python3 - "$root/opencode-new.jsonl" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    try: d = json.loads(line)
+    except Exception: continue
+    p = d.get("part", {})
+    if d.get("type") == "error": print("error:", str(d.get("error"))[:300])
+    if d.get("type") == "text": print("reply:", p.get("text", "")[:300].replace("\n", " "))
+    if p.get("type") == "tool":
+        st = p.get("state", {})
+        print("tool:", p.get("tool"), st.get("status"), "|", str(st.get("error") or "")[:120])
+PY
+  echo "session: $onsid  (expect: the HANDOFF-PROBE-LINE, and /etc/hosts refused with external_directory)"
+  [ -n "$onsid" ] && "$opencode" session delete "$onsid" > /dev/null
 fi
 rm -rf "$root"

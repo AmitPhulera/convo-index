@@ -217,13 +217,33 @@ the first agent's account. Both include where and when it happened, the reposito
 now (`git status`, diff stat, recent commits), problems found without an LLM (tool errors,
 interruptions, compactions, user messages that look like corrections), every user message
 verbatim, and the path of a full transcript the new session can read on demand (under
-`handoffs/` next to the database, readable only by you). Older assistant text is left out
+`handoffs/` next to the database, readable only by you, with credential-looking strings
+masked). Older assistant text is left out
 first when the prompt would pass ~100k tokens; user messages never are.
 
-Only the prompt goes to stdout. Its size, the known problems, and anything that looks like a
-credential (remove it before pasting into a tool from another provider) go to stderr. A
+Only the prompt goes to stdout. Its size, the known problems, anything in the prompt that
+looks like a credential (remove it before pasting into a tool from another provider) and how
+many were masked in the transcript go to stderr. A
 note that cannot be written (no backend, `hosted_processing` not `allow`, a timeout) leaves
 the prompt without one and says why; `--no-digest` skips it.
+
+`--start claude_code` or `--start opencode` runs the new session here instead of printing the
+prompt, with the same closed surface as a browser turn (read-only unless `--edit`, which a
+review ignores), and prints its replies, the new conversation's id and the command that
+resumes it in that tool. The two conversations are linked in the index as soon as the tool
+reports its session. It sends the conversation to that tool's provider, so it needs
+`[privacy].hosted_processing = allow`, like the handoff note; with `deny` or `ask` it is
+refused and the prompt can still be printed and pasted by hand. The new session may read the transcript copy's directory and nothing
+else outside the project. It is not started when the prompt holds what looks like a
+credential: print the prompt, remove it, and pass the result with `--prompt-file`, or pass
+`--ignore-secrets` to send the prompt as it is (the transcript copy stays masked). The model comes from `--model`, else `[handoff.models]`:
+
+    [handoff.models]
+    claude_code = ""                                  # "" = Claude Code's own default
+    opencode = "opencode-go/deepseek-v4.1-flash"      # "" = the first of opencode's recent models
+
+opencode needs one: in the turn's empty configuration home it falls back to a default model
+that a workspace's privacy settings may refuse.
 
 ## Daily refresh and the server from login
     convo-index schedule install            # LaunchAgent (macOS) or systemd user timer (Linux); crontab line elsewhere
