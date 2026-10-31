@@ -62,7 +62,7 @@ function updateFilterState() {
   if (projectFilter) active.unshift({ label: "Project " + shortPath(projectFilter), remove: () => { projectFilter = null; updateFilterState(); runSearch(); } });
   const box = $("active-filters");
   box.innerHTML = active.map((f, i) =>
-    `<button type="button" class="active-chip" data-i="${i}" aria-label="Remove filter ${escape(f.label)}">${escape(f.label)}${ICON.close}</button>`).join("");
+    `<button type="button" class="active-chip" data-i="${i}" aria-label="Remove filter ${escape(f.label)}" title="Remove this filter">${escape(f.label)}${ICON.close}</button>`).join("");
   box.querySelectorAll(".active-chip").forEach(b => b.addEventListener("click", () => active[Number(b.dataset.i)].remove()));
   $("filter-count").textContent = active.length ? String(active.length) : "";
   $("filters-toggle").classList.toggle("on", active.length > 0);
@@ -547,7 +547,7 @@ async function openDetail(id, cardEl) {
   ].join("");
   detail.className = open ? "details-open" : "";
   detail.innerHTML = `<div class="detail-bar">
-      <button class="btn ghost icon-only" id="detail-back" aria-label="Back to results">${ICON.back}</button>
+      <button class="btn ghost icon-only" id="detail-back" aria-label="Back to results" title="Back to the results (Esc)">${ICON.back}</button>
       <div class="detail-head">
         <h2 class="detail-title" title="${escape(c.title)}">${escape(c.title)}</h2>
         <div class="meta-line">${meta}${flags}</div>
@@ -569,7 +569,7 @@ async function openDetail(id, cardEl) {
         ${c.turns_supported ? composerHTML(c) : ""}
       </div>
       <aside class="details-panel" id="details-panel" aria-label="Conversation details">
-        <div class="panel-head"><h2>Details</h2><button class="btn ghost icon-only" id="details-close" type="button" aria-label="Close details">${ICON.close}</button></div>
+        <div class="panel-head"><h2>Details</h2><button class="btn ghost icon-only" id="details-close" type="button" aria-label="Close details" title="Close the details panel">${ICON.close}</button></div>
         ${section(`Continue in ${WINDOWS ? "PowerShell" : "the terminal"}`, resume ? `<div class="resume">
           <code class="resume-cmd" title="${escape(resume)}">${escape(resume)}</code>
           <button class="btn copy-btn" data-cmd="${escape(resume)}" onclick="copyCmd(this)">${ICON.copy}<span class="label">Copy</span></button>
