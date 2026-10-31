@@ -15,6 +15,11 @@ Envelopes verified on 2026-09-16:
       "output_tokens","reasoning_output_tokens"}}; LAST holds the final message text.
       Strict schemas need additionalProperties=false on every object.
 
+The prompt goes to Claude Code and Codex on stdin: as an argument it would hit the operating
+system's limit (128 KiB per argument on Linux, 32,767 characters for the whole command line on
+Windows) long before the model's. agy takes it only as an argument (`--print=` reads no stdin),
+so its prompt is bounded by `ARGV_PROMPT_CHARS` (see max_prompt_chars).
+
 The prompt is untrusted text (a transcript), so every call runs with the agent's tools,
 MCP servers and slash commands disabled and from the temp dir, where no project settings or
 instructions files are picked up. Claude Code is told not to persist the session and Codex
@@ -89,9 +94,8 @@ class ClaudeCLI:
                "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"]
         if req.schema is not None:
             cmd += ["--json-schema", json.dumps(req.schema)]
-        cmd.append(req.marker + req.prompt)
         try:
-            res = _run(cmd, req.timeout)
+            res = _run(cmd, req.timeout, stdin=req.marker + req.prompt)   # -p with no argument reads stdin
         except _Missing as e:
             return LLMResult(ok=False, error="config", detail=str(e), backend=self.name)
         if res is None or res.returncode != 0:
@@ -176,9 +180,8 @@ class CodexCLI:
                 with open(sp, "w", encoding="utf-8") as fh:
                     json.dump(strict_schema(req.schema), fh)
                 cmd += ["--output-schema", sp]
-            cmd.append(req.marker + req.prompt)
             try:
-                res = _run(cmd, req.timeout)
+                res = _run(cmd, req.timeout, stdin=req.marker + req.prompt)   # no PROMPT argument: read from stdin
             except _Missing as e:
                 return LLMResult(ok=False, error="config", detail=str(e), backend=self.name)
             if res is None or res.returncode != 0:
