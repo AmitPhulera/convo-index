@@ -16,7 +16,6 @@ from pathlib import Path
 
 from convo_index import export as X
 from convo_index.config import SUMMARY_PROMPT_PREFIX
-from convo_index import summarize as SUM
 from convo_index.indexer import cwd_excluded
 from convo_index.model import KIND_TEXT, KIND_TOOL_CALL, KIND_TOOL_RESULT
 from convo_index.providers import registry as R
@@ -70,6 +69,12 @@ HARNESS_NAMES = {"claude_code": "Claude Code", "opencode": "opencode", "codex": 
 
 PROBLEM_QUOTE = 300   # characters of a message quoted in the known-problems list
 DIGEST_TOOL_CALL = 200   # characters of each tool call the digest model sees
+
+# The digest's own window, much wider than the summary job's 9k + 5k: a session handed off
+# because it hit a limit is long, and its decisions sit in the middle. The end weighs more
+# (where the work stands). ~50k tokens, within any current summary model.
+DIGEST_HEAD_CHARS = 60_000
+DIGEST_TAIL_CHARS = 140_000
 
 
 def refusal(settings, h):
@@ -214,6 +219,14 @@ def _why(res, timeout):
     return _quote(first, 200)
 
 
+def _digest_transcript(convo):
+    """(transcript, cut): role-prefixed, the middle left out past the digest window."""
+    full = "\n\n".join(f"{m['role'].upper()}: {m['text']}" for m in convo)
+    if len(full) <= DIGEST_HEAD_CHARS + DIGEST_TAIL_CHARS:
+        return full, False
+    return full[:DIGEST_HEAD_CHARS] + "\n\n…[middle of the transcript left out]…\n\n" + full[-DIGEST_TAIL_CHARS:], True
+
+
 def digest(msgs, title="", settings=None, timeout=90):
     """(digest dict or None, status) from the configured summary backend. The status says why
     there is none, so the preview can explain it; the brief works without a digest."""
@@ -223,9 +236,11 @@ def digest(msgs, title="", settings=None, timeout=90):
              for m in msgs if (m.get("kind") or KIND_TEXT) in (KIND_TEXT, KIND_TOOL_CALL) and harness_label(m) is None]
     if not any((m.get("kind") or KIND_TEXT) == KIND_TEXT for m in convo):
         return None, "nothing to digest"
-    prompt = _DIGEST_PROMPT + f"Title: {title}\n\n" + SUM.build_transcript(convo, settings)
+    transcript, cut = _digest_transcript(convo)
+    prompt = _DIGEST_PROMPT + f"Title: {title}\n\n" + transcript
     for _ in range(2):   # a malformed answer is often a one-off; anything else is not retried
-        res = R.complete("summary", prompt, schema=DIGEST_SCHEMA, settings=settings, max_output_tokens=1500, timeout=timeout)
+        res = R.complete("summary", prompt, schema=DIGEST_SCHEMA, settings=settings, max_output_tokens=1500,
+                         max_input_chars=len(prompt), timeout=timeout)
         if res.ok or res.error != "malformed":
             break
     if not res.ok or not isinstance(res.data, dict):
@@ -235,6 +250,7 @@ def digest(msgs, title="", settings=None, timeout=90):
         d[k] = [str(x).strip() for x in (d[k] or []) if str(x).strip()]
     for k in ("goal", "state", "next_step"):
         d[k] = str(d[k] or "").strip()
+    d["cut"] = cut
     return d, "ok"
 
 
@@ -365,7 +381,9 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
         sections.append("## The repository now\n\n" + _repo(repo))
     if kind == "continue":
         if digest_result:
-            sections.append("## Handoff note (written by a model from the transcript)\n\n" + _digest_md(digest_result))
+            source = ("the first and last parts of the transcript; the middle was too long to include"
+                      if digest_result.get("cut") else "the transcript")
+            sections.append(f"## Handoff note (written by a model from {source})\n\n" + _digest_md(digest_result))
         else:
             sections.append("## Handoff note\n\nNone could be written" + (f" ({digest_status})" if digest_status else "")
                             + ". Work from the user's messages, the repository and the transcript file.")

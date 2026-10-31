@@ -211,3 +211,20 @@ def test_the_digest_session_is_not_indexed_as_a_conversation(fake_llm, llm_setti
     home = make_home(tmp_path, records=default_records(first=f.calls[0]["prompt"]))
     ad = ag.AntigravityAdapter(home)
     assert ad.load(next(iter(ad.discover()))) is None
+
+
+def test_the_digest_reads_the_middle_of_a_long_conversation(fake_llm, llm_settings, tmp_path):
+    msgs = [{"seq": i, "role": "user" if i % 2 == 0 else "assistant", "kind": "text", "text": f"m{i} " + "x" * 2000}
+            for i in range(60)]
+    msgs[30]["text"] = "MIDDLE-CONSTRAINT never touch the CLI flags " + "x" * 2000
+    f = fake_llm({"goal": "g"})
+    d, _ = H.digest(msgs, "T", llm_settings)
+    assert "MIDDLE-CONSTRAINT" in f.calls[0]["prompt"] and not d["cut"]
+    assert f.calls[0]["max_input_chars"] >= len(f.calls[0]["prompt"])   # not cut again by the registry
+    huge = [{"seq": i, "role": "user", "kind": "text", "text": "y" * 10_000} for i in range(30)]
+    fake_llm({"goal": "g"})
+    d, _ = H.digest(huge, "T", llm_settings)
+    assert d["cut"]
+    conn = _db(tmp_path)
+    p = H.build(conn, "claude_code:s1", "continue", digest_result=d, digest_status="ok")["prompt"]
+    assert "the middle was too long to include" in p
