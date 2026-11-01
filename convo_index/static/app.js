@@ -564,7 +564,7 @@ async function openDetail(id, cardEl) {
           ${viewBtn("all", "All", "Every message, with tool activity and thinking collapsed")}
         </div>` : ""}
         ${(c.handoff_targets || []).length ? `<button class="btn" id="handoff-toggle" type="button" aria-expanded="false" aria-controls="handoff-panel"
-          title="${turnToken ? "Continue this conversation in another tool, or ask one for a second opinion" : "To hand off from here, open the UI through the URL `convo-index serve` or `up` prints"}"${turnToken ? "" : " disabled"}>${ICON.handoff}<span class="label">Hand off</span></button>` : ""}
+          title="${turnToken ? "Continue this conversation in another tool, or ask one for a second opinion" : "To hand off from here, open the UI with `convo-index open`"}"${turnToken ? "" : " disabled"}>${ICON.handoff}<span class="label">Hand off</span></button>` : ""}
         <button class="btn" id="details-toggle" type="button" aria-expanded="${open}" aria-controls="details-panel" title="Summary, tags, references and how to resume">${ICON.panel}<span class="label">Details</span></button>
       </div>
     </div>
@@ -800,7 +800,7 @@ function composerHTML(c) {
   const tools = c.source === "claude_code" && turnToken;
   const send = /Mac/.test(navigator.platform) ? "⌘" : "Ctrl";
   const hint = turnToken ? `<span class="send-hint"><kbd>${send}</kbd><kbd>Enter</kbd> to send</span>`
-    : "To send messages here, open the UI through the URL <code>convo-index serve</code> or <code>up</code> prints.";
+    : "To send messages here, open the UI with <code>convo-index open</code>.";
   return `<div id="turn-live"></div>
     <div class="composer" id="composer">
       <div class="composer-box">
@@ -1480,7 +1480,7 @@ $("refresh").addEventListener("click", async () => {
   runSearch();
 });
 
-// The turn token arrives in the fragment of the URL `serve` and `up` print (#turns=<token>).
+// The turn token arrives in the fragment of the URL `open`, `serve` and `up` give (#turns=<token>).
 // It is kept for this tab (sessionStorage outlives a reload, never leaves the browser) and
 // taken out of the address bar before the fragment is read as a conversation id.
 let turnToken = null;
@@ -1495,13 +1495,13 @@ function takeTurnToken() {
   return true;
 }
 
-// Stopping the server takes the turn token too: a tab not opened through the printed URL
+// Stopping the server takes the turn token too: a tab not opened with the token URL
 // cannot stop it. Running turns end first; the page then says how to start it again.
 function updateStopButton() {
   const btn = $("stop-server");
   btn.disabled = !turnToken;
   btn.title = turnToken ? `Stop the convo-index server. Start it again with \`${START_CMD}\``
-    : "To stop the server here, open the UI through the URL `convo-index serve` or `up` prints (or run `convo-index stop`)";
+    : "To stop the server here, open the UI with `convo-index open` (or run `convo-index stop`)";
 }
 $("stop-server").addEventListener("click", async () => {
   if (!confirm(`Stop the convo-index server? Running browser turns end, and this page stops working until you start it again with \`${START_CMD}\`.`)) return;

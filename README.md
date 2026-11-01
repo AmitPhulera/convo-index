@@ -47,6 +47,7 @@ Hugging Face into `models/` next to the database, and nothing leaves the machine
     convo-index doctor  # what will be indexed, which backends will be called, what is failing
     convo-index index   # build/refresh convos.db (incremental)
     convo-index serve   # browse at http://127.0.0.1:9753
+    convo-index open    # open the running UI with its turn token (--print: just the URL)
     convo-index stop    # stop the running UI server (running browser turns end first)
     convo-index search "kubernetes crash" --source codex --since 30d   # from the terminal
     convo-index export <id> --md          # one conversation as Markdown (or JSON without --md)
@@ -188,7 +189,8 @@ Turns are accepted only on a loopback listener, from a loopback peer, when the b
 addresses the server by a loopback name, with no proxy header present, and with the server's
 turn token: a secret kept in `turn-token` next to the database (readable by you only; a
 restarted server keeps it, a file others can read gets a new one) and carried in the fragment of
-the URL that `convo-index serve` prints on a terminal and `up` prints and opens. The page moves
+the URL that `convo-index open` opens (`--print` prints it), `serve` prints on a terminal, and
+`up` prints and opens. When the login service started the server, `open` is the way in. The page moves
 it out of the address bar into the tab's session storage, so a reload keeps it; the login
 service's log never holds it. A page reached any other way, a reverse proxy on this machine, or a
 client that only has what the HTTP API serves cannot run turns; everything else keeps
@@ -266,10 +268,11 @@ that a workspace's privacy settings may refuse.
 
 `convo-index stop`, or the power button in the UI's header, stops the running server without
 uninstalling the service: running browser turns end, the server exits cleanly, and the service
-(which restarts it only after a crash) starts it again at the next login; `convo-index serve`
-or `up` start it sooner. Both go through `POST /api/shutdown`, which needs the turn token, a
+(which restarts it only after a crash) starts it again at the next login; `convo-index service
+install` starts it sooner (`convo-index serve` without the service). Both go through `POST /api/shutdown`, which needs the turn token, a
 request from this machine and no proxy in between; the button is disabled in a tab that was
-not opened through the URL `serve` or `up` prints. `service uninstall` keeps it off for good.
+not opened with `convo-index open` (or the URL `serve` or `up` prints). `service uninstall` keeps
+it off for good.
 
 Time comes from `[schedule] hour/minute` in the config (default 21:00 local); the log is
 `refresh.log` next to the database. The job runs `convo-index index`, which is incremental and

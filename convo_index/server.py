@@ -423,7 +423,7 @@ def token_refusal(headers, qs=None):
     header; the event stream may send it as ?token= because EventSource cannot set headers."""
     given = (headers or {}).get(TURN_TOKEN_HEADER) or ((qs or {}).get("token") or [None])[0]
     if not given or not secrets.compare_digest(given, turn_token()):
-        return "missing or wrong turn token; open the UI through the URL that `convo-index serve` or `up` prints"
+        return "missing or wrong turn token; open the UI with `convo-index open`"
     return None
 
 
