@@ -17,7 +17,7 @@ jobs:
     name: lint and static checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
       - name: ruff
         run: uvx ruff check .
@@ -39,7 +39,7 @@ jobs:
       HF_HUB_OFFLINE: "1"          # the suite must never download the embedding model
       UV_PYTHON_PREFERENCE: only-managed   # runner Pythons may lack sqlite loadable-extension support
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python }}
@@ -50,7 +50,7 @@ jobs:
     name: dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
       - run: uv export --frozen --no-dev --no-emit-project -o requirements.txt
       - run: uvx pip-audit --strict -r requirements.txt
@@ -59,7 +59,7 @@ jobs:
     name: build and install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
       - run: uv build
       - run: uvx twine check dist/*
