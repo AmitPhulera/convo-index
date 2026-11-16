@@ -1,0 +1,67 @@
+name: Deploy playground
+
+# The public playground at convo-index.amitphulera.in. A copy of AmitPhulera/infra's
+# build-and-deploy workflow: that repo is private, and a public repo cannot call a private
+# repo's reusable workflow. The ssh payload must stay byte-for-byte (modulo whitespace) what the
+# server's forced-command validator, infra/scripts/ci-deploy.sh, accepts.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-push:
+    # only a green CI run of a push to main deploys
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/amitphulera/convo-index:latest
+            ghcr.io/amitphulera/convo-index:${{ github.event.workflow_run.head_sha }}
+
+  deploy:
+    needs: build-push
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-convo-index
+      cancel-in-progress: false
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.SERVER_IP }}" >> ~/.ssh/known_hosts
+      - name: Pull and restart app
+        run: |
+          ssh deploy@${{ secrets.SERVER_IP }} '
+            set -e
+            cd /srv/infra/apps/convo-index
+            test -f compose.yml || { echo "ERROR: /srv/infra/apps/convo-index/compose.yml does not exist — app not onboarded in infra repo yet"; exit 1; }
+            [ -r .env ] || { echo "ERROR: /srv/infra/apps/convo-index/.env missing or unreadable — aborting to avoid clobbering secrets" >&2; exit 1; }
+            { grep -v "^IMAGE_TAG=" .env 2>/dev/null || true; echo "IMAGE_TAG=${{ github.event.workflow_run.head_sha }}"; } > .env.tmp
+            mv .env.tmp .env
+            chmod 600 .env
+            docker compose -f compose.yml pull
+            docker compose -f compose.yml up -d --wait
+            docker compose -f compose.yml ps
+          '

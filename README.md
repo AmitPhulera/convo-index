@@ -8,6 +8,9 @@ whichever LLM CLI you already have, related work by ticket/PR/branch, token usag
 API-equivalent cost estimates, and an MCP server so your agents can search the archive.
 Design: `docs/design.md`.
 
+**Try it:** https://convo-index.amitphulera.in is a read-only playground with fictional
+conversations from all five tools; nothing in it is real.
+
 ## Install
 
     curl -fsSL https://raw.githubusercontent.com/AmitPhulera/convo-index/main/install.sh | sh
@@ -349,3 +352,9 @@ recorded the repository. The detail pane's **Related work** lists every other co
 a linkable key, grouped by key, across tools, without transitive merging; `convo-index related
 <key>` prints the timeline for a ticket, PR or branch. `default_branches` and `github_hosts` are
 configurable.
+
+## The playground
+`demo/` holds the playground's fictional conversations and its config; `scripts/make_demo_data.py --out DIR`
+writes them in each tool's native format (`scripts/demo_writers.py`), indexes them with the real
+`convo-index index`, adds their summaries and bakes a read-only database plus runtime config into DIR.
+The `Dockerfile` builds the playground image; `.github/workflows/deploy.yml` deploys it after CI passes on main.

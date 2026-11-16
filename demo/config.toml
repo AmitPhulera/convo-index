@@ -1,0 +1,56 @@
+# Settings the playground's database is built with (scripts/make_demo_data.py). The build writes
+# the runtime config from this file, adding [paths] and [embeddings].cache_dir.
+
+[server]
+host = "0.0.0.0"
+port = 9753
+allowed_hosts = ["convo-index.amitphulera.in"]
+demo = true
+
+[ui.turns]
+enabled = false
+
+[privacy]
+hosted_processing = "deny"          # nothing in the build or the playground calls a hosted model
+
+[category]
+labels = ["work", "personal"]
+hints = { work = ["/work/"], personal = ["/code/"] }
+
+[references]
+ticket_url = "https://tracker.acme-labs.example/browse/{key}"
+
+[[tag_groups]]
+name = "topic"
+exclusive = false
+description = "what the conversation is about"
+
+[[tags]]
+name = "bug"
+group = "topic"
+description = "fixing something broken"
+rules = { branch_prefix = ["fix/"], regex = ["fails|flaky|leak|deadlock|off by|error|wrong"] }
+
+[[tags]]
+name = "performance"
+group = "topic"
+description = "making something faster or cheaper"
+rules = { branch_prefix = ["perf/"], regex = ["slow|faster|speed up|bill|cost"] }
+
+[[tags]]
+name = "infra"
+group = "topic"
+description = "servers, deploys, CI"
+rules = { path_contains = ["infra-playbooks"], branch_prefix = ["ci/"], regex = ["terraform|ansible|github actions|release"] }
+
+[[tags]]
+name = "review"
+group = "topic"
+description = "reviewing someone's PR"
+rules = { regex = ["^review\\b"] }
+
+[[tags]]
+name = "design"
+group = "topic"
+description = "deciding how to build something before building it"
+rules = { regex = ["\\bdesign\\b|how should i model|explain|options"] }
