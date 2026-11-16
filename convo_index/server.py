@@ -1030,6 +1030,8 @@ def prepare(cfg=None):
     vector dimension. Returns the database path."""
     cfg = cfg or CFG.load()
     path = Path(_db())
+    if cfg.demo():
+        return _prepare_demo(path)
     conn = dbm.connect(path)
     try:
         dbm.init_schema(conn, path, dim=cfg["embeddings"].get("dim"))
@@ -1066,6 +1068,25 @@ def advertised_url(bind_host, port, token=None):
     elif ":" in bind_host:
         bind_host = f"[{bind_host}]"
     return f"http://{bind_host}:{port}" + (f"#turns={token}" if token else "")
+
+
+def _prepare_demo(path):
+    """The playground serves a baked database as is: every connection is read-only and an
+    out-of-date schema is an error, never a migration (there is nowhere to write one)."""
+    wal = path.with_name(path.name + "-wal")
+    if wal.exists() and wal.stat().st_size:
+        # an immutable connection reads only the main file: whatever the WAL holds would be
+        # silently missing (stale rows, or tables that "do not exist")
+        raise SystemExit(f"demo database {path} has un-checkpointed changes in {wal.name}; checkpoint it first "
+                         "(PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE)")
+    dbm.set_read_only(True)
+    conn = dbm.connect(path)
+    try:
+        if not dbm._is_current(conn):
+            raise SystemExit(f"demo database {path} is not at schema version {dbm.SCHEMA_VERSION}; rebuild it")
+    finally:
+        conn.close()
+    return path
 
 
 def main():
