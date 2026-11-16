@@ -804,6 +804,19 @@ def request_error(method, headers, allowed):
     return None
 
 
+DEMO_REFUSAL = "disabled in the playground"
+
+
+def demo_refusal(method, path):
+    """Why the playground refuses this request, or None. Every POST/DELETE writes or runs
+    something, and the turn GETs only exist to follow a turn; reads pass."""
+    if not CFG.load().demo():
+        return None
+    if method not in ("GET", "HEAD") or path.startswith("/api/turn/") or path == "/api/turns/tools":
+        return DEMO_REFUSAL
+    return None
+
+
 def _segment(path, prefix):
     """Path segment after `prefix`, URL-decoded (ids contain ':' which clients encode)."""
     return unquote(path[len(prefix):])
@@ -811,7 +824,8 @@ def _segment(path, prefix):
 
 class Handler(BaseHTTPRequestHandler):
     def _refused(self):
-        err = request_error(self.command, self.headers, self.server.allowed)
+        err = (request_error(self.command, self.headers, self.server.allowed)
+               or demo_refusal(self.command, urlparse(self.path).path))
         if err:
             self._send(403, json.dumps({"error": err}))
         return err is not None

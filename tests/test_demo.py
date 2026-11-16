@@ -53,6 +53,36 @@ def test_demo_flag_env_overrides_config(tmp_path, monkeypatch):
     assert make_settings(tmp_path).demo()
 
 
+@pytest.mark.parametrize("method,path", [
+    ("POST", "/api/refresh"),
+    ("POST", "/api/shutdown"),
+    ("POST", "/api/hide/claude_code:s1?hidden=1"),
+    ("POST", "/api/delete/claude_code:s1"),
+    ("POST", "/api/tag/claude_code:s1"),
+    ("POST", "/api/reference/claude_code:s1"),
+    ("POST", "/api/conversation/claude_code:s1/turn"),
+    ("POST", "/api/conversation/claude_code:s1/handoff"),
+    ("POST", "/api/handoff/start"),
+    ("POST", "/api/turns/tools"),
+    ("POST", "/api/some-endpoint-added-later"),
+    ("DELETE", "/api/turn/abc"),
+])
+def test_every_write_is_refused(demo, method, path):
+    srv, db = demo
+    before = db.stat().st_mtime_ns
+    status, body = _post(srv, path, method)
+    assert status == 403 and json.loads(body)["error"] == server.DEMO_REFUSAL
+    assert db.stat().st_mtime_ns == before
+    assert server.handle_conversation("claude_code:s1") is not None
+
+
+@pytest.mark.parametrize("path", ["/api/turn/abc", "/api/turns/tools"])
+def test_turn_reads_are_refused(demo, path):
+    srv, _ = demo
+    status, _ = _request(srv, "GET", path)
+    assert status == 403
+
+
 def test_connections_are_read_only(demo):
     _, db = demo
     conn = dbm.connect(db)
