@@ -18,6 +18,17 @@ function apiPost(url, body) {
   return fetch(url, init);
 }
 
+// The public playground (/api/config "demo"): the server only reads, so the controls that
+// write or run something are hidden (CSS, body.demo) and the top bar says what this is.
+function applyDemo(cfg) {
+  if (!cfg || !cfg.demo || document.body.classList.contains("demo")) return;
+  document.body.classList.add("demo");
+  const spacer = document.querySelector(".topbar .spacer");
+  if (spacer) spacer.insertAdjacentHTML("afterend",
+    `<a class="demo-pill" href="https://github.com/AmitPhulera/convo-index#install" target="_blank" rel="noopener"
+      title="Fictional conversations, read-only. Install convo-index to index your own.">Playground<span class="label"> · fictional data · install</span></a>`);
+}
+
 // ~ for the home directory so long project paths stay readable.
 function shortPath(p) {
   return (p || "").replace(/^\/(Users|home)\/[^/]+/, "~");

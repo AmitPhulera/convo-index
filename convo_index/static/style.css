@@ -522,6 +522,15 @@ a.bar-label:hover { text-decoration: underline; }
 /* ---------------------------------------------------------------------------
    Medium screens: the details panel becomes a drawer over the transcript
    --------------------------------------------------------------------------- */
+/* The public playground: a read-only server, so nothing that writes or runs is offered. */
+body.demo :is(#refresh, #stop-server, #handoff-toggle, .detail-actions, .tag-edit, .ref-toggle) { display: none !important; }
+.demo-pill {
+  flex: none; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; text-decoration: none;
+  color: var(--warn); background: var(--warn-soft); border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
+}
+.demo-pill:hover { text-decoration: underline; }
+@media (max-width: 640px) { .demo-pill .label { display: none; } }
+
 @media (max-width: 1200px) {
   #detail.details-open .detail-grid { grid-template-columns: minmax(0, 1fr); }
   #detail.details-open .details-panel {
