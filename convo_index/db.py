@@ -22,8 +22,27 @@ from convo_index.model import TITLE_LIMIT, display_title, Conversation, KIND_TEX
 SCHEMA_VERSION = 8
 
 
+_read_only = False   # the playground: see set_read_only()
+
+
+def set_read_only(on=True):
+    """Open every later connection immutable and read-only (the public playground). No
+    directory is created and no journal mode is switched, so it works on a read-only file
+    system; the database must be a checkpointed, non-WAL file."""
+    global _read_only
+    _read_only = bool(on)
+
+
 def connect(path):
     path = Path(path)
+    if _read_only and str(path) != ":memory:":
+        if not path.exists():
+            raise FileNotFoundError(f"read-only mode: no database at {path}")
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        return conn
     if str(path) != ":memory:":
         path.parent.mkdir(parents=True, exist_ok=True)  # fresh installs: ~/.local/share/convo-index
     conn = sqlite3.connect(str(path))
