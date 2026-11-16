@@ -100,6 +100,8 @@ first one found for classification and summaries; an explicit `[llm]` entry alwa
     allowed_hosts = []                    # extra Host names, e.g. ["mybox.lan"] when binding 0.0.0.0
                                           # or behind a proxy; a bare name matches any port, "mybox.lan:8080"
                                           # only that one (localhost / 127.0.0.1 always match)
+    demo = false                          # public playground: the database opens read-only and
+                                          # every POST/DELETE is refused (CONVO_INDEX_DEMO=1 overrides)
 
 Summaries are derived jobs: a failed provider call is retried on later runs (up to
 `[summary].max_attempts`) without the conversation changing. Changing the embedding model
