@@ -8,6 +8,9 @@ whichever LLM CLI you already have, related work by ticket/PR/branch, token usag
 API-equivalent cost estimates, and an MCP server so your agents can search the archive.
 Design: `docs/design.md`.
 
+**Try it:** https://convo-index.amitphulera.in is a read-only playground with fictional
+conversations from all five tools; nothing in it is real.
+
 ## Install
 
     curl -fsSL https://raw.githubusercontent.com/AmitPhulera/convo-index/main/install.sh | sh
