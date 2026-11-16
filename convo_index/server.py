@@ -1122,12 +1122,15 @@ def main():
         # so a service manager does not restart this one in a loop
         print(f"{advertised_url(host, port)} is already served by another process; nothing to do")
         return 0
-    adopt_turn_token(cfg)                     # the same secret across restarts
-    token_file = write_turn_token(cfg)        # only once the port is ours: a stepped-aside serve must not replace it
-    if sys.stdout.isatty():                   # a person at a terminal gets the one-click URL; a service log never holds the secret
-        print(f"serving on {advertised_url(host, srv.server_address[1], turn_token())}")
+    if cfg.demo():                            # nothing to continue, and no file system to keep a token on
+        print(f"serving the playground (read-only) on {advertised_url(host, srv.server_address[1])}")
     else:
-        print(f"serving on {advertised_url(host, srv.server_address[1])} (turn token in {token_file})")
+        adopt_turn_token(cfg)                 # the same secret across restarts
+        token_file = write_turn_token(cfg)    # only once the port is ours: a stepped-aside serve must not replace it
+        if sys.stdout.isatty():               # a person at a terminal gets the one-click URL; a service log never holds the secret
+            print(f"serving on {advertised_url(host, srv.server_address[1], turn_token())}")
+        else:
+            print(f"serving on {advertised_url(host, srv.server_address[1])} (turn token in {token_file})")
 
     def _terminate(signum, frame):        # SIGTERM from a service manager ends the loop like Ctrl-C does
         raise KeyboardInterrupt

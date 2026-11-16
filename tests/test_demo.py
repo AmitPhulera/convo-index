@@ -122,6 +122,23 @@ def test_demo_prepare_refuses_an_old_schema(tmp_path, monkeypatch):
     assert db.stat().st_size == 0                    # nothing was migrated into it
 
 
+def test_demo_main_writes_no_turn_token(tmp_path, monkeypatch, capsys):
+    st = make_settings(tmp_path, server={"port": 0})
+    monkeypatch.setattr(server.CFG, "load", lambda *a, **k: st)
+    monkeypatch.setenv("CONVO_INDEX_DEMO", "1")
+    monkeypatch.setattr(server, "prepare", lambda c: None)
+    monkeypatch.setattr(server, "write_turn_token", lambda *a: pytest.fail("demo wrote a turn token"))
+    monkeypatch.setattr(server, "adopt_turn_token", lambda *a: pytest.fail("demo read a turn token"))
+
+    class Srv:
+        server_address = ("127.0.0.1", 1)
+        def serve_forever(self): raise KeyboardInterrupt
+        def server_close(self): pass
+    monkeypatch.setattr(server, "make_server", lambda *a, **k: Srv())
+    assert server.main() == 0
+    assert "playground" in capsys.readouterr().out
+
+
 def test_demo_prepare_refuses_a_database_with_wal_content(tmp_path, monkeypatch):
     """immutable=1 reads only the main file, so un-checkpointed WAL pages would silently vanish."""
     db = tmp_path / "t.db"
