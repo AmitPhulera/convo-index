@@ -83,6 +83,22 @@ def test_turn_reads_are_refused(demo, path):
     assert status == 403
 
 
+def test_reads_work_and_report_demo(demo):
+    srv, db = demo
+    before = db.stat().st_mtime_ns
+    status, body = _request(srv, "GET", "/api/search?q=kubernetes&mode=keyword")
+    assert status == 200 and json.loads(body)[0]["id"] == "claude_code:s1"
+    status, body = _request(srv, "GET", "/api/config")
+    assert status == 200 and json.loads(body)["demo"] is True
+    status, body = _request(srv, "GET", "/api/conversation/claude_code:s1")
+    conv = json.loads(body)
+    assert status == 200 and conv["turns_supported"] is False and conv["handoff_targets"] == []
+    for path in ("/", "/analytics", "/api/analytics", "/api/sources", "/api/suggestions", "/api/related/SAAS-1"):
+        assert _request(srv, "GET", path)[0] == 200, path
+    assert db.stat().st_mtime_ns == before
+    assert not db.with_name(db.name + "-wal").exists()
+
+
 def test_connections_are_read_only(demo):
     _, db = demo
     conn = dbm.connect(db)

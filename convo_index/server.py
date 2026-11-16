@@ -130,7 +130,8 @@ def handle_config():
                        "config_path": str(cfg.path) if cfg.path else None,
                        "windows": os.name == "nt",
                        "start_command": start_command(),
-                       "semantic_search": ok, "semantic_reason": reason})
+                       "semantic_search": ok, "semantic_reason": reason,
+                       "demo": cfg.demo()})
 
 
 def handle_suggestions():
@@ -237,6 +238,11 @@ def handle_delete(conversation_id):
     return json.dumps({"ok": True, "id": conversation_id})
 
 
+def _turns_enabled():
+    cfg = CFG.load()
+    return bool(cfg["ui"]["turns"].get("enabled", True)) and not cfg.demo()
+
+
 def handle_conversation(conversation_id):
     conn = dbm.connect(_db())
     try:
@@ -272,13 +278,13 @@ def handle_conversation(conversation_id):
         "models": json.loads(head[12] or "[]"), "warnings": json.loads(head[13] or "[]"),
         "metadata": json.loads(head[14] or "{}"), "children": children,
         "resume_cmd": resume_command(conversation_id, head[3]),
-        "turns_supported": (bool(CFG.load()["ui"]["turns"].get("enabled", True)) and supports_turns(conversation_id)
+        "turns_supported": (_turns_enabled() and supports_turns(conversation_id)
                             and turn_launcher(conversation_id) is not None),
         "active_turn": (lambda t: t.snapshot() if t else None)(_runner().active(conversation_id)),
         "edit_mcp_tools": len(TT.load()) if head[7] == "claude_code" else 0,   # how many the Tools button shows
         "hidden": hidden, "summary": summary, "tags": tag_detail, "usage": usage,
         "references": refs, "related": related, "links": links,
-        "handoff_targets": handoff_targets() if CFG.load()["ui"]["turns"].get("enabled", True) else [],
+        "handoff_targets": handoff_targets() if _turns_enabled() else [],
         "active_handoff": active_handoff(conversation_id),
         "messages": [{"role": m[0], "kind": m[1] or "text", "ts": m[2], "text": m[3]} for m in msgs],
     })
