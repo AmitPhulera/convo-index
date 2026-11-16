@@ -357,5 +357,4 @@ configurable.
 `demo/` holds the playground's fictional conversations and its config; `scripts/make_demo_data.py --out DIR`
 writes them in each tool's native format (`scripts/demo_writers.py`), indexes them with the real
 `convo-index index`, adds their summaries and bakes a read-only database plus runtime config into DIR.
-The `Dockerfile` builds the playground image, and CI deploys it from main through the shared workflow
-in AmitPhulera/infra.
+The `Dockerfile` builds the playground image; `.github/workflows/deploy.yml` deploys it after CI passes on main.
