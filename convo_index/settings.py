@@ -5,7 +5,9 @@ writes a starter file after probing the machine. Sections:
 
   [paths]        db, archive
   [server]       host, port, allowed_hosts (extra Host names, e.g. a LAN name when bound to 0.0.0.0;
-                 a bare name matches any port, "name:port" only that one; loopback always matches)
+                 a bare name matches any port, "name:port" only that one; loopback always matches),
+                 demo (public playground: read-only database, every POST/DELETE refused;
+                 CONVO_INDEX_DEMO=1 overrides)
   [sources.*]    enabled, exclude_cwd (project paths or globs)
   [llm]          classify / summary = { backend, model, base_url?, api_key_env? }
   [embeddings]   backend (fastembed | openai_compat), model, cache_dir?, base_url?, api_key_env?, dim, max_chars
@@ -133,6 +135,14 @@ class Settings(dict):
 
     def archive_dir(self):
         return Path(os.environ.get("CONVO_INDEX_ARCHIVE", self["paths"]["archive"])).expanduser()
+
+    def demo(self):
+        """Playground mode: the server only reads. CONVO_INDEX_DEMO wins over `[server] demo`
+        and is read on every call, so it never goes stale in the settings cache."""
+        env = os.environ.get("CONVO_INDEX_DEMO")
+        if env is not None:
+            return env.strip().lower() not in ("", "0", "false", "no", "n", "off")
+        return bool(self["server"].get("demo"))
 
     def llm_job(self, job):
         """Backend/model for a job, falling back to the backend's default model."""

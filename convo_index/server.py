@@ -130,7 +130,8 @@ def handle_config():
                        "config_path": str(cfg.path) if cfg.path else None,
                        "windows": os.name == "nt",
                        "start_command": start_command(),
-                       "semantic_search": ok, "semantic_reason": reason})
+                       "semantic_search": ok, "semantic_reason": reason,
+                       "demo": cfg.demo()})
 
 
 def handle_suggestions():
@@ -237,6 +238,11 @@ def handle_delete(conversation_id):
     return json.dumps({"ok": True, "id": conversation_id})
 
 
+def _turns_enabled():
+    cfg = CFG.load()
+    return bool(cfg["ui"]["turns"].get("enabled", True)) and not cfg.demo()
+
+
 def handle_conversation(conversation_id):
     conn = dbm.connect(_db())
     try:
@@ -272,13 +278,13 @@ def handle_conversation(conversation_id):
         "models": json.loads(head[12] or "[]"), "warnings": json.loads(head[13] or "[]"),
         "metadata": json.loads(head[14] or "{}"), "children": children,
         "resume_cmd": resume_command(conversation_id, head[3]),
-        "turns_supported": (bool(CFG.load()["ui"]["turns"].get("enabled", True)) and supports_turns(conversation_id)
+        "turns_supported": (_turns_enabled() and supports_turns(conversation_id)
                             and turn_launcher(conversation_id) is not None),
         "active_turn": (lambda t: t.snapshot() if t else None)(_runner().active(conversation_id)),
         "edit_mcp_tools": len(TT.load()) if head[7] == "claude_code" else 0,   # how many the Tools button shows
         "hidden": hidden, "summary": summary, "tags": tag_detail, "usage": usage,
         "references": refs, "related": related, "links": links,
-        "handoff_targets": handoff_targets() if CFG.load()["ui"]["turns"].get("enabled", True) else [],
+        "handoff_targets": handoff_targets() if _turns_enabled() else [],
         "active_handoff": active_handoff(conversation_id),
         "messages": [{"role": m[0], "kind": m[1] or "text", "ts": m[2], "text": m[3]} for m in msgs],
     })
@@ -804,6 +810,19 @@ def request_error(method, headers, allowed):
     return None
 
 
+DEMO_REFUSAL = "disabled in the playground"
+
+
+def demo_refusal(method, path):
+    """Why the playground refuses this request, or None. Every POST/DELETE writes or runs
+    something, and the turn GETs only exist to follow a turn; reads pass."""
+    if not CFG.load().demo():
+        return None
+    if method not in ("GET", "HEAD") or path.startswith("/api/turn/") or path == "/api/turns/tools":
+        return DEMO_REFUSAL
+    return None
+
+
 def _segment(path, prefix):
     """Path segment after `prefix`, URL-decoded (ids contain ':' which clients encode)."""
     return unquote(path[len(prefix):])
@@ -811,7 +830,8 @@ def _segment(path, prefix):
 
 class Handler(BaseHTTPRequestHandler):
     def _refused(self):
-        err = request_error(self.command, self.headers, self.server.allowed)
+        err = (request_error(self.command, self.headers, self.server.allowed)
+               or demo_refusal(self.command, urlparse(self.path).path))
         if err:
             self._send(403, json.dumps({"error": err}))
         return err is not None
@@ -1030,6 +1050,8 @@ def prepare(cfg=None):
     vector dimension. Returns the database path."""
     cfg = cfg or CFG.load()
     path = Path(_db())
+    if cfg.demo():
+        return _prepare_demo(path)
     conn = dbm.connect(path)
     try:
         dbm.init_schema(conn, path, dim=cfg["embeddings"].get("dim"))
@@ -1068,6 +1090,25 @@ def advertised_url(bind_host, port, token=None):
     return f"http://{bind_host}:{port}" + (f"#turns={token}" if token else "")
 
 
+def _prepare_demo(path):
+    """The playground serves a baked database as is: every connection is read-only and an
+    out-of-date schema is an error, never a migration (there is nowhere to write one)."""
+    wal = path.with_name(path.name + "-wal")
+    if wal.exists() and wal.stat().st_size:
+        # an immutable connection reads only the main file: whatever the WAL holds would be
+        # silently missing (stale rows, or tables that "do not exist")
+        raise SystemExit(f"demo database {path} has un-checkpointed changes in {wal.name}; checkpoint it first "
+                         "(PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE)")
+    dbm.set_read_only(True)
+    conn = dbm.connect(path)
+    try:
+        if not dbm._is_current(conn):
+            raise SystemExit(f"demo database {path} is not at schema version {dbm.SCHEMA_VERSION}; rebuild it")
+    finally:
+        conn.close()
+    return path
+
+
 def main():
     cfg = CFG.load()
     prepare(cfg)
@@ -1081,12 +1122,15 @@ def main():
         # so a service manager does not restart this one in a loop
         print(f"{advertised_url(host, port)} is already served by another process; nothing to do")
         return 0
-    adopt_turn_token(cfg)                     # the same secret across restarts
-    token_file = write_turn_token(cfg)        # only once the port is ours: a stepped-aside serve must not replace it
-    if sys.stdout.isatty():                   # a person at a terminal gets the one-click URL; a service log never holds the secret
-        print(f"serving on {advertised_url(host, srv.server_address[1], turn_token())}")
+    if cfg.demo():                            # nothing to continue, and no file system to keep a token on
+        print(f"serving the playground (read-only) on {advertised_url(host, srv.server_address[1])}")
     else:
-        print(f"serving on {advertised_url(host, srv.server_address[1])} (turn token in {token_file})")
+        adopt_turn_token(cfg)                 # the same secret across restarts
+        token_file = write_turn_token(cfg)    # only once the port is ours: a stepped-aside serve must not replace it
+        if sys.stdout.isatty():               # a person at a terminal gets the one-click URL; a service log never holds the secret
+            print(f"serving on {advertised_url(host, srv.server_address[1], turn_token())}")
+        else:
+            print(f"serving on {advertised_url(host, srv.server_address[1])} (turn token in {token_file})")
 
     def _terminate(signum, frame):        # SIGTERM from a service manager ends the loop like Ctrl-C does
         raise KeyboardInterrupt

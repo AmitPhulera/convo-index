@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 
 import duckdb
 
@@ -79,9 +81,38 @@ def usage(con, pricing):
             "note": "API-equivalent estimate from list prices; a conversation linked to two keys counts in both."}
 
 
+DUCKDB_EXTENSIONS_ENV = "CONVO_INDEX_DUCKDB_EXTENSIONS"
+
+
+def install_duckdb_extensions(directory):
+    """Install the sqlite extension into `directory` (the playground image bakes one, see
+    DUCKDB_EXTENSIONS_ENV). Extensions are tied to the exact DuckDB version: run it with the
+    DuckDB the server will use."""
+    con = duckdb.connect(config={"extension_directory": str(directory)})
+    try:
+        con.execute("INSTALL sqlite;")
+    finally:
+        con.close()
+
+
+def _duckdb():
+    """An in-memory DuckDB with the sqlite extension loaded. Normally it is installed on first
+    use into ~/.duckdb; with CONVO_INDEX_DUCKDB_EXTENSIONS it is only loaded from that
+    pre-installed directory and nothing is written to the home directory, so a read-only
+    container (the playground) works offline."""
+    ext = os.environ.get(DUCKDB_EXTENSIONS_ENV)
+    if not ext:
+        con = duckdb.connect()
+        con.execute("INSTALL sqlite; LOAD sqlite;")
+        return con
+    con = duckdb.connect(config={"extension_directory": ext, "temp_directory": tempfile.gettempdir(),
+                                 "autoinstall_known_extensions": False, "autoload_known_extensions": False})
+    con.execute("LOAD sqlite;")
+    return con
+
+
 def analytics(db_path, settings=None):
-    con = duckdb.connect()
-    con.execute("INSTALL sqlite; LOAD sqlite;")
+    con = _duckdb()
     con.execute(f"ATTACH '{str(db_path).replace(chr(39), chr(39) * 2)}' AS c (TYPE sqlite, READ_ONLY);")
 
     # Hidden and deleted conversations are out of every number here, as they are in search.

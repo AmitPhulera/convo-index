@@ -293,7 +293,7 @@ def test_the_turn_token_is_required_and_never_served(site):
 
 
 def test_main_writes_the_token_after_binding_and_prints_it_only_to_a_terminal(tmp_path, monkeypatch, capsys):
-    cfg = {"server": {"host": "127.0.0.1", "port": 0, "allowed_hosts": []}, "embeddings": {"dim": 8}}
+    cfg = server.CFG.Settings({"server": {"host": "127.0.0.1", "port": 0, "allowed_hosts": []}, "embeddings": {"dim": 8}})
     monkeypatch.setattr(server.CFG, "load", lambda *a, **k: cfg)
     monkeypatch.setattr(server, "prepare", lambda c: None)
     token_file = tmp_path / "turn-token"

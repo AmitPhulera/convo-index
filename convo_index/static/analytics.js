@@ -103,6 +103,7 @@ function projLabel(p) {
 
 async function load() {
   wireTabs();
+  fetch("/api/config").then(r => r.ok ? r.json() : null).then(applyDemo).catch(() => {});
   let d;
   try { d = await (await fetch("/api/analytics")).json(); }
   catch (e) { showError("Could not load analytics: " + e); return; }

@@ -80,6 +80,7 @@ async function loadConfig() {
   const res = await fetch("/api/config");
   if (!res.ok) return;
   const cfg = await res.json();
+  applyDemo(cfg);
   TICKET_URL = cfg.ticket_url || TICKET_URL;
   WINDOWS = !!cfg.windows;
   START_CMD = cfg.start_command || START_CMD;
@@ -201,10 +202,12 @@ function render(items, srcs, q) {
         if (a.dataset.act === "keyword") { setMode("keyword"); runSearch(); } else clearFilters();
       }));
     } else {
+      const demo = document.body.classList.contains("demo");   // the playground cannot refresh
       ul.insertAdjacentHTML("beforeend", emptyState("Nothing indexed yet",
-        "If the first build is still running this page fills in by itself. Otherwise run <code>convo-index index</code> in a terminal, or refresh the index from here.",
-        `<button class="btn primary" data-act="refresh">Refresh index</button>`));
-      ul.querySelector("[data-act=refresh]").addEventListener("click", () => $("refresh").click());
+        "If the first build is still running this page fills in by itself. Otherwise run <code>convo-index index</code> in a terminal" + (demo ? "." : ", or refresh the index from here."),
+        demo ? "" : `<button class="btn primary" data-act="refresh">Refresh index</button>`));
+      const again = ul.querySelector("[data-act=refresh]");
+      if (again) again.addEventListener("click", () => $("refresh").click());
       // the first build runs in the background after `convo-index up`: look again until it shows
       clearTimeout(emptyPoll); emptyPoll = setTimeout(runSearch, 5000);
     }

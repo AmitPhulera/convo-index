@@ -100,13 +100,17 @@ first one found for classification and summaries; an explicit `[llm]` entry alwa
     allowed_hosts = []                    # extra Host names, e.g. ["mybox.lan"] when binding 0.0.0.0
                                           # or behind a proxy; a bare name matches any port, "mybox.lan:8080"
                                           # only that one (localhost / 127.0.0.1 always match)
+    demo = false                          # public playground: the database opens read-only and
+                                          # every POST/DELETE is refused (CONVO_INDEX_DEMO=1 overrides)
 
 Summaries are derived jobs: a failed provider call is retried on later runs (up to
 `[summary].max_attempts`) without the conversation changing. Changing the embedding model
 or server requires `convo-index reembed`; vectors are skipped until then so spaces never mix.
 
 `CONVO_INDEX_DB` and `CONVO_INDEX_ARCHIVE` override where the database and archive
-copies live. Defaults: the repo root when running from a checkout, otherwise
+copies live. `CONVO_INDEX_DUCKDB_EXTENSIONS` names a directory with DuckDB's sqlite extension
+already installed; analytics then loads it from there instead of installing into `~/.duckdb`
+(for read-only containers such as the playground). Defaults: the repo root when running from a checkout, otherwise
 `~/.local/share/convo-index/` (respects `XDG_DATA_HOME`).
 
 `convo-index index` exits 0 on success, 1 if any source or conversation failed (details
