@@ -349,3 +349,10 @@ recorded the repository. The detail pane's **Related work** lists every other co
 a linkable key, grouped by key, across tools, without transitive merging; `convo-index related
 <key>` prints the timeline for a ticket, PR or branch. `default_branches` and `github_hosts` are
 configurable.
+
+## The playground
+`demo/` holds the playground's fictional conversations and its config; `scripts/make_demo_data.py --out DIR`
+writes them in each tool's native format (`scripts/demo_writers.py`), indexes them with the real
+`convo-index index`, adds their summaries and bakes a read-only database plus runtime config into DIR.
+The `Dockerfile` builds the playground image, and CI deploys it from main through the shared workflow
+in AmitPhulera/infra.

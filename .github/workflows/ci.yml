@@ -67,3 +67,12 @@ jobs:
         run: |
           uv tool install dist/*.whl
           convo-index --help
+
+  playground-image:
+    name: playground image builds
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t convo-index-playground .
+
