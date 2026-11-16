@@ -156,3 +156,20 @@ def test_demo_prepare_refuses_a_database_with_wal_content(tmp_path, monkeypatch)
             server.prepare(st)
     finally:
         holder.close()
+
+
+def test_analytics_loads_a_baked_duckdb_extension_without_writing_home(demo, tmp_path, monkeypatch):
+    """The playground image bakes the sqlite extension; at run time HOME is read-only."""
+    from convo_index import analytics as A
+    _, db = demo
+    ext = tmp_path / "duckdb-ext"
+    A.install_duckdb_extensions(ext)                 # the image build step (same network need as test_analytics)
+    home = tmp_path / "ro-home"
+    home.mkdir(); home.chmod(0o500)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv(A.DUCKDB_EXTENSIONS_ENV, str(ext))
+    try:
+        assert A.analytics(db)["by_source"]
+        assert list(home.iterdir()) == []
+    finally:
+        home.chmod(0o700)
