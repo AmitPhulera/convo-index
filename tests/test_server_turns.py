@@ -751,6 +751,27 @@ def test_handoff_requests_are_guarded_and_checked(site):
     assert status == 403 and "disabled" in body["error"]
 
 
+def test_a_handoff_of_a_conversation_with_control_characters_starts(site):
+    """ANSI colour pasted into a message used to stop the handoff at start: the prompt quoted
+    it verbatim and the start check refuses control characters. The prompt now writes each as
+    its visible escape, so the prepared prompt starts as it is."""
+    site.settings["privacy"]["hosted_processing"] = "allow"
+    conn = dbm.connect(site.tmp / "t.db")
+    conv = Conversation(source="claude_code", native_id="ctrl", title="Colours", first_prompt="x",
+                        source_ref="/x", cwd=str(site.proj), start_ts="2026-06-16T00:00:00Z",
+                        messages=[Message(seq=0, role="user", text="it prints \x1b[31mred\x1b[0m", ts="2026-06-16T00:00:00Z")])
+    dbm.upsert_conversation(conn, conv, "globex", "path", [], None, "1", lambda t: [[0.0] * EMBED_DIM for _ in t])
+    conn.close()
+    status, prep = handoff(site, "/api/conversation/claude_code:ctrl/handoff", {"kind": "review"})
+    assert status == 200 and "\\x1b[31mred\\x1b[0m" in prep["prompt"]
+    os.environ["FAKE_HARNESS"] = json.dumps(claude_lines("ok"))
+    status, snap = handoff(site, "/api/handoff/start",
+                           {"preview_id": prep["preview_id"], "target": "claude_code", "prompt": prep["prompt"]})
+    assert status == 200 and snap["turn_id"]
+    events, _ = sse_events(site, snap["turn_id"])
+    assert events[-1]["kind"] == "done"
+
+
 def test_a_continue_preview_carries_the_note_or_says_why_not(site, monkeypatch):
     from convo_index import handoff as HO
     monkeypatch.setattr(HO, "digest", lambda msgs, title, settings: (None, "the summary backend did not answer within 90 s"))
