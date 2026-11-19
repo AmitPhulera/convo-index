@@ -78,6 +78,16 @@ SECRET_PATTERNS = [
 # (a log the agent read), not a failure.
 ERROR_RE = re.compile(r"\AERROR: |\nSTATUS: [^\n]*\nERROR: ")
 
+# A conversation can hold control characters (ANSI colour pasted from a terminal is the usual
+# one), and the start check refuses them in a prompt. A handoff must not fail on what the
+# conversation itself contains: each is written as its visible escape, never dropped, so the
+# reader can see a character was there. \x7f rides along: unreadable in any prompt.
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _plain(text):
+    return CONTROL_RE.sub(lambda m: f"\\x{ord(m.group(0)):02x}", text or "")
+
 HARNESS_NAMES = {"claude_code": "Claude Code", "opencode": "opencode", "codex": "Codex CLI",
                  "antigravity": "Antigravity", "pi": "pi"}
 
@@ -333,7 +343,9 @@ def _utf8(text):
 def _digest_transcript(convo, max_bytes=None):
     """(transcript, cut): role-prefixed, the middle left out past the digest window, or past
     `max_bytes` (UTF-8) when the backend can carry less. Head and tail keep their proportions."""
-    full = "\n\n".join(f"{m['role'].upper()}: {m['text']}" for m in convo)
+    # sanitized before the size math: agy takes the prompt as one argument, where a NUL byte
+    # raises ValueError and every backend carries the other control characters raw
+    full = _plain("\n\n".join(f"{m['role'].upper()}: {m['text']}" for m in convo))
     head, tail = DIGEST_HEAD_CHARS, DIGEST_TAIL_CHARS
     while True:
         if len(full) <= head + tail:
@@ -354,7 +366,7 @@ def digest(msgs, title="", settings=None, timeout=90):
              for m in msgs if (m.get("kind") or KIND_TEXT) in (KIND_TEXT, KIND_TOOL_CALL) and harness_label(m) is None]
     if not any((m.get("kind") or KIND_TEXT) == KIND_TEXT for m in convo):
         return None, "nothing to digest"
-    head = _DIGEST_PROMPT + f"Title: {title}\n\n"
+    head = _DIGEST_PROMPT + f"Title: {_plain(title)}\n\n"       # the title rides the same argument
     limit = R.max_prompt_bytes("summary", settings)      # agy takes the prompt as one argument
     transcript, cut = _digest_transcript(convo, None if limit is None else limit - _utf8(head) - 64)
     prompt = head + transcript
@@ -536,7 +548,9 @@ def build(conn, cid, kind, *, digest_result=None, digest_status=None, transcript
                         "Read the parts you need instead of guessing.")
     sections.append("## What to do\n\n" + CLOSING[kind])
 
-    prompt = "\n\n".join(sections) + "\n"
+    # sanitized as a whole: the repo state, the digest and every quoted message pass through here,
+    # and the prompt this prints or starts must hold none of CONTROL_RE's characters
+    prompt = _plain("\n\n".join(sections)) + "\n"
     secrets = find_secrets(prompt)
     return {"kind": kind, "prompt": prompt, "problems": problems, "secrets": secrets, "transcript_masked": transcript_masked,
             "chars": len(prompt), "tokens": len(prompt) // 4, "over_budget": len(prompt) > budget_chars,

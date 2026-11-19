@@ -9,6 +9,7 @@ from convo_index import db as dbm
 from convo_index import handoff as H
 from convo_index.model import Conversation, Message, KIND_TOOL_CALL, KIND_TOOL_RESULT, KIND_THINKING
 from convo_index.providers.base import LLMResult
+from convo_index.server import PROMPT_FORBIDDEN
 
 
 def _msgs():
@@ -113,6 +114,17 @@ def test_tool_output_with_fences_cannot_break_out_of_a_message(tmp_path):
     assert "````\nlook:" in p and p.count("## What to do") == 2   # the quoted one sits inside a longer fence
 
 
+def test_control_characters_in_a_conversation_do_not_stop_the_handoff(tmp_path):
+    """ANSI colour pasted from a terminal, a bell: the prompt must pass the start check that
+    refuses control characters, and show what was there instead of failing on it."""
+    msgs = [Message(seq=0, role="user", text="the run prints \x1b[31mFAILED\x1b[0m and beeps\x07\x7f"),
+            Message(seq=1, role="assistant", kind="text", text="fixed")]
+    conn = _db(tmp_path, msgs)
+    p = H.build(conn, "claude_code:s1", "continue")["prompt"]
+    assert "\\x1b[31mFAILED\\x1b[0m and beeps\\x07\\x7f" in p
+    assert not (set(p) & PROMPT_FORBIDDEN)
+
+
 def test_unknown_conversation_and_kind(tmp_path):
     conn = _db(tmp_path)
     assert H.build(conn, "claude_code:nope", "review") is None
@@ -177,6 +189,20 @@ def test_digest_uses_the_summary_job_and_reports_failure(fake_llm, llm_settings)
     f = fake_llm(LLMResult(ok=False, error="timeout"), {"goal": "g"})
     assert H.digest(msgs, "T", llm_settings) == (None, "the summary backend did not answer within 90 s")
     assert len(f.calls) == 1                                                        # a timeout is not retried
+
+
+def test_the_digest_prompt_carries_no_control_characters(fake_llm, llm_settings):
+    """agy takes the digest prompt as one argument, where a NUL byte raises ValueError and
+    the handoff note is lost: the digest transcript writes each control character as its
+    visible escape, like the built prompt."""
+    msgs = [m.__dict__ for m in _msgs()]
+    msgs[0]["text"] = "it prints \x1b[31mFAILED\x1b[0m and holds a NUL\x00"
+    f = fake_llm({"goal": "g"})
+    H.digest(msgs, "T\x07", llm_settings)
+    p = f.calls[0]["prompt"]
+    assert "it prints \\x1b[31mFAILED\\x1b[0m and holds a NUL\\x00" in p
+    assert "Title: T\\x07" in p
+    assert not (set(p) & PROMPT_FORBIDDEN)
 
 
 def test_cli_prints_only_the_prompt_on_stdout(tmp_path, monkeypatch, capsys):
